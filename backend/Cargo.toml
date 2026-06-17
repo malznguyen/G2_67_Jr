@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/api",
+    "crates/worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Proprietary"
+publish = false
+
+[workspace.dependencies]
+# Runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "json",
+] }
+
+# Serde / errors
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Misc
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = 1

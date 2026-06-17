@@ -6,9 +6,11 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::jwt::{JwtClaims, JwtValidator};
+use crate::auth::provision::provision_user;
 use crate::error::AuthError;
 
 /// Authenticated user context extracted from the request.
@@ -73,6 +75,11 @@ where
 
         // Store in extensions so downstream extractors (e.g. TenantContext) can access it.
         parts.extensions.insert(auth_user.clone());
+
+        // Auto-provision user in DB if pool is available.
+        if let Some(pool) = parts.extensions.get::<PgPool>().cloned() {
+            provision_user(&pool, &auth_user.claims).await?;
+        }
 
         Ok(auth_user)
     }

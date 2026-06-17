@@ -142,10 +142,9 @@ mod tests {
         Json(json!({ "tenant_id": tenant.0.to_string() }))
     }
 
-    fn build_app(auth_state: AuthState, pool: PgPool) -> Router {
+    fn build_app(auth_state: AuthState, _pool: PgPool) -> Router {
         Router::new()
             .route("/protected", get(protected_route))
-            .layer(Extension(pool))
             .layer(Extension(auth_state))
     }
 

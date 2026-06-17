@@ -13,6 +13,7 @@
 mod auth;
 mod error;
 mod middleware;
+mod routes;
 
 use std::time::Duration;
 
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
+        .route("/users/me", get(routes::users::get_me))
         .with_state(state);
 
     // 6. Serve.

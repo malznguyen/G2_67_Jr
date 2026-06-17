@@ -22,7 +22,7 @@
 - [x] `/health` trả **200** khi boot thật
 - [x] `/users/me` trả **401** với `Bearer fake_token` (KHÔNG phải 500, KHÔNG phải 503)
 - [x] `sqlx migrate info` — 3 Applied, 0 Pending, 0 `(different checksum)`
-- [ ] Commit: {PENDING — sẽ fill sau khi git commit}
+- [x] Commit: `4a8c17c`
 
 ## FIX 1 — Wiring `PgPool` + `AuthState` vào `main.rs`
 

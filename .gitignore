@@ -1,0 +1,51 @@
+# ---------- Rust / Cargo ----------
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# ---------- Frontend (Next.js / Node) ----------
+node_modules/
+.next/
+out/
+dist/
+build/
+.cache/
+.turbo/
+.parcel-cache/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# ---------- Env & secrets ----------
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+*.pem
+*.key
+*.crt
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------- Docker / Infra runtime ----------
+infra/.volumes/
+infra/data/
+infra/runtime/
+*.log
+
+# ---------- OS ----------
+.DS_Store
+desktop.ini
+
+# ---------- Test artifacts ----------
+junit.xml
+test-results/
+playwright-report/
+playwright/.cache/

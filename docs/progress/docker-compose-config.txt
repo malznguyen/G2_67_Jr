@@ -1,0 +1,408 @@
+﻿name: g2-67-jr
+services:
+  backend:
+    build:
+      context: C:\Users\admin\Desktop\Project\gm_rag_2.0\infra
+      dockerfile: infra/backend.Dockerfile
+    container_name: gmrag-backend
+    depends_on:
+      keycloak:
+        condition: service_started
+        required: true
+      minio:
+        condition: service_healthy
+        required: true
+      postgres16:
+        condition: service_healthy
+        required: true
+      qdrant:
+        condition: service_healthy
+        required: true
+      redis:
+        condition: service_healthy
+        required: true
+    environment:
+      CORS_ALLOW_CREDENTIALS: "true"
+      CORS_ALLOWED_HEADERS: Authorization,Content-Type,X-Tenant-ID,X-Request-ID
+      CORS_ALLOWED_METHODS: GET,POST,PUT,PATCH,DELETE,OPTIONS
+      CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:8080
+      DATABASE_URL: postgres://gmrag:gmrag_change_me@postgres16:5432/gmrag
+      DEEPSEEK_API_KEY: ""
+      DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
+      DEEPSEEK_MODEL: deepseek-chat
+      GMRAG_HTTP_BIND: 0.0.0.0:8080
+      GMRAG_RUST_LOG: info,gmrag_backend=debug
+      GMRAG_TENANT_HEADER: X-Tenant-ID
+      KEYCLOAK_CLIENT_ID: gmrag-backend
+      KEYCLOAK_CLIENT_SECRET: gmrag_backend_change_me
+      KEYCLOAK_ISSUER: http://keycloak:8080/realms/gmrag
+      OLLAMA_HOST: http://ollama:11434
+      QDRANT_COLLECTION_DEFAULT: gmrag_chunks
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      S3_ACCESS_KEY: gmrag_minio
+      S3_BUCKET: gmrag-uploads
+      S3_ENDPOINT: http://minio:9000
+      S3_FORCE_PATH_STYLE: "true"
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_SECRET_KEY: gmrag_minio_change_me
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1
+      timeout: 5s
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    image: gmrag/backend:dev
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 8080
+        published: "8088"
+        protocol: tcp
+    restart: unless-stopped
+  frontend:
+    build:
+      context: C:\Users\admin\Desktop\Project\gm_rag_2.0\infra
+      dockerfile: infra/frontend.Dockerfile
+    container_name: gmrag-frontend
+    depends_on:
+      backend:
+        condition: service_started
+        required: true
+      keycloak:
+        condition: service_started
+        required: true
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+      NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: gmrag-frontend
+      NEXT_PUBLIC_KEYCLOAK_REALM: gmrag
+      NEXT_PUBLIC_KEYCLOAK_URL: http://localhost:8080
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://localhost:3000/api/health >/dev/null 2>&1 || exit 1
+      timeout: 5s
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    image: gmrag/frontend:dev
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 3000
+        published: "3000"
+        protocol: tcp
+    restart: unless-stopped
+  keycloak:
+    command:
+      - start-dev
+      - --http-port=8080
+      - --health-enabled=true
+    container_name: gmrag-keycloak
+    environment:
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin_change_me
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_HEALTH_ENABLED: "true"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'exec 3<>/dev/tcp/localhost/9000 && echo -e ''GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n'' >&3 && grep -q ''"status": "UP"'' <&3'
+      timeout: 10s
+      interval: 15s
+      retries: 15
+      start_period: 1m0s
+    image: quay.io/keycloak/keycloak:25.0.6
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 8080
+        published: "8080"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: keycloak_data
+        target: /opt/keycloak/data
+        volume: {}
+  minio:
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+    container_name: gmrag-minio
+    environment:
+      MINIO_ROOT_PASSWORD: gmrag_minio_change_me
+      MINIO_ROOT_USER: gmrag_minio
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9000/minio/health/live
+      timeout: 5s
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 9000
+        published: "9000"
+        protocol: tcp
+      - mode: ingress
+        target: 9001
+        published: "9001"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: minio_data
+        target: /data
+        volume: {}
+  ollama:
+    container_name: gmrag-ollama
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1
+      timeout: 5s
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    image: ollama/ollama:0.5.7
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 11434
+        published: "11434"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: ollama_data
+        target: /root/.ollama
+        volume: {}
+  postgres16:
+    container_name: gmrag-postgres16
+    environment:
+      POSTGRES_DB: gmrag
+      POSTGRES_PASSWORD: gmrag_change_me
+      POSTGRES_USER: gmrag
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 30s
+    image: postgres:16-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 5432
+        published: "5432"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql/data
+        volume: {}
+      - type: bind
+        source: C:\Users\admin\Desktop\Project\gm_rag_2.0\infra\postgres\init.sql
+        target: /docker-entrypoint-initdb.d/01-init.sql
+        read_only: true
+        bind:
+          create_host_path: true
+  qdrant:
+    container_name: gmrag-qdrant
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -qO-
+        - http://localhost:6333/healthz
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 20s
+    image: qdrant/qdrant:v1.12.4
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 6333
+        published: "6333"
+        protocol: tcp
+      - mode: ingress
+        target: 6334
+        published: "6334"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: qdrant_data
+        target: /qdrant/storage
+        volume: {}
+  redis:
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    container_name: gmrag-redis
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      timeout: 5s
+      interval: 10s
+      retries: 10
+      start_period: 10s
+    image: redis:7-alpine
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    ports:
+      - mode: ingress
+        target: 6379
+        published: "6379"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: redis_data
+        target: /data
+        volume: {}
+  worker:
+    build:
+      context: C:\Users\admin\Desktop\Project\gm_rag_2.0\infra
+      dockerfile: infra/backend.Dockerfile
+    command:
+      - gmrag-worker
+    container_name: gmrag-worker
+    depends_on:
+      ollama:
+        condition: service_started
+        required: true
+      postgres16:
+        condition: service_healthy
+        required: true
+      qdrant:
+        condition: service_healthy
+        required: true
+      redis:
+        condition: service_healthy
+        required: true
+    environment:
+      DATABASE_URL: postgres://gmrag:gmrag_change_me@postgres16:5432/gmrag
+      DEEPSEEK_API_KEY: ""
+      DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
+      DEEPSEEK_MODEL: deepseek-chat
+      GMRAG_RUST_LOG: info,gmrag_backend=debug
+      GMRAG_WORKER_CONCURRENCY: "4"
+      OLLAMA_EMBED_MODEL: nomic-embed-text
+      OLLAMA_HOST: http://ollama:11434
+      QDRANT_COLLECTION_DEFAULT: gmrag_chunks
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      S3_ACCESS_KEY: gmrag_minio
+      S3_BUCKET: gmrag-uploads
+      S3_ENDPOINT: http://minio:9000
+      S3_FORCE_PATH_STYLE: "true"
+      S3_REGION: us-east-1
+      S3_SECRET_KEY: gmrag_minio_change_me
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -f gmrag-worker >/dev/null || exit 1
+      timeout: 5s
+      interval: 30s
+      retries: 5
+      start_period: 30s
+    image: gmrag/backend:dev
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      gmrag-net: null
+    restart: unless-stopped
+networks:
+  gmrag-net:
+    name: gmrag-net
+    driver: bridge
+volumes:
+  keycloak_data:
+    name: gmrag-keycloak-data
+  minio_data:
+    name: gmrag-minio-data
+  ollama_data:
+    name: gmrag-ollama-data
+  pgdata:
+    name: gmrag-pgdata
+  qdrant_data:
+    name: gmrag-qdrant-data
+  redis_data:
+    name: gmrag-redis-data
+x-logging:
+  driver: json-file
+  options:
+    max-file: "3"
+    max-size: 10m
+x-restart-policy:
+  restart: unless-stopped

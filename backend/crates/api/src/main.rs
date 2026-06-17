@@ -12,6 +12,7 @@
 
 mod auth;
 mod error;
+mod middleware;
 
 use std::time::Duration;
 

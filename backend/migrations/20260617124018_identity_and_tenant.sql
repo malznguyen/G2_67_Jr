@@ -4,6 +4,29 @@
 -- RLS is applied on tenant-scoped tables using gmrag_current_tenant().
 -- =========================================================
 
+-- ---------- RLS helper function ----------
+-- Must exist before any RLS policy references it.
+-- Also defined in infra/postgres/init.sql for Docker; repeated here
+-- so that sqlx::test databases (which skip init.sql) work correctly.
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- App role (idempotent — already exists in Docker via init.sql).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gmrag_app') THEN
+    CREATE ROLE gmrag_app NOLOGIN;
+  END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION gmrag_current_tenant()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid
+$$;
+
 -- ---------- users ----------
 CREATE TABLE IF NOT EXISTS users (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),

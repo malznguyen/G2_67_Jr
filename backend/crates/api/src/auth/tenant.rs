@@ -1,93 +1,162 @@
-//! Tenant context extractor.
+//! Tenant context middleware.
 //!
-//! `TenantContext` is extracted from the `X-Tenant-Id` header **after**
-//! `AuthUser` has been resolved.  It verifies that the authenticated user is a
-//! member of the requested tenant by querying the `tenant_members` table.
+//! `tenant_middleware` is a [`axum::middleware::from_fn`] layer that runs
+//! **after** [`crate::auth::middleware::auth_middleware`] (which populates
+//! `Extension<AuthUser>`) and **before**
+//! [`crate::middleware::rls::rls_middleware`] (which consumes
+//! `Extension<TenantContext>`).
+//!
+//! It reads the `X-Tenant-Id` header, parses it as a UUID, and verifies that
+//! the authenticated user is a member of that tenant by querying
+//! `tenant_members` via the [`AdminPool`] (platform-level, bypasses RLS —
+//! this lookup must succeed *before* the RLS tenant context is established,
+//! otherwise the policy on `tenant_members` would hide the very row we need
+//! to authorise).
+//!
+//! On success it inserts [`TenantContext`] into request extensions.
+//!
+//! This replaces the previous `TenantContext` `FromRequestParts` extractor.
+//! The extractor form could not satisfy the invariant that
+//! `TenantContext` must be present in extensions *before* `rls_middleware`
+//! runs, because axum only dispatches extractors at handler time (after all
+//! middleware).
 
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
-use sqlx::PgPool;
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::ApiError;
+use crate::pool::AdminPool;
 
 /// The resolved tenant for the current request.
 ///
 /// Carries the tenant UUID validated against the `tenant_members` table.
+/// Populated by [`tenant_middleware`] and consumed by
+/// [`crate::middleware::rls::rls_middleware`] and tenant-scoped handlers.
 #[derive(Debug, Clone)]
 pub struct TenantContext(pub Uuid);
 
 const TENANT_HEADER: &str = "x-tenant-id";
 
-#[axum::async_trait]
-impl<S> FromRequestParts<S> for TenantContext
-where
-    S: Send + Sync,
-{
-    type Rejection = ApiError;
+/// Middleware that resolves [`TenantContext`] and stores it in extensions.
+///
+/// Requires `Extension<AuthUser>` (populated by `auth_middleware`) and
+/// `Extension<AdminPool>` to be present in request extensions.
+pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Response {
+    // 1. AuthUser must already be in extensions (auth_middleware ran first).
+    let auth_user = match request.extensions().get::<AuthUser>().cloned() {
+        Some(u) => u,
+        None => {
+            return tenant_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tenant-missing-auth",
+                "tenant_middleware requires AuthUser in extensions",
+            )
+        }
+    };
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // AuthUser must be resolved first (declared before TenantContext in handler args).
-        let auth_user = parts
-            .extensions
-            .get::<AuthUser>()
-            .cloned()
-            .ok_or(ApiError::BadRequest(
-                "auth must be resolved before tenant context".into(),
-            ))?;
+    // 2. Read X-Tenant-Id header.
+    let header_value = match request.headers().get(TENANT_HEADER) {
+        Some(v) => v,
+        None => {
+            return tenant_error_response(
+                StatusCode::BAD_REQUEST,
+                "bad-request",
+                "missing X-Tenant-Id header",
+            )
+        }
+    };
 
-        // Read X-Tenant-Id header.
-        let header_value = parts
-            .headers
-            .get(TENANT_HEADER)
-            .ok_or(ApiError::BadRequest("missing X-Tenant-Id header".into()))?;
+    let header_str = match header_value.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            return tenant_error_response(
+                StatusCode::BAD_REQUEST,
+                "bad-request",
+                "X-Tenant-Id contains invalid characters",
+            )
+        }
+    };
 
-        let header_str = header_value
-            .to_str()
-            .map_err(|_| ApiError::BadRequest("X-Tenant-Id contains invalid characters".into()))?;
+    let tenant_id = match Uuid::parse_str(header_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return tenant_error_response(
+                StatusCode::BAD_REQUEST,
+                "bad-request",
+                "X-Tenant-Id is not a valid UUID",
+            )
+        }
+    };
 
-        let tenant_id = Uuid::parse_str(header_str)
-            .map_err(|_| ApiError::BadRequest("X-Tenant-Id is not a valid UUID".into()))?;
+    // 3. AdminPool for the membership check (platform-level, bypasses RLS).
+    let AdminPool(pool) = match request.extensions().get::<AdminPool>().cloned() {
+        Some(p) => p,
+        None => {
+            return tenant_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tenant-missing-pool",
+                "tenant_middleware requires AdminPool in extensions",
+            )
+        }
+    };
 
-        // Get DbPool from extensions (injected by AppState).
-        let pool = parts
-            .extensions
-            .get::<PgPool>()
-            .cloned()
-            .ok_or(ApiError::Internal("database pool not configured".into()))?;
+    // 4. Verify membership.
+    let is_member: bool = match sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM tenant_members WHERE tenant_id = $1 AND user_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(auth_user.user_id)
+    .fetch_one(&pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return tenant_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal-error",
+                &format!("membership check failed: {e}"),
+            )
+        }
+    };
 
-        // Verify membership.
-        let is_member = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM tenant_members WHERE tenant_id = $1 AND user_id = $2)",
-        )
-        .bind(tenant_id)
-        .bind(auth_user.user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| ApiError::Internal(format!("membership check failed: {e}")))?;
-
-        if !is_member {
-            return Err(ApiError::Forbidden(format!(
+    if !is_member {
+        return tenant_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &format!(
                 "user {} is not a member of tenant {tenant_id}",
                 auth_user.user_id
-            )));
-        }
-
-        Ok(TenantContext(tenant_id))
+            ),
+        );
     }
+
+    // 5. Store TenantContext in extensions for rls_middleware + handlers.
+    request.extensions_mut().insert(TenantContext(tenant_id));
+
+    next.run(request).await
+}
+
+fn tenant_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    let body = json!({ "error": { "code": code, "message": message } });
+    (status, axum::Json(body)).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::extractor::AuthState;
+    use crate::auth::extractor::{AuthState, AuthUser};
     use crate::auth::jwt::{JwtClaims, JwtValidator};
+    use crate::pool::AdminPool;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use axum::{Extension, Json, Router};
+    use axum::{Extension, Router};
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
     use serde_json::json;
     use tower::ServiceExt;
@@ -134,32 +203,47 @@ mod tests {
         }
     }
 
-    /// A protected route that extracts both `AuthUser` and `TenantContext`.
-    async fn protected_route(
-        _user: AuthUser,
-        tenant: TenantContext,
-    ) -> impl IntoResponse {
+    fn stub_admin_pool() -> AdminPool {
+        AdminPool(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
+                .expect("lazy pool"),
+        )
+    }
+
+    fn make_auth_user() -> AuthUser {
+        AuthUser::new(
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            make_claims(),
+        )
+    }
+
+    /// A handler that reads Extension<TenantContext>.
+    async fn protected_route(Extension(tenant): Extension<TenantContext>) -> impl IntoResponse {
         Json(json!({ "tenant_id": tenant.0.to_string() }))
     }
 
-    fn build_app(auth_state: AuthState, _pool: PgPool) -> Router {
+    use axum::Json;
+
+    /// Build a test app that wires tenant_middleware and pre-seeds
+    /// Extension<AuthUser> + Extension<AdminPool> (skipping auth_middleware).
+    fn build_app(auth_user: AuthUser, pool: AdminPool) -> Router {
         Router::new()
             .route("/protected", get(protected_route))
-            .layer(Extension(auth_state))
+            .layer(axum::middleware::from_fn(tenant_middleware))
+            .layer(Extension(auth_user))
+            .layer(Extension(pool))
     }
 
     #[tokio::test]
     async fn missing_tenant_header_returns_400() {
-        let auth_state = make_auth_state().await;
-        let pool = stub_pool().await;
-        let app = build_app(auth_state, pool);
+        let app = build_app(make_auth_user(), stub_admin_pool());
 
-        let token = make_token(&make_claims());
         let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/protected")
-                    .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -175,16 +259,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_tenant_uuid_returns_400() {
-        let auth_state = make_auth_state().await;
-        let pool = stub_pool().await;
-        let app = build_app(auth_state, pool);
+        let app = build_app(make_auth_user(), stub_admin_pool());
 
-        let token = make_token(&make_claims());
         let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/protected")
-                    .header("authorization", format!("Bearer {token}"))
                     .header("x-tenant-id", "not-a-uuid")
                     .body(Body::empty())
                     .unwrap(),
@@ -201,16 +281,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_tenant_header_returns_400() {
-        let auth_state = make_auth_state().await;
-        let pool = stub_pool().await;
-        let app = build_app(auth_state, pool);
+        let app = build_app(make_auth_user(), stub_admin_pool());
 
-        let token = make_token(&make_claims());
         let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/protected")
-                    .header("authorization", format!("Bearer {token}"))
                     .header("x-tenant-id", "")
                     .body(Body::empty())
                     .unwrap(),
@@ -221,17 +297,79 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn missing_auth_user_returns_500() {
+        // Don't seed AuthUser — tenant_middleware must fail cleanly.
+        let app = Router::new()
+            .route("/protected", get(protected_route))
+            .layer(axum::middleware::from_fn(tenant_middleware))
+            .layer(Extension(stub_admin_pool()));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("x-tenant-id", Uuid::new_v4().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "tenant-missing-auth");
+    }
+
+    #[tokio::test]
+    async fn missing_admin_pool_returns_500() {
+        let app = Router::new()
+            .route("/protected", get(protected_route))
+            .layer(axum::middleware::from_fn(tenant_middleware))
+            .layer(Extension(make_auth_user()));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("x-tenant-id", Uuid::new_v4().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "tenant-missing-pool");
+    }
+
+    /// With a stub (lazy) pool, the membership query fails to connect → 500.
+    /// Confirms the middleware reached the DB step (header + uuid parsed ok).
+    #[tokio::test]
+    async fn stub_pool_membership_check_returns_500() {
+        let app = build_app(make_auth_user(), stub_admin_pool());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("x-tenant-id", Uuid::new_v4().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "internal-error");
+    }
+
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    async fn stub_pool() -> PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
-            .expect("lazy pool")
     }
 }

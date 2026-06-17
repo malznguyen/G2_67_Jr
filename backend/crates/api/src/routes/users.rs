@@ -5,11 +5,11 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::error::ApiError;
+use crate::pool::AdminPool;
 
 #[derive(Serialize)]
 struct UserRow {
@@ -27,9 +27,13 @@ struct TenantRow {
 }
 
 /// `GET /users/me` — Return the authenticated user's profile and tenant memberships.
+///
+/// Uses [`AdminPool`] (superuser, bypasses RLS) because this endpoint is
+/// cross-tenant: it lists ALL tenants the user is a member of, not just the
+/// active tenant. `AuthUser` is populated by `auth_middleware`.
 pub async fn get_me(
-    auth_user: AuthUser,
-    Extension(pool): Extension<PgPool>,
+    Extension(auth_user): Extension<AuthUser>,
+    Extension(AdminPool(pool)): Extension<AdminPool>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = sqlx::query_as!(
         UserRow,
@@ -73,6 +77,8 @@ mod tests {
     use super::*;
     use crate::auth::extractor::AuthState;
     use crate::auth::jwt::{JwtClaims, JwtValidator};
+    use crate::auth::middleware::auth_middleware;
+    use crate::pool::AdminPool;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
@@ -122,25 +128,26 @@ mod tests {
         }
     }
 
-    fn stub_pool() -> PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
-            .expect("lazy pool")
+    fn stub_admin_pool() -> AdminPool {
+        AdminPool(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
+                .expect("lazy pool"),
+        )
     }
 
-    fn build_app(auth_state: AuthState, pool: PgPool) -> Router {
+    fn build_app(auth_state: AuthState, pool: AdminPool) -> Router {
         Router::new()
             .route("/users/me", get(get_me))
+            .layer(axum::middleware::from_fn(auth_middleware))
             .layer(Extension(pool))
             .layer(Extension(auth_state))
     }
 
     #[tokio::test]
     async fn get_me_without_auth_returns_401() {
-        let auth_state = make_auth_state().await;
-        let pool = stub_pool();
-        let app = build_app(auth_state, pool);
+        let app = build_app(make_auth_state().await, stub_admin_pool());
 
         let resp = app
             .oneshot(
@@ -156,14 +163,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_me_with_valid_auth_but_stub_pool_returns_error() {
-        let auth_state = make_auth_state().await;
-        // Build app WITHOUT PgPool — AuthUser provisioning is skipped.
-        // The handler requires PgPool, so it will fail with 500 when
-        // it tries to extract Extension<PgPool>.
-        let app = Router::new()
-            .route("/users/me", get(get_me))
-            .layer(Extension(auth_state));
+    async fn get_me_with_valid_auth_but_stub_pool_returns_provisioning_error() {
+        // Valid token, but stub AdminPool → provision_user fails → 401.
+        let app = build_app(make_auth_state().await, stub_admin_pool());
 
         let token = make_token(&make_claims());
         let resp = app
@@ -177,7 +179,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Handler requires Extension<PgPool> — missing → 500.
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // auth_middleware provisioning fails on stub pool → 401 user-not-found.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

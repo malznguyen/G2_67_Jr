@@ -21,6 +21,7 @@ use sqlx::{PgConnection, Postgres};
 use tokio::sync::Mutex;
 
 use crate::auth::tenant::TenantContext;
+use crate::pool::AppPool;
 
 /// A cloneable, shared database connection for use within a single request.
 ///
@@ -43,8 +44,9 @@ impl SharedConnection {
 
 /// Axum middleware that sets up the RLS context for each request.
 ///
-/// Requires [`TenantContext`] to already be present in request extensions
-/// (i.e. the `TenantContext` extractor must run before this middleware).
+/// Requires [`TenantContext`] (populated by `tenant_middleware`) and
+/// [`AppPool`] (connections running as `gmrag_app` so RLS is enforced) to
+/// already be present in request extensions.
 pub async fn rls_middleware(mut request: Request<Body>, next: Next) -> Response {
     // 1. Get tenant context from extensions.
     let tenant_id = match request.extensions().get::<TenantContext>().cloned() {
@@ -58,14 +60,14 @@ pub async fn rls_middleware(mut request: Request<Body>, next: Next) -> Response 
         }
     };
 
-    // 2. Get DB pool from extensions.
-    let pool = match request.extensions().get::<sqlx::PgPool>().cloned() {
+    // 2. Get AppPool (RLS-enforced) from extensions.
+    let AppPool(pool) = match request.extensions().get::<AppPool>().cloned() {
         Some(p) => p,
         None => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "rls-missing-pool",
-                "RLS middleware requires PgPool in extensions",
+                "RLS middleware requires AppPool in extensions",
             );
         }
     };
@@ -136,6 +138,8 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::tenant::TenantContext;
+    use crate::pool::AppPool;
     use axum::body::Body;
     use axum::extract::Extension;
     use axum::http::Request;
@@ -145,12 +149,14 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    /// A stub pool that is never actually queried (lazy connection).
-    async fn stub_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
-            .expect("lazy pool")
+    /// A stub AppPool that is never actually queried (lazy connection).
+    fn stub_app_pool() -> AppPool {
+        AppPool(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
+                .expect("lazy pool"),
+        )
     }
 
     /// A handler that returns the SharedConnection presence.
@@ -164,7 +170,7 @@ mod tests {
     }
 
     /// Build a test app with the RLS middleware.
-    fn build_app_with_rls(pool: sqlx::PgPool, tenant_ctx: TenantContext) -> Router {
+    fn build_app_with_rls(pool: AppPool, tenant_ctx: TenantContext) -> Router {
         Router::new()
             .route("/test", get(check_shared_conn))
             .layer(axum::middleware::from_fn(rls_middleware))
@@ -178,11 +184,7 @@ mod tests {
         // connection. With a stub (lazy) pool, `pool.acquire()` will fail
         // because there's no real DB. The expected response is 503 (connection
         // failed), which confirms the middleware ran correctly.
-        //
-        // Full integration tests with real DB will be in T15.
-        let pool = stub_pool().await;
-        let tenant_ctx = TenantContext(uuid::Uuid::new_v4());
-        let app = build_app_with_rls(pool, tenant_ctx);
+        let app = build_app_with_rls(stub_app_pool(), TenantContext(uuid::Uuid::new_v4()));
 
         let resp = app
             .oneshot(
@@ -206,12 +208,11 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_returns_500_when_tenant_context_missing() {
-        let pool = stub_pool().await;
         // Don't add TenantContext to extensions.
         let app = Router::new()
             .route("/test", get(check_shared_conn))
             .layer(axum::middleware::from_fn(rls_middleware))
-            .layer(Extension(pool));
+            .layer(Extension(stub_app_pool()));
 
         let resp = app
             .oneshot(
@@ -235,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn middleware_returns_500_when_pool_missing() {
         let tenant_ctx = TenantContext(uuid::Uuid::new_v4());
-        // Don't add PgPool to extensions.
+        // Don't add AppPool to extensions.
         let app = Router::new()
             .route("/test", get(check_shared_conn))
             .layer(axum::middleware::from_fn(rls_middleware))

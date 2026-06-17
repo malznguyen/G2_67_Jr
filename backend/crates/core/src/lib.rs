@@ -8,5 +8,5 @@ pub mod db;
 pub mod error;
 
 pub use config::Config;
-pub use db::{DbPool, init_pool};
+pub use db::{DbPool, init_app_pool, init_pool};
 pub use error::Error;

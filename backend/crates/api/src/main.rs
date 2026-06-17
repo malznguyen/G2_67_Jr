@@ -1,24 +1,27 @@
 //! gmrag-api — HTTP entry point.
 //!
-//! Boot sequence (T5-T7 scope, exactly the order required by the task):
+//! Boot sequence:
 //!   1. Initialise tracing subscriber with the env-driven filter.
 //!   2. Load `Config` from environment (fail fast on missing DATABASE_URL, ...).
-//!   3. Initialise the Postgres connection pool (`gmrag_core::init_pool`).
-//!   4. Run `sqlx::migrate!()` — applies any pending migrations.
-//!   5. Build the axum router with `GET /health` (liveness) and
-//!      `GET /healthz` (alias kept for the docker-compose healthcheck which
-//!      already commits to `/healthz`).
+//!   3. Initialise TWO Postgres pools:
+//!        - `admin_pool` via `init_pool`  — superuser `gmrag`, bypasses RLS.
+//!          Used for migrations, provisioning, cross-tenant endpoints.
+//!        - `app_pool` via `init_app_pool` — every connection runs
+//!          `SET ROLE gmrag_app`, so RLS policies are enforced. Used by
+//!          `rls_middleware` for tenant-scoped handler queries.
+//!   4. Run `sqlx::migrate!()` on the `admin_pool` (the `gmrag_app` role
+//!      cannot CREATE tables).
+//!   5. Build the axum router with three route groups (public `/health`,
+//!      authed `/users/me`, and a tenant-scoped group wiring
+//!      auth → tenant → rls middleware).
 //!   6. Bind & serve with graceful shutdown on SIGINT / SIGTERM.
 
-// Hotfix Batch 2B: RLS middleware (middleware::rls) and several reserved
-// ApiError variants are staged but not yet wired into the router (see
-// docs/progress/HOTFIX_BATCH2B.md — RLS middleware ordering blocker).
-// Suppress dead_code at crate level until the next batch wires them.
 #![allow(dead_code)]
 
 mod auth;
 mod error;
 mod middleware;
+mod pool;
 mod routes;
 
 use std::time::Duration;
@@ -26,8 +29,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use auth::extractor::AuthState;
 use auth::jwt::JwtValidator;
+use auth::middleware::auth_middleware;
+use auth::tenant::tenant_middleware;
 use axum::{Extension, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
-use gmrag_core::{Config, DbPool, init_pool};
+use gmrag_core::{Config, init_app_pool, init_pool};
+use middleware::rls::rls_middleware;
+use pool::{AdminPool, AppPool};
 use serde_json::json;
 use tokio::signal;
 use tracing::{info, warn};
@@ -35,7 +42,6 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Clone)]
 struct AppState {
-    pool: DbPool,
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -52,18 +58,23 @@ async fn main() -> anyhow::Result<()> {
         "gmrag-api starting"
     );
 
-    // 3. DB pool.
-    let pool = init_pool(&cfg.database_url)
+    // 3a. Admin pool (superuser, bypasses RLS) — used for migrations +
+    //     platform-level / cross-tenant operations.
+    let admin_pool = init_pool(&cfg.database_url)
         .await
-        .context("initialising postgres pool")?;
-    info!("postgres pool ready");
+        .context("initialising admin postgres pool")?;
+    info!("admin postgres pool ready");
 
-    // 4. Migrations. The macro embeds SQL files at compile time, so the
-    //    path is relative to CARGO_MANIFEST_DIR (= crates/api). Resolving
-    //    `../../migrations` points at the workspace-root migrations dir,
-    //    which is the shared location for all backend crates.
+    // 3b. App pool (gmrag_app role, RLS enforced) — used by rls_middleware
+    //     for tenant-scoped handler queries.
+    let app_pool = init_app_pool(&cfg.database_url)
+        .await
+        .context("initialising app postgres pool (RLS-enforced)")?;
+    info!("app postgres pool ready (role=gmrag_app)");
+
+    // 4. Migrations — MUST run on admin_pool; gmrag_app lacks CREATE.
     sqlx::migrate!("../../migrations")
-        .run(&pool)
+        .run(&admin_pool)
         .await
         .context("running database migrations")?;
     info!("database migrations applied");
@@ -75,16 +86,41 @@ async fn main() -> anyhow::Result<()> {
     info!(issuer = %cfg.oidc.issuer, "auth state ready");
 
     // 5. Router.
-    let app = Router::new()
+    // All sub-routers share the same state type (`Router<AppState>`) so they
+    // can be merged, then `.with_state(AppState)` converts the merged router
+    // to `Router<()>` for serving.
+
+    // Public group — no middleware.
+    let public: Router<AppState> = Router::new()
         .route("/health", get(health))
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(healthz));
+
+    // Authed group — auth_middleware only (cross-tenant).
+    let authed: Router<AppState> = Router::new()
         .route("/users/me", get(routes::users::get_me))
-        .layer(Extension(pool.clone()))
-        .layer(Extension(auth_state))
-        .with_state(AppState {
-            pool,
-            started_at: chrono::Utc::now(),
-        });
+        .layer(axum::middleware::from_fn(auth_middleware));
+
+    // Tenant-scoped group — auth → tenant → rls.
+    // No route is mounted yet; the group is declared solely so the
+    // middleware chain compiles and is ready for the first tenant-scoped
+    // handler. The `from_fn` references below keep `tenant_middleware` and
+    // `rls_middleware` "used" (no dead_code) until a real route is added.
+    let tenant_scoped: Router<AppState> = Router::new()
+        .layer(axum::middleware::from_fn(rls_middleware))
+        .layer(axum::middleware::from_fn(tenant_middleware))
+        .layer(axum::middleware::from_fn(auth_middleware));
+
+    // Extensions shared by all groups.
+    let merged: Router<AppState> = public
+        .merge(authed)
+        .merge(tenant_scoped)
+        .layer(Extension(AppPool(app_pool.clone())))
+        .layer(Extension(AdminPool(admin_pool.clone())))
+        .layer(Extension(auth_state.clone()));
+
+    let app = merged.with_state(AppState {
+        started_at: chrono::Utc::now(),
+    });
 
     // 6. Serve.
     let listener = tokio::net::TcpListener::bind(cfg.http_bind)
@@ -122,12 +158,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, axum::Json(body))
 }
 
-/// `GET /healthz` — readiness probe. Pings the DB to confirm the service is
-/// ready to serve traffic. Aliased to `/health` for docker-compose compat
-/// (compose file already commits to `/healthz`).
-async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+/// `GET /healthz` — readiness probe. Pings the DB via the admin pool to
+/// confirm the service is ready to serve traffic. Aliased to `/health` for
+/// docker-compose compat (compose file already commits to `/healthz`).
+async fn healthz(Extension(AdminPool(pool)): Extension<AdminPool>) -> impl IntoResponse {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
+        .fetch_one(&pool)
         .await
     {
         Ok(_) => (
@@ -178,12 +214,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_200() {
-        // Build a router with a stub pool that is never queried by /health.
-        // /health must NOT touch the DB (liveness only).
+        // /health must NOT touch the DB (liveness only) — no pool needed.
         let state = AppState {
-            // Constructing a real PgPool needs a DB; use sqlx::Any-free stub.
-            // Easiest: build a router that only registers /health, no pool.
-            pool: stub_pool().await,
             started_at: chrono::Utc::now(),
         };
         let app = Router::new()
@@ -200,14 +232,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    /// Build a `PgPool` that is never used by the test (pool is lazily
-    /// connected on first use; `connect_lazy` succeeds without a live DB).
-    async fn stub_pool() -> DbPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_lazy("postgres://stub:stub@127.0.0.1:1/stub")
-            .expect("lazy pool")
     }
 }

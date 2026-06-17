@@ -28,6 +28,22 @@ pub enum Error {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Qdrant client error.
+    ///
+    /// `qdrant_client::QdrantError` is ~176 bytes (wraps a `tonic::Status`
+    /// plus other variants), which trips `clippy::result_large_err` when
+    /// inlined into `Error`. Boxing keeps the `Error` enum small on the
+    /// happy path. A manual `From` is provided so callers can still use
+    /// `.map_err(Error::from)` on `Result<_, QdrantError>`.
+    #[error("qdrant error: {0}")]
+    Qdrant(Box<qdrant_client::QdrantError>),
+}
+
+impl From<qdrant_client::QdrantError> for Error {
+    fn from(e: qdrant_client::QdrantError) -> Self {
+        Error::Qdrant(Box::new(e))
+    }
 }
 
 impl Error {
@@ -39,6 +55,7 @@ impl Error {
             Error::Migrate(_) => "database-migrate-error",
             Error::Io(_) => "io-error",
             Error::Json(_) => "json-error",
+            Error::Qdrant(_) => "qdrant-error",
         }
     }
 }

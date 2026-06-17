@@ -19,3 +19,5 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
+tokio.workspace = true
+qdrant-client.workspace = true

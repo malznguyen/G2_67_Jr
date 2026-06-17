@@ -47,6 +47,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 
+# Vector DB — pinned to 1.12.1 to match the running Qdrant server v1.12.4
+# (1.12.4 client does not exist on crates.io; 1.12.1 is the closest
+# same-minor release and shares the stable gRPC API surface).
+qdrant-client = "=1.12.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

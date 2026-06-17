@@ -6,7 +6,9 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod qdrant;
 
 pub use config::Config;
 pub use db::{DbPool, init_app_pool, init_pool};
 pub use error::Error;
+pub use qdrant::QdrantStore;

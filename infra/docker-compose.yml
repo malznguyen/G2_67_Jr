@@ -49,7 +49,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' 2>/dev/null && echo OK || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -112,7 +112,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/11434' 2>/dev/null && echo OK || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -266,6 +266,7 @@ services:
       NEXT_PUBLIC_KEYCLOAK_URL: ${NEXT_PUBLIC_KEYCLOAK_URL}
       NEXT_PUBLIC_KEYCLOAK_REALM: ${NEXT_PUBLIC_KEYCLOAK_REALM}
       NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${NEXT_PUBLIC_KEYCLOAK_CLIENT_ID}
+      NEXT_PUBLIC_TENANT_HEADER: ${NEXT_PUBLIC_TENANT_HEADER}
     ports:
       - "3000:3000"
     healthcheck:

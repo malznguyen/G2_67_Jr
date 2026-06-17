@@ -11,7 +11,7 @@
 # =========================================================
 
 # ---------- Stage 1: dependencies (cargo-chef) ----------
-FROM rust:1.83-slim-bookworm AS chef
+FROM rust:slim-bookworm AS chef
 RUN cargo install --locked cargo-chef
 WORKDIR /app
 

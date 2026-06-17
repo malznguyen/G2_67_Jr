@@ -69,7 +69,12 @@ where
         let user_id = Uuid::parse_str(&claims.sub)
             .map_err(|e| AuthError::InvalidToken(format!("invalid 'sub' UUID: {e}")))?;
 
-        Ok(AuthUser::new(user_id, claims))
+        let auth_user = AuthUser::new(user_id, claims);
+
+        // Store in extensions so downstream extractors (e.g. TenantContext) can access it.
+        parts.extensions.insert(auth_user.clone());
+
+        Ok(auth_user)
     }
 }
 

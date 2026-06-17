@@ -199,3 +199,306 @@ async fn rls_tenant_members_isolation(pool: PgPool) {
 
     tx.rollback().await.unwrap();
 }
+
+// ─── T25: cross-tenant isolation on domain tables (T19-T24) ──────────────
+// These tests verify that RLS policies block cross-tenant data leaks on
+// every new tenant-scoped table. Before the rls_apply_all migration, the
+// gmrag_app role sees ALL rows (no policy) → these tests FAIL (red).
+
+/// Helper: insert a workspace and return its id.
+async fn create_workspace(pool: &PgPool, tenant_id: Uuid, name: &str, user_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workspaces (id, tenant_id, name, slug, created_by)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(format!("slug-{}", name))
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Helper: insert a document and return its id.
+async fn create_document(pool: &PgPool, tenant_id: Uuid, owner_id: Uuid, title: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO documents (id, tenant_id, owner_id, title)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(owner_id)
+    .bind(title)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_workspaces_blocks_cross_tenant_access(pool: PgPool) {
+    // Diagnostic: check if RLS policy exists in the test DB.
+    let policy_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_policy WHERE polrelid = 'workspaces'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(policy_count, 1, "workspaces_isolation policy must exist in test DB");
+
+    let rls_enabled: bool = sqlx::query_scalar(
+        "SELECT relrowsecurity FROM pg_class WHERE relname = 'workspaces'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(rls_enabled, "RLS must be enabled on workspaces in test DB");
+
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user_a = create_user(&pool, "a@ws.com").await;
+
+    let ws_a = create_workspace(&pool, tenant_a, "WS A", user_a).await;
+    let _ws_b = create_workspace(&pool, tenant_b, "WS B", user_a).await;
+
+    // Diagnostic: check current_role after SET LOCAL ROLE
+    let mut tx = begin_rls_tx(&pool).await;
+    let role: String = sqlx::query_scalar("SELECT current_role")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(role, "gmrag_app", "SET LOCAL ROLE must switch to gmrag_app");
+
+    set_tenant(&mut tx, tenant_a).await;
+
+    let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM workspaces")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "should only see tenant_a's workspace");
+    assert_eq!(rows[0].0, ws_a);
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_documents_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user_a = create_user(&pool, "a@doc.com").await;
+
+    let doc_a = create_document(&pool, tenant_a, user_a, "Doc A").await;
+    let _doc_b = create_document(&pool, tenant_b, user_a, "Doc B").await;
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM documents")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "should only see tenant_a's document");
+    assert_eq!(rows[0].0, doc_a);
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_chat_sessions_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user_a = create_user(&pool, "a@chat.com").await;
+
+    sqlx::query("INSERT INTO chat_sessions (tenant_id, user_id, title) VALUES ($1, $2, 'Sess A')")
+        .bind(tenant_a)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chat_sessions (tenant_id, user_id, title) VALUES ($1, $2, 'Sess B')")
+        .bind(tenant_b)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should only see tenant_a's chat session");
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_audit_log_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+
+    sqlx::query("INSERT INTO audit_log (tenant_id, action) VALUES ($1, 'login')")
+        .bind(tenant_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO audit_log (tenant_id, action) VALUES ($1, 'login')")
+        .bind(tenant_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should only see tenant_a's audit log entry");
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_ingest_jobs_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user_a = create_user(&pool, "a@ingest.com").await;
+
+    let doc_a = create_document(&pool, tenant_a, user_a, "Doc A").await;
+    let doc_b = create_document(&pool, tenant_b, user_a, "Doc B").await;
+
+    sqlx::query("INSERT INTO ingest_jobs (tenant_id, document_id) VALUES ($1, $2)")
+        .bind(tenant_a)
+        .bind(doc_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO ingest_jobs (tenant_id, document_id) VALUES ($1, $2)")
+        .bind(tenant_b)
+        .bind(doc_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingest_jobs")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should only see tenant_a's ingest job");
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_graph_nodes_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+
+    sqlx::query("INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node A')")
+        .bind(tenant_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node B')")
+        .bind(tenant_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM graph_nodes")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should only see tenant_a's graph node");
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_invitations_blocks_cross_tenant_access(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user_a = create_user(&pool, "a@inv.com").await;
+
+    sqlx::query("INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'x@a.com', $2)")
+        .bind(tenant_a)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'y@b.com', $2)")
+        .bind(tenant_b)
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invitations")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "should only see tenant_a's invitation");
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_no_context_hides_all_domain_tables(pool: PgPool) {
+    // Without SET LOCAL app.tenant_id, every tenant-scoped table must
+    // return zero rows (gmrag_current_tenant() = NULL → policy matches nothing).
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let user_a = create_user(&pool, "a@none.com").await;
+    create_workspace(&pool, tenant_a, "WS", user_a).await;
+    create_document(&pool, tenant_a, user_a, "Doc").await;
+
+    let mut tx = begin_rls_tx(&pool).await;
+    // No set_tenant call — app.tenant_id is unset.
+
+    for table in [
+        "workspaces",
+        "workspace_members",
+        "documents",
+        "document_chunks",
+        "graph_nodes",
+        "graph_edges",
+        "chat_sessions",
+        "chat_messages",
+        "resource_acl",
+        "invitations",
+        "tenant_quotas",
+        "usage_events",
+        "audit_log",
+        "ingest_jobs",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "{table} must return 0 rows without tenant context (RLS), got {count}"
+        );
+    }
+
+    tx.rollback().await.unwrap();
+}

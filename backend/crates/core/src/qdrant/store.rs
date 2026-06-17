@@ -99,6 +99,24 @@ impl QdrantStore {
         .await
     }
 
+    /// Create the tenant-scoped graph collection.
+    ///
+    /// Collection name: `graph_{tenant_id}`. Vector config: single vector,
+    /// size [`EMBED_DIM`] (768), `Distance::Cosine`, Qdrant-default HNSW.
+    /// Payload indexes (per spec):
+    /// - `node_id`      — Uuid
+    /// - `workspace_id` — Uuid
+    /// - `entity_name`  — Keyword
+    pub async fn create_graph_collection(&self, tenant_id: Uuid) -> Result<()> {
+        let name = format!("graph_{tenant_id}");
+        self.create_collection_with_indexes(&name, &[
+            ("node_id", FieldType::Uuid),
+            ("workspace_id", FieldType::Uuid),
+            ("entity_name", FieldType::Keyword),
+        ])
+        .await
+    }
+
     /// Shared helper: create a 768-dim Cosine collection and attach a set of
     /// payload field indexes. Used by `create_chunks_collection` (T28) and
     /// `create_graph_collection` (T29).
@@ -263,6 +281,93 @@ mod tests {
                     Distance::Cosine,
                     "distance must be Cosine"
                 );
+            }
+            Config::ParamsMap(_) => panic!("expected single (unnamed) vector config, got ParamsMap"),
+        }
+
+        // Cleanup.
+        store
+            .delete_collection(&name)
+            .await
+            .expect("delete_collection must succeed");
+        let names_after = store
+            .list_collection_names()
+            .await
+            .expect("list_collection_names must succeed after delete");
+        assert!(
+            !names_after.contains(&name),
+            "collection '{name}' must be gone after delete, got {names_after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_graph_collection_creates_with_payload_indexes() {
+        let store = local_store().await;
+        let tenant_id = Uuid::new_v4();
+        let name = format!("graph_{tenant_id}");
+
+        // Cleanup any stale collection from a prior aborted run.
+        let _ = store.delete_collection(&name).await;
+
+        // Create.
+        store
+            .create_graph_collection(tenant_id)
+            .await
+            .expect("create_graph_collection must succeed on live Qdrant");
+
+        // Verify the collection appears in the listing.
+        let names = store
+            .list_collection_names()
+            .await
+            .expect("list_collection_names must succeed");
+        assert!(
+            names.contains(&name),
+            "collection '{name}' must be listed, got {names:?}"
+        );
+
+        // Verify payload indexes + vector config via collection_info.
+        let resp = store
+            .client
+            .collection_info(&name)
+            .await
+            .expect("collection_info must succeed for a real collection");
+        let info = resp
+            .result
+            .as_ref()
+            .expect("collection_info result must be present");
+
+        // 3 payload indexes with the exact schema from the spec.
+        assert_eq!(
+            payload_index_type(info, "node_id"),
+            Some(PayloadSchemaType::Uuid),
+            "node_id must be indexed as Uuid"
+        );
+        assert_eq!(
+            payload_index_type(info, "workspace_id"),
+            Some(PayloadSchemaType::Uuid),
+            "workspace_id must be indexed as Uuid"
+        );
+        assert_eq!(
+            payload_index_type(info, "entity_name"),
+            Some(PayloadSchemaType::Keyword),
+            "entity_name must be indexed as Keyword"
+        );
+
+        // Vector config: single vector, size 768, Cosine.
+        let cfg = info
+            .config
+            .as_ref()
+            .expect("CollectionConfig must be present");
+        let params = cfg.params.as_ref().expect("CollectionParams must be present");
+        let vc = params
+            .vectors_config
+            .as_ref()
+            .expect("VectorsConfig must be present");
+        let inner = vc.config.as_ref().expect("vectors_config::Config must be present");
+        match inner {
+            Config::Params(vp) => {
+                assert_eq!(vp.size, 768, "vector size must be 768");
+                assert_eq!(vp.distance(), Distance::Cosine, "distance must be Cosine");
             }
             Config::ParamsMap(_) => panic!("expected single (unnamed) vector config, got ParamsMap"),
         }

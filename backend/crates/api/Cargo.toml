@@ -32,3 +32,10 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
+
+# Auth
+jsonwebtoken = "9"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

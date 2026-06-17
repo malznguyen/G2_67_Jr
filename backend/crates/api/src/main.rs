@@ -10,6 +10,9 @@
 //!      already commits to `/healthz`).
 //!   6. Bind & serve with graceful shutdown on SIGINT / SIGTERM.
 
+mod auth;
+mod error;
+
 use std::time::Duration;
 
 use anyhow::Context as _;

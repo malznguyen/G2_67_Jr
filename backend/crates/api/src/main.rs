@@ -10,6 +10,12 @@
 //!      already commits to `/healthz`).
 //!   6. Bind & serve with graceful shutdown on SIGINT / SIGTERM.
 
+// Hotfix Batch 2B: RLS middleware (middleware::rls) and several reserved
+// ApiError variants are staged but not yet wired into the router (see
+// docs/progress/HOTFIX_BATCH2B.md — RLS middleware ordering blocker).
+// Suppress dead_code at crate level until the next batch wires them.
+#![allow(dead_code)]
+
 mod auth;
 mod error;
 mod middleware;
@@ -18,7 +24,9 @@ mod routes;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use auth::extractor::AuthState;
+use auth::jwt::JwtValidator;
+use axum::{Extension, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use gmrag_core::{Config, DbPool, init_pool};
 use serde_json::json;
 use tokio::signal;
@@ -60,17 +68,23 @@ async fn main() -> anyhow::Result<()> {
         .context("running database migrations")?;
     info!("database migrations applied");
 
-    let state = AppState {
-        pool,
-        started_at: chrono::Utc::now(),
-    };
+    // Auth state — JwtValidator seeded from OIDC config. JWKS is fetched
+    // lazily on first token validation (see auth::jwt::JwtValidator::get_key).
+    let jwt_validator = JwtValidator::new(cfg.oidc.issuer.clone(), cfg.oidc.client_id.clone());
+    let auth_state = AuthState { jwt_validator };
+    info!(issuer = %cfg.oidc.issuer, "auth state ready");
 
     // 5. Router.
     let app = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
         .route("/users/me", get(routes::users::get_me))
-        .with_state(state);
+        .layer(Extension(pool.clone()))
+        .layer(Extension(auth_state))
+        .with_state(AppState {
+            pool,
+            started_at: chrono::Utc::now(),
+        });
 
     // 6. Serve.
     let listener = tokio::net::TcpListener::bind(cfg.http_bind)

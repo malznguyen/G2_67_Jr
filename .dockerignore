@@ -1,0 +1,61 @@
+# Repo-root .dockerignore — applied when context is the repo root (e.g.
+# infra/docker-compose.yml which uses `context: ..`).
+# Keep this file small and coarse; service-level ignores live next to
+# their Dockerfile (e.g. frontend/.dockerignore) and are only honoured
+# when the service context is that service's directory.
+
+# VCS / metadata
+**/.git
+**/.gitignore
+**/.gitattributes
+**/.gitkeep
+**/.github
+**/.vscode
+**/.idea
+**/.DS_Store
+**/Thumbs.db
+**/desktop.ini
+
+# Build artefacts
+**/target/
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+**/build/
+**/.cache/
+**/.turbo/
+**/.parcel-cache/
+**/coverage/
+**/.pnpm-store/
+
+# Rust / Cargo
+**/*.rs.bk
+**/Cargo.lock.bak
+
+# Env & secrets
+**/.env
+**/.env.local
+**/.env.*.local
+**/.env.development
+**/.env.production
+**/*.pem
+**/*.key
+**/*.crt
+
+# Test artifacts
+**/junit.xml
+**/test-results/
+**/playwright-report/
+**/playwright/.cache/
+**/.dockerignore
+**/Dockerfile
+
+# Local infra runtime
+infra/.volumes/
+infra/data/
+infra/runtime/
+**/*.log
+
+# OS
+**/.DS_Store

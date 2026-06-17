@@ -1,0 +1,12 @@
+**/node_modules
+**/.next
+**/out
+**/.git
+**/.gitignore
+**/.env*.local
+**/Dockerfile
+**/docker-compose*.yml
+**/README.md
+**/.DS_Store
+**/coverage
+**/.pnpm-store

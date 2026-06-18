@@ -16,11 +16,16 @@ pub mod queue;
 pub mod storage;
 pub mod chunking;
 pub mod embedding;
+pub mod graph;
 pub mod ocr;
 
 pub use chunking::{ChunkError, chunk_page_texts};
 pub use embedding::{
     EmbedError, Embedder, OpenAiEmbedder, OllamaEmbedder, TenantLlmConfig, select_embedder,
+};
+pub use graph::{
+    DeepSeekGraphExtractor, ExtractedEdge, ExtractedNode, GraphExtractError, GraphExtraction,
+    GraphExtractor, parse_graph_json, select_graph_extractor,
 };
 pub use job::{IngestJob, process_job};
 pub use ocr::{MockOcr, NoOcr, OcrClient, OcrError, OllamaVisionOcr};

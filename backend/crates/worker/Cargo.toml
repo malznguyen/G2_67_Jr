@@ -47,6 +47,9 @@ futures = "0.3"
 tiktoken-rs = "0.11"
 text-splitter = { version = "0.30", features = ["tiktoken-rs"] }
 
+# T37: OCR fallback — base64 encoding for Ollama vision API images.
+base64 = "0.22"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = "0.6"

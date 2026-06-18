@@ -10,9 +10,9 @@ use crate::error::{Error, Result};
 use std::sync::Arc;
 
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder, Distance,
-    FieldType, Filter, PointStruct, ScoredPoint, SearchPointsBuilder, UpsertPointsBuilder,
-    VectorParamsBuilder,
+    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder,
+    Distance, FieldType, Filter, PointStruct, ScoredPoint, SearchPointsBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use uuid::Uuid;
 
@@ -232,6 +232,71 @@ impl QdrantStore {
         let resp = self
             .client
             .search_points(req)
+            .await
+            .map_err(Error::from)?;
+        Ok(resp.result)
+    }
+
+    /// Upsert graph nodes into the tenant-scoped `graph_{tenant_id}`
+    /// collection.
+    ///
+    /// Each point is expected to carry a 768-dim vector (matching
+    /// [`EMBED_DIM`]) and a payload conforming to the T29 schema
+    /// (`node_id`, `workspace_id`, `entity_name`). The caller is
+    /// responsible for embedding the entity description into the vector
+    /// and building the payload; this method only transports them to
+    /// Qdrant.
+    ///
+    /// `.wait(true)` is set so the upsert is acknowledged (and indexed)
+    /// before the call returns — a subsequent `search_graph_nodes` will
+    /// see the new nodes.
+    ///
+    /// Mirrors [`upsert_chunks`] (T31) but targets `graph_{tenant_id}`.
+    pub async fn upsert_graph_nodes(
+        &self,
+        tenant_id: Uuid,
+        points: Vec<PointStruct>,
+    ) -> Result<()> {
+        let name = format!("graph_{tenant_id}");
+        self.client
+            .upsert_points(UpsertPointsBuilder::new(name, points).wait(true))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// kNN search over the tenant-scoped `graph_{tenant_id}` collection,
+    /// scoped to a single `workspace_id` within the tenant.
+    ///
+    /// Unlike [`search_chunks`] (T32, which takes an `Option<Filter>` so
+    /// the caller can compose arbitrary filters), `search_graph_nodes`
+    /// takes `workspace_id` directly and builds the `workspace_id` filter
+    /// internally. Per the T33 spec, graph search is always
+    /// workspace-scoped inside a tenant — there is no use case for
+    /// cross-workspace graph queries.
+    ///
+    /// Returns the `top_k` closest nodes to `query_vector` (cosine
+    /// similarity, per the T29 vector config), sorted by score descending.
+    /// Payload (`node_id`, `workspace_id`, `entity_name`) is included in
+    /// every `ScoredPoint` so the caller can join back to the
+    /// `graph_nodes` table in PostgreSQL (T21 migration) via `node_id`.
+    pub async fn search_graph_nodes(
+        &self,
+        tenant_id: Uuid,
+        workspace_id: Uuid,
+        query_vector: Vec<f32>,
+        top_k: u64,
+    ) -> Result<Vec<ScoredPoint>> {
+        let name = format!("graph_{tenant_id}");
+        let filter =
+            Filter::must([Condition::matches("workspace_id", workspace_id.to_string())]);
+        let resp = self
+            .client
+            .search_points(
+                SearchPointsBuilder::new(name, query_vector, top_k)
+                    .filter(filter)
+                    .with_payload(true),
+            )
             .await
             .map_err(Error::from)?;
         Ok(resp.result)
@@ -773,6 +838,110 @@ mod tests {
             3,
             "unfiltered search must return all 3 points, got {}",
             all.len()
+        );
+
+        // Cleanup.
+        store
+            .teardown_tenant_collections(tenant_id)
+            .await
+            .expect("teardown_tenant_collections must clean up");
+    }
+
+    /// T33 — `upsert_graph_nodes` + `search_graph_nodes` on
+    /// `graph_{tenant_id}`. Inserts 3 graph nodes across 2 workspaces with
+    /// orthogonal vectors, then searches scoped to a workspace and
+    /// asserts: (1) only the filtered workspace's nodes are returned,
+    /// (2) the top hit is the exact-match vector (recall), (3) results
+    /// sorted by score descending.
+    ///
+    /// Unlike `search_chunks` (T32, caller-supplied `Option<Filter>`),
+    /// `search_graph_nodes` takes `workspace_id` directly and builds the
+    /// filter internally — per the T33 spec, graph search is always
+    /// workspace-scoped inside a tenant.
+    #[tokio::test]
+    async fn upsert_and_search_graph_nodes_filters_by_workspace() {
+        let store = local_store().await;
+        let tenant_id = Uuid::new_v4();
+
+        // Provision via T30 pub API (creates both chunks_* and graph_*).
+        store
+            .setup_tenant_collections(tenant_id)
+            .await
+            .expect("setup_tenant_collections must provision graph collection");
+
+        let ws_a = Uuid::new_v4();
+        let ws_b = Uuid::new_v4();
+
+        let make_node = |id: u64, node_id: Uuid, ws: Uuid, entity: &str, vec: Vec<f32>| {
+            PointStruct::new(
+                id,
+                vec,
+                Payload::try_from(serde_json::json!({
+                    "node_id": node_id.to_string(),
+                    "workspace_id": ws.to_string(),
+                    "entity_name": entity,
+                }))
+                .expect("graph node payload must build from json"),
+            )
+        };
+
+        // node 1: ws_a, vec A (unit_vec(0)), entity "Person" — top hit for query A.
+        // node 2: ws_a, vec B (unit_vec(1)), entity "Org" — orthogonal to A, same ws.
+        // node 3: ws_b, vec A (unit_vec(0)), entity "Person" — same vec as node 1
+        //         but DIFFERENT workspace; must be filtered OUT.
+        let nodes = vec![
+            make_node(1, Uuid::new_v4(), ws_a, "Person", unit_vec(0)),
+            make_node(2, Uuid::new_v4(), ws_a, "Org", unit_vec(1)),
+            make_node(3, Uuid::new_v4(), ws_b, "Person", unit_vec(0)),
+        ];
+        store
+            .upsert_graph_nodes(tenant_id, nodes)
+            .await
+            .expect("upsert_graph_nodes must seed graph corpus");
+
+        // Search scoped to ws_a with query vector A.
+        let results = store
+            .search_graph_nodes(tenant_id, ws_a, unit_vec(0), 3)
+            .await
+            .expect("search_graph_nodes must succeed");
+
+        // (1) Only ws_a nodes returned — node 3 (ws_b) filtered out.
+        assert!(
+            !results.is_empty(),
+            "search_graph_nodes must return at least one result"
+        );
+        let ws_a_str = ws_a.to_string();
+        for point in &results {
+            let got = point.get("workspace_id").as_str();
+            assert_eq!(
+                got,
+                Some(&ws_a_str),
+                "graph search must only return ws_a nodes, got workspace_id = {got:?}"
+            );
+        }
+        assert_eq!(
+            results.len(),
+            2,
+            "expected 2 ws_a nodes (1 and 2), got {} results",
+            results.len()
+        );
+
+        // (2) Recall: top hit is node 1 (vec A == query A, cosine = 1.0).
+        // Distinguish node 1 from node 2 via entity_name.
+        let top = &results[0];
+        let top_entity = top.get("entity_name").as_str();
+        assert_eq!(
+            top_entity.map(|s| s.as_str()),
+            Some("Person"),
+            "top result must be node 1 (entity 'Person', exact vector match), got entity_name = {top_entity:?}"
+        );
+
+        // (3) Results sorted by score descending.
+        assert!(
+            results[0].score >= results[1].score,
+            "graph results must be sorted by score descending; got [0].score={} >= [1].score={}",
+            results[0].score,
+            results[1].score
         );
 
         // Cleanup.

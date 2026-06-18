@@ -7,6 +7,9 @@ license.workspace = true
 publish = false
 description = "gmrag background worker (ingestion, GraphRAG jobs)."
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "gmrag-worker"
 path = "src/main.rs"
@@ -25,3 +28,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 dotenvy.workspace = true
+uuid.workspace = true
+
+redis = { version = "0.25", features = ["tokio-comp", "aio"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

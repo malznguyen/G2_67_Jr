@@ -19,7 +19,7 @@
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` → ExitCode 0
 - [x] `cargo test --workspace` → **87 passed, 0 failed**
 - [x] `/health` → 200, `/users/me` fake_token → 401
-- [x] Commit: {COMMIT_HASH — điền sau khi commit}
+- [x] Commit: `cc443ea` (pushed to origin main)
 
 ## Files đã tạo / sửa
 | File | Hành động | Fix |

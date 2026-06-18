@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn make_validator_with_key() -> JwtValidator {
-        let decoding_key = DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap();
+        let _decoding_key = DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap();
         let validator = JwtValidator::new(
             "http://localhost:8080/realms/gmrag".to_string(),
             "gmrag-backend".to_string(),

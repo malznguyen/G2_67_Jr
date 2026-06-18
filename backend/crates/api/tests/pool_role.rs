@@ -9,7 +9,6 @@
 //! by `infra/postgres/init.sql` / the identity migration.
 
 use gmrag_core::{init_app_pool, init_pool};
-use sqlx::Executor;
 
 /// The role that `init_pool` connects as (the `DATABASE_URL` superuser).
 /// In dev this is `gmrag`.

@@ -16,7 +16,9 @@ pub mod queue;
 pub mod storage;
 pub mod embedding;
 
-pub use embedding::{EmbedError, OllamaEmbedder};
+pub use embedding::{
+    EmbedError, Embedder, OpenAiEmbedder, OllamaEmbedder, TenantLlmConfig, select_embedder,
+};
 pub use job::{IngestJob, process_job};
 pub use pdf_parser::{ExtractionMethod, ParsedDocument, PdfParseError, parse_pdf};
 pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};

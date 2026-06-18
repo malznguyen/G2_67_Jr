@@ -1,8 +1,9 @@
-//! Ollama embedding client: batched `/api/embed` with retry/backoff.
+//! Embedding clients: Ollama (default) + OpenAI (BYOK), behind a shared trait.
 //!
-//! T39: port of v1 `embedding.rs` + retry/backoff logic from v1 `processor.rs`.
-//! The embedder is a concrete type (`OllamaEmbedder`); T40 introduces the
-//! `Embedder` trait + `OpenAiEmbedder` + factory for BYOK.
+//! T39: `OllamaEmbedder` — `POST {host}/api/embed` with batch + retry/backoff.
+//! T40: `Embedder` trait + `OpenAiEmbedder` (BYOK, `dimensions=768` pinned) +
+//!      `select_embedder` factory that reads `tenant_llm_config` (RLS-scoped)
+//!      to pick the right embedder per tenant.
 
 use std::time::Duration;
 
@@ -16,6 +17,36 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_RETRIES: usize = 1;
 const DEFAULT_BACKOFF_MS: u64 = 250;
 const BACKOFF_CAP_POWER: u32 = 6;
+
+/// Embedding dimension shared by all embedders.
+///
+/// Pinned to 768 to match `QdrantStore::EMBED_DIM` (core/src/qdrant/store.rs).
+/// `OpenAiEmbedder` requests `dimensions=768` from `text-embedding-3-small`
+/// (OpenAI supports shortening) so BYOK vectors fit existing collections
+/// without re-embedding or per-tenant dimension tracking.
+pub const EMBED_DIM: usize = 768;
+
+/// Boxed future returned by [`Embedder::embed_batch`]. The `Send` bound
+/// lets it be awaited from any tokio task; the `'a` tie lets the embedder
+/// borrow `&[String]` without cloning.
+pub type EmbedFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send + 'a>,
+>;
+
+/// Trait abstracting embedding providers so the worker can swap Ollama vs
+/// OpenAI per-tenant (BYOK) without the call site caring.
+pub trait Embedder: Send + Sync {
+    /// Embed a slice of texts, returning vectors in input order.
+    fn embed_batch<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a>;
+
+    /// Output vector dimension (always 768 in this project).
+    fn dimension(&self) -> usize {
+        EMBED_DIM
+    }
+
+    /// Provider name for logging/metrics ("ollama" | "openai").
+    fn provider(&self) -> &str;
+}
 
 /// Ollama embedding client backed by `POST {host}/api/embed`.
 ///
@@ -35,17 +66,19 @@ pub struct OllamaEmbedder {
     backoff_ms: u64,
 }
 
-/// Errors emitted by the Ollama embedder.
+/// Errors emitted by embedding clients.
 #[derive(Debug, Error)]
 pub enum EmbedError {
-    #[error("ollama embedding request failed: {0}")]
+    #[error("embedding HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("ollama embedding timed out after {0}s")]
+    #[error("embedding request timed out after {0}s")]
     Timeout(u64),
-    #[error("ollama returned an empty embedding")]
+    #[error("embedding provider returned an empty embedding")]
     Empty,
-    #[error("ollama returned {actual} embeddings for {expected} requested texts")]
+    #[error("embedding provider returned {actual} embeddings for {expected} requested texts")]
     CountMismatch { expected: usize, actual: usize },
+    #[error("embedding database error: {0}")]
+    Db(String),
 }
 
 impl OllamaEmbedder {
@@ -211,6 +244,296 @@ impl OllamaEmbedder {
     }
 }
 
+impl Embedder for OllamaEmbedder {
+    fn embed_batch<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send + 'a>,
+    > {
+        Box::pin(async move { OllamaEmbedder::embed_batch(self, texts).await })
+    }
+
+    fn provider(&self) -> &str {
+        "ollama"
+    }
+}
+
+// =========================================================
+// T40: OpenAI BYOK embedder (text-embedding-3-small, dim 768)
+// =========================================================
+
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 60;
+const OPENAI_MODEL: &str = "text-embedding-3-small";
+
+/// OpenAI embedding client (BYOK). Uses `text-embedding-3-small` with
+/// `dimensions=768` pinned so output vectors fit the shared Qdrant
+/// collection schema (768-dim Cosine) without re-embedding or per-tenant
+/// dimension tracking.
+pub struct OpenAiEmbedder {
+    client: reqwest::Client,
+    url: String,
+    api_key: String,
+    model: String,
+    batch_size: usize,
+    concurrency: usize,
+    timeout: Duration,
+    retries: usize,
+    backoff_ms: u64,
+}
+
+impl OpenAiEmbedder {
+    /// Build from a tenant's BYOK config. `base_url` falls back to the
+    /// OpenAI default when `None`; `model` falls back to
+    /// `text-embedding-3-small` when empty.
+    pub fn new(api_key: String, model: &str, base_url: Option<&str>) -> Self {
+        let base = base_url
+            .map(|b| b.trim_end_matches('/').to_string())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
+        let model = if model.is_empty() {
+            OPENAI_MODEL.to_string()
+        } else {
+            model.to_string()
+        };
+        Self {
+            client: reqwest::Client::new(),
+            url: format!("{base}/embeddings"),
+            api_key,
+            model,
+            batch_size: DEFAULT_BATCH_SIZE,
+            concurrency: DEFAULT_CONCURRENCY,
+            timeout: Duration::from_secs(DEFAULT_OPENAI_TIMEOUT_SECS),
+            retries: DEFAULT_RETRIES,
+            backoff_ms: DEFAULT_BACKOFF_MS,
+        }
+    }
+
+    pub fn with_batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n.max(1);
+        self
+    }
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
+        self
+    }
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs.max(1));
+        self
+    }
+    pub fn with_retries(mut self, n: usize) -> Self {
+        self.retries = n;
+        self
+    }
+    pub fn with_backoff_ms(mut self, ms: u64) -> Self {
+        self.backoff_ms = ms;
+        self
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Embed a single text. Convenience wrapper around the trait's
+    /// `embed_batch`.
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let out = self
+            .embed_batch(&[text.to_string()])
+            .await?;
+        out.into_iter().next().ok_or(EmbedError::Empty)
+    }
+
+    async fn embed_batch_with_retry(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let body = OpenAiEmbedRequest {
+            model: self.model.clone(),
+            input: texts,
+            dimensions: EMBED_DIM,
+        };
+        let timeout_secs = self.timeout.as_secs();
+
+        let mut last_error: Option<EmbedError> = None;
+        for attempt in 0..=self.retries {
+            let result = tokio::time::timeout(
+                self.timeout,
+                self.client
+                    .post(&self.url)
+                    .bearer_auth(&self.api_key)
+                    .json(&body)
+                    .send(),
+            )
+            .await;
+
+            let outcome: Result<Vec<Vec<f32>>, EmbedError> = match result {
+                Ok(Ok(resp)) => match resp.error_for_status() {
+                    Ok(ok_resp) => match ok_resp.json::<OpenAiEmbedResponse>().await {
+                        Ok(parsed) => {
+                            let embeddings: Vec<Vec<f32>> =
+                                parsed.data.into_iter().map(|d| d.embedding).collect();
+                            if embeddings.len() != texts.len() {
+                                Err(EmbedError::CountMismatch {
+                                    expected: texts.len(),
+                                    actual: embeddings.len(),
+                                })
+                            } else if embeddings.iter().any(Vec::is_empty) {
+                                Err(EmbedError::Empty)
+                            } else {
+                                Ok(embeddings)
+                            }
+                        }
+                        Err(e) => Err(EmbedError::Http(e)),
+                    },
+                    Err(e) => Err(EmbedError::Http(e)),
+                },
+                Ok(Err(e)) => Err(EmbedError::Http(e)),
+                Err(_) => Err(EmbedError::Timeout(timeout_secs)),
+            };
+
+            match outcome {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => last_error = Some(e),
+            }
+
+            if attempt < self.retries {
+                let pow = attempt.min(BACKOFF_CAP_POWER as usize) as u32;
+                let delay_ms = self.backoff_ms.saturating_mul(2_u64.saturating_pow(pow));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or(EmbedError::Timeout(timeout_secs)))
+    }
+}
+
+impl Embedder for OpenAiEmbedder {
+    fn embed_batch<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let batch_size = self.batch_size;
+            let batches: Vec<(usize, Vec<String>)> = texts
+                .chunks(batch_size)
+                .enumerate()
+                .map(|(i, chunk)| (i * batch_size, chunk.to_vec()))
+                .collect();
+
+            let results = stream::iter(batches.into_iter().map(|(start, batch)| {
+                async move {
+                    let embeddings = self.embed_batch_with_retry(&batch).await?;
+                    Ok::<_, EmbedError>((start, embeddings))
+                }
+            }))
+            .buffer_unordered(self.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+            let mut ordered = vec![None; texts.len()];
+            for result in results {
+                let (start, embeddings) = result?;
+                for (offset, emb) in embeddings.into_iter().enumerate() {
+                    let idx = start + offset;
+                    if idx < ordered.len() {
+                        ordered[idx] = Some(emb);
+                    }
+                }
+            }
+            ordered
+                .into_iter()
+                .map(|emb| emb.ok_or(EmbedError::Empty))
+                .collect()
+        })
+    }
+
+    fn provider(&self) -> &str {
+        "openai"
+    }
+}
+
+// =========================================================
+// T40: tenant_llm_config row + select_embedder factory
+// =========================================================
+
+/// Row from `tenant_llm_config` (RLS-scoped per tenant).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TenantLlmConfig {
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub dimensions: i32,
+    pub enabled: bool,
+}
+
+/// Select the embedder for a tenant.
+///
+/// Reads `tenant_llm_config` inside an RLS-enforced transaction
+/// (`SET LOCAL ROLE gmrag_app` + `SET LOCAL app.tenant_id`). If the
+/// tenant has an enabled row with `provider='openai'` and a non-null
+/// `api_key`, returns an `OpenAiEmbedder`; otherwise falls back to the
+/// platform default `OllamaEmbedder` built from `ollama_cfg`.
+///
+/// This is the entry point the worker calls per ingest job (T42). The
+/// pool passed in can be either `init_app_pool` (production — role
+/// already `gmrag_app`) or a superuser test pool — `SET LOCAL ROLE
+/// gmrag_app` handles both.
+pub async fn select_embedder(
+    pool: &sqlx::PgPool,
+    tenant_id: uuid::Uuid,
+    ollama_cfg: &OllamaConfig,
+) -> Result<Box<dyn Embedder>, EmbedError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| EmbedError::Db(e.to_string()))?;
+
+    // RLS: downgrade to app role + set tenant context for this tx.
+    sqlx::Executor::execute(&mut *tx, "SET LOCAL ROLE gmrag_app")
+        .await
+        .map_err(|e| EmbedError::Db(e.to_string()))?;
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{tenant_id}'"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| EmbedError::Db(e.to_string()))?;
+
+    let row = sqlx::query_as::<_, TenantLlmConfig>(
+        r#"
+        SELECT provider, api_key, model, base_url, dimensions, enabled
+        FROM tenant_llm_config
+        WHERE enabled = true
+        "#,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| EmbedError::Db(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| EmbedError::Db(e.to_string()))?;
+
+    match row {
+        Some(cfg) if cfg.provider == "openai" && cfg.api_key.is_some() => {
+            Ok(Box::new(OpenAiEmbedder::new(
+                cfg.api_key.unwrap(),
+                &cfg.model,
+                cfg.base_url.as_deref(),
+            )))
+        }
+        _ => Ok(Box::new(OllamaEmbedder::new(ollama_cfg))),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct OllamaEmbedRequest<'a> {
     model: String,
@@ -220,6 +543,23 @@ struct OllamaEmbedRequest<'a> {
 #[derive(serde::Deserialize)]
 struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiEmbedRequest<'a> {
+    model: String,
+    input: &'a [String],
+    dimensions: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiEmbedResponse {
+    data: Vec<OpenAiEmbedDatum>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiEmbedDatum {
+    embedding: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -433,5 +773,106 @@ mod tests {
         let v = embedder.embed_one("hello").await.expect("must succeed");
         assert_eq!(v.len(), 768);
         assert_eq!(v[0], 0.5);
+    }
+
+    // ---------- T40: OpenAiEmbedder (BYOK) ----------
+
+    fn openai_embedder_at(server: &MockServer) -> OpenAiEmbedder {
+        OpenAiEmbedder::new("sk-test-key".into(), "", Some(&server.uri()))
+            .with_batch_size(2)
+            .with_concurrency(2)
+            .with_timeout_secs(5)
+            .with_retries(2)
+            .with_backoff_ms(5)
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_returns_768_dim_vectors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(body_partial_json(json!({ "dimensions": 768 })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [
+                        { "embedding": vec768(0.1), "index": 0 },
+                        { "embedding": vec768(0.2), "index": 1 },
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let embedder = openai_embedder_at(&server).with_batch_size(2);
+        let out = embedder
+            .embed_batch(&["a".to_string(), "b".to_string()])
+            .await
+            .expect("must succeed");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len(), 768, "dimension must be pinned to 768");
+        assert_eq!(out[0][0], 0.1);
+        assert_eq!(out[1][0], 0.2);
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_sends_bearer_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer sk-test-key",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{ "embedding": vec768(0.7), "index": 0 }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let embedder = openai_embedder_at(&server).with_batch_size(1).with_retries(0);
+        let v = embedder.embed_one("hello").await.expect("must succeed");
+        assert_eq!(v[0], 0.7);
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_retries_on_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{ "embedding": vec768(0.3), "index": 0 }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let embedder = openai_embedder_at(&server).with_batch_size(1);
+        let v = embedder.embed_one("x").await.expect("retry must succeed");
+        assert_eq!(v[0], 0.3);
+    }
+
+    #[tokio::test]
+    async fn openai_embedder_trait_provider_and_dimension() {
+        let server = MockServer::start().await;
+        let embedder = openai_embedder_at(&server);
+        assert_eq!(embedder.provider(), "openai");
+        assert_eq!(embedder.dimension(), 768);
+    }
+
+    #[tokio::test]
+    async fn ollama_embedder_trait_provider_and_dimension() {
+        let server = MockServer::start().await;
+        let embedder = embedder_at(&server);
+        assert_eq!(embedder.provider(), "ollama");
+        assert_eq!(embedder.dimension(), 768);
     }
 }

@@ -71,7 +71,7 @@ impl QdrantStore {
             .map(|_| ())
     }
 
-    /// Create the tenant-scoped chunks collection.
+    /// Create the tenant-scoped chunks collection (idempotent).
     ///
     /// Collection name: `chunks_{tenant_id}`. Vector config: single vector,
     /// size [`EMBED_DIM`] (768), `Distance::Cosine`, Qdrant-default HNSW.
@@ -83,11 +83,19 @@ impl QdrantStore {
     /// - `owner_id`     — Uuid
     /// - `visibility`   — Keyword
     ///
+    /// Idempotent (T30): `list_collection_names` is checked first and the
+    /// collection is only created when missing. This avoids the
+    /// "collection already exists" error that `create_collection` returns
+    /// when called twice with the same name — see the T28/T29 blocker notes.
+    ///
     /// Index creation uses `.wait(true)` so the index is materialized before
     /// the call returns (avoids a race where an immediate upsert lands
     /// before the index exists).
-    pub async fn create_chunks_collection(&self, tenant_id: Uuid) -> Result<()> {
+    async fn create_chunks_collection(&self, tenant_id: Uuid) -> Result<()> {
         let name = format!("chunks_{tenant_id}");
+        if self.collection_exists(&name).await? {
+            return Ok(());
+        }
         self.create_collection_with_indexes(&name, &[
             ("workspace_id", FieldType::Uuid),
             ("document_id", FieldType::Uuid),
@@ -99,7 +107,7 @@ impl QdrantStore {
         .await
     }
 
-    /// Create the tenant-scoped graph collection.
+    /// Create the tenant-scoped graph collection (idempotent).
     ///
     /// Collection name: `graph_{tenant_id}`. Vector config: single vector,
     /// size [`EMBED_DIM`] (768), `Distance::Cosine`, Qdrant-default HNSW.
@@ -107,14 +115,62 @@ impl QdrantStore {
     /// - `node_id`      — Uuid
     /// - `workspace_id` — Uuid
     /// - `entity_name`  — Keyword
-    pub async fn create_graph_collection(&self, tenant_id: Uuid) -> Result<()> {
+    ///
+    /// Idempotent (T30): same guard as [`create_chunks_collection`].
+    async fn create_graph_collection(&self, tenant_id: Uuid) -> Result<()> {
         let name = format!("graph_{tenant_id}");
+        if self.collection_exists(&name).await? {
+            return Ok(());
+        }
         self.create_collection_with_indexes(&name, &[
             ("node_id", FieldType::Uuid),
             ("workspace_id", FieldType::Uuid),
             ("entity_name", FieldType::Keyword),
         ])
         .await
+    }
+
+    /// Returns `true` if a collection with the given name exists on the
+    /// server. Used by the idempotent `create_*` helpers (T30).
+    async fn collection_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.list_collection_names().await?.contains(&name.to_string()))
+    }
+
+    /// Provision both tenant-scoped collections (`chunks_{tenant_id}` and
+    /// `graph_{tenant_id}`) in one call. Idempotent: safe to call multiple
+    /// times for the same tenant — existing collections are left untouched.
+    ///
+    /// This is the entry point for tenant provisioning (worker / tenant
+    /// bootstrap). The underlying `create_chunks_collection` /
+    /// `create_graph_collection` helpers check `list_collection_names`
+    /// before issuing `create_collection`, so a repeated `setup` does not
+    /// raise the Qdrant "collection already exists" error.
+    pub async fn setup_tenant_collections(&self, tenant_id: Uuid) -> Result<()> {
+        self.create_chunks_collection(tenant_id).await?;
+        self.create_graph_collection(tenant_id).await?;
+        Ok(())
+    }
+
+    /// Delete both tenant-scoped collections (`chunks_{tenant_id}` and
+    /// `graph_{tenant_id}`). Idempotent: missing collections are treated as
+    /// success (the server returns an error for nonexistent collections,
+    /// so `delete_collection`'s `Err` is only surfaced when the name is
+    /// present but deletion fails for another reason — handled by first
+    /// checking `collection_exists`).
+    ///
+    /// This is the entry point for tenant teardown (tenant offboarding /
+    /// test cleanup).
+    pub async fn teardown_tenant_collections(&self, tenant_id: Uuid) -> Result<()> {
+        let chunks = format!("chunks_{tenant_id}");
+        let graph = format!("graph_{tenant_id}");
+        let names = self.list_collection_names().await?;
+        if names.contains(&chunks) {
+            self.delete_collection(&chunks).await?;
+        }
+        if names.contains(&graph) {
+            self.delete_collection(&graph).await?;
+        }
+        Ok(())
     }
 
     /// Shared helper: create a 768-dim Cosine collection and attach a set of
@@ -385,5 +441,81 @@ mod tests {
             !names_after.contains(&name),
             "collection '{name}' must be gone after delete, got {names_after:?}"
         );
+    }
+
+    /// T30 — `setup_tenant_collections` must be idempotent (calling it twice
+    /// for the same tenant does not error) and `teardown_tenant_collections`
+    /// must remove both `chunks_{tenant_id}` and `graph_{tenant_id}`.
+    ///
+    /// This is the core blocker fix from T28/T29: the raw `create_*`
+    /// helpers raised "collection already exists" on the second call. The
+    /// `setup` wrapper guards with `list_collection_names` first.
+    #[tokio::test]
+    async fn setup_tenant_collections_is_idempotent() {
+        let store = local_store().await;
+        let tenant_id = Uuid::new_v4();
+        let chunks_name = format!("chunks_{tenant_id}");
+        let graph_name = format!("graph_{tenant_id}");
+
+        // Cleanup any stale collections from a prior aborted run.
+        let _ = store.teardown_tenant_collections(tenant_id).await;
+
+        // First setup: both collections must be created.
+        store
+            .setup_tenant_collections(tenant_id)
+            .await
+            .expect("first setup_tenant_collections must succeed");
+        let names_after_first = store
+            .list_collection_names()
+            .await
+            .expect("list_collection_names must succeed after first setup");
+        assert!(
+            names_after_first.contains(&chunks_name),
+            "chunks collection '{chunks_name}' must exist after setup, got {names_after_first:?}"
+        );
+        assert!(
+            names_after_first.contains(&graph_name),
+            "graph collection '{graph_name}' must exist after setup, got {names_after_first:?}"
+        );
+
+        // Second setup: MUST NOT error — this is the idempotency assertion
+        // that failed before T30 (raw create_collection raised on duplicate).
+        store
+            .setup_tenant_collections(tenant_id)
+            .await
+            .expect("second setup_tenant_collections must be idempotent (no error)");
+        let names_after_second = store
+            .list_collection_names()
+            .await
+            .expect("list_collection_names must succeed after second setup");
+        assert!(
+            names_after_second.contains(&chunks_name)
+                && names_after_second.contains(&graph_name),
+            "both collections must still exist after idempotent second setup, got {names_after_second:?}"
+        );
+
+        // Teardown: both collections must be gone.
+        store
+            .teardown_tenant_collections(tenant_id)
+            .await
+            .expect("teardown_tenant_collections must succeed");
+        let names_after_teardown = store
+            .list_collection_names()
+            .await
+            .expect("list_collection_names must succeed after teardown");
+        assert!(
+            !names_after_teardown.contains(&chunks_name),
+            "chunks collection must be gone after teardown, got {names_after_teardown:?}"
+        );
+        assert!(
+            !names_after_teardown.contains(&graph_name),
+            "graph collection must be gone after teardown, got {names_after_teardown:?}"
+        );
+
+        // Second teardown: MUST NOT error — idempotent on missing collections.
+        store
+            .teardown_tenant_collections(tenant_id)
+            .await
+            .expect("second teardown_tenant_collections must be idempotent (no error)");
     }
 }

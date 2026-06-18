@@ -33,5 +33,9 @@ uuid.workspace = true
 redis = { version = "0.25", features = ["tokio-comp", "aio"] }
 async-trait = "0.1"
 
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+wiremock = "0.6"

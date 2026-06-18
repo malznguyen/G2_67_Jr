@@ -12,9 +12,11 @@
 
 pub mod job;
 pub mod queue;
+pub mod storage;
 
 pub use job::{IngestJob, process_job};
 pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};
+pub use storage::S3Client;
 
 use anyhow::Context as _;
 use gmrag_core::{Config, init_pool};

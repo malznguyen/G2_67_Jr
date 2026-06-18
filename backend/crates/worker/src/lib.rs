@@ -11,10 +11,12 @@
 //! business queries would bypass RLS and cause a data leak.
 
 pub mod job;
+pub mod pdf_parser;
 pub mod queue;
 pub mod storage;
 
 pub use job::{IngestJob, process_job};
+pub use pdf_parser::{ExtractionMethod, ParsedDocument, PdfParseError, parse_pdf};
 pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};
 pub use storage::S3Client;
 

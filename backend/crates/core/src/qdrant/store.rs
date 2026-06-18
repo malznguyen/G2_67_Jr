@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use qdrant_client::qdrant::{
     CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder, Distance,
-    FieldType, PointStruct, UpsertPointsBuilder, VectorParamsBuilder,
+    FieldType, Filter, PointStruct, ScoredPoint, SearchPointsBuilder, UpsertPointsBuilder,
+    VectorParamsBuilder,
 };
 use uuid::Uuid;
 
@@ -201,6 +202,41 @@ impl QdrantStore {
         Ok(())
     }
 
+    /// kNN search over the tenant-scoped `chunks_{tenant_id}` collection.
+    ///
+    /// Returns the `top_k` closest points to `query_vector` (cosine
+    /// similarity, per the T28 vector config), optionally restricted to
+    /// points matching `filter`. Results are sorted by score descending
+    /// (Qdrant default). Payload is included in every `ScoredPoint` so the
+    /// caller can read `workspace_id`, `document_id`, `chunk_index`, etc.
+    /// without a follow-up `get_points` call.
+    ///
+    /// The `filter` is `Option<Filter>` — pass `None` for an unfiltered
+    /// kNN, or `Some(Filter::must([Condition::matches("workspace_id",
+    /// ws.to_string())]))` to scope the search to a workspace within the
+    /// tenant. Per the multi-tenant invariant, the `tenant_id` IS the
+    /// collection boundary (hard isolation), while `workspace_id` is a
+    /// softer payload-level partition inside the tenant.
+    pub async fn search_chunks(
+        &self,
+        tenant_id: Uuid,
+        query_vector: Vec<f32>,
+        filter: Option<Filter>,
+        top_k: u64,
+    ) -> Result<Vec<ScoredPoint>> {
+        let name = format!("chunks_{tenant_id}");
+        let mut req = SearchPointsBuilder::new(name, query_vector, top_k).with_payload(true);
+        if let Some(f) = filter {
+            req = req.filter(f);
+        }
+        let resp = self
+            .client
+            .search_points(req)
+            .await
+            .map_err(Error::from)?;
+        Ok(resp.result)
+    }
+
     /// Shared helper: create a 768-dim Cosine collection and attach a set of
     /// payload field indexes. Used by `create_chunks_collection` (T28) and
     /// `create_graph_collection` (T29).
@@ -232,7 +268,10 @@ impl QdrantStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qdrant_client::qdrant::{vectors_config::Config, CountPointsBuilder, Distance, PayloadSchemaType, PointStruct};
+    use qdrant_client::qdrant::{
+        vectors_config::Config, Condition, CountPointsBuilder, Distance, Filter, PayloadSchemaType,
+        PointStruct,
+    };
     use qdrant_client::Payload;
     use uuid::Uuid;
 
@@ -615,6 +654,125 @@ mod tests {
         assert_eq!(
             count, 3,
             "exactly 3 points must be present in '{chunks_name}' after upsert, got {count}"
+        );
+
+        // Cleanup.
+        store
+            .teardown_tenant_collections(tenant_id)
+            .await
+            .expect("teardown_tenant_collections must clean up");
+    }
+
+    /// T32 — `search_chunks` returns kNN results filtered by payload
+    /// (`workspace_id`). Inserts 3 chunks across 2 workspaces with known
+    /// orthogonal vectors, then searches with a `workspace_id` filter and
+    /// asserts: (1) only the filtered workspace's points are returned,
+    /// (2) the top hit is the exact-match vector (recall), (3) results are
+    /// sorted by score descending.
+    #[tokio::test]
+    async fn search_chunks_returns_filtered_knn_results() {
+        let store = local_store().await;
+        let tenant_id = Uuid::new_v4();
+
+        // Provision via T30 pub API.
+        store
+            .setup_tenant_collections(tenant_id)
+            .await
+            .expect("setup_tenant_collections must provision chunks collection");
+
+        // Two workspaces; doc + owner shared for simplicity.
+        let ws_a = Uuid::new_v4();
+        let ws_b = Uuid::new_v4();
+        let doc = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+
+        let make_point = |id: u64, ws: Uuid, idx: i64, vec: Vec<f32>| {
+            PointStruct::new(
+                id,
+                vec,
+                Payload::try_from(serde_json::json!({
+                    "workspace_id": ws.to_string(),
+                    "document_id": doc.to_string(),
+                    "chunk_index": idx,
+                    "filename": "a.txt",
+                    "owner_id": owner.to_string(),
+                    "visibility": "private",
+                }))
+                .expect("payload must build from json"),
+            )
+        };
+
+        // chunk 1: ws_a, vec A (unit_vec(0)) — should be the top hit for query A.
+        // chunk 2: ws_a, vec B (unit_vec(1)) — orthogonal to A, same workspace.
+        // chunk 3: ws_b, vec A (unit_vec(0)) — same vec as chunk 1 but DIFFERENT
+        //          workspace; must be filtered OUT by the workspace_id filter.
+        let points = vec![
+            make_point(1, ws_a, 0, unit_vec(0)),
+            make_point(2, ws_a, 1, unit_vec(1)),
+            make_point(3, ws_b, 0, unit_vec(0)),
+        ];
+        store
+            .upsert_chunks(tenant_id, points)
+            .await
+            .expect("upsert_chunks must seed search corpus");
+
+        // Search with workspace_id = ws_a filter, query vector = A (unit_vec(0)).
+        let ws_a_str = ws_a.to_string();
+        let filter = Filter::must([Condition::matches("workspace_id", ws_a_str.clone())]);
+        let results = store
+            .search_chunks(tenant_id, unit_vec(0), Some(filter), 3)
+            .await
+            .expect("search_chunks must succeed");
+
+        // (1) Only ws_a points are returned — chunk 3 (ws_b) is filtered out.
+        assert!(
+            !results.is_empty(),
+            "search_chunks must return at least one result"
+        );
+        for point in &results {
+            let got = point.get("workspace_id").as_str();
+            assert_eq!(
+                got,
+                Some(&ws_a_str),
+                "filtered search must only return ws_a points, got workspace_id = {got:?}"
+            );
+        }
+        // chunk 1 + chunk 2 are in ws_a → 2 results.
+        assert_eq!(
+            results.len(),
+            2,
+            "expected 2 ws_a points (chunks 1 and 2), got {} results",
+            results.len()
+        );
+
+        // (2) Recall: top hit is chunk 1 (vec A == query A, cosine = 1.0).
+        let top = &results[0];
+        let top_idx = top.get("chunk_index").as_integer();
+        assert_eq!(
+            top_idx,
+            Some(0),
+            "top result must be chunk 1 (chunk_index 0, exact vector match), got chunk_index = {top_idx:?}"
+        );
+
+        // (3) Results sorted by score descending.
+        assert!(
+            results[0].score >= results[1].score,
+            "results must be sorted by score descending; got [0].score={} > [1].score={}",
+            results[0].score,
+            results[1].score
+        );
+
+        // Sanity: unfiltered search returns all 3 (proves filter is what
+        // removed chunk 3, not a missing point).
+        let all = store
+            .search_chunks(tenant_id, unit_vec(0), None, 5)
+            .await
+            .expect("unfiltered search_chunks must succeed");
+        assert_eq!(
+            all.len(),
+            3,
+            "unfiltered search must return all 3 points, got {}",
+            all.len()
         );
 
         // Cleanup.

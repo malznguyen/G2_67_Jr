@@ -133,6 +133,8 @@ mod tests {
             "document_id": "880e8400-e29b-41d4-a716-446655440000",
             "s3_key": "tenant-66/document-88/report.pdf",
             "filename": "report.pdf",
+            "owner_id": "990e8400-e29b-41d4-a716-446655440000",
+            "visibility": "private",
             "attempts": 0
         }"#
         .as_bytes()

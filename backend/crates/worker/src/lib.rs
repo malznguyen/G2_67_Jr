@@ -1,24 +1,22 @@
 //! gmrag-worker — background job runner library.
 //!
-//! T34: worker crate skeleton + Redis BRPOP poll loop.
-//! `process_job` is a stub — real ingestion pipeline lands in T37+.
+//! T34: skeleton + Redis BRPOP poll loop. T43: full ingestion pipeline
+//! (`IngestContext::process_job`) + retry wrapper (`process_job_with_retry`).
 //!
-//! Pool rule (per project invariant): the worker currently uses `init_pool`
-//! (admin / `gmrag` superuser) only for the boot-time liveness check.
-//! **When T37+ implements `process_job` with Postgres dual-write, it MUST
-//! switch to `init_app_pool` (`gmrag_app` role) + `SET LOCAL
-//! app.tenant_id = $job.tenant_id` per job.** Using `admin_pool` for
-//! business queries would bypass RLS and cause a data leak.
+//! Pool rule (per project invariant): the worker uses `init_app_pool`
+//! (`gmrag_app` role, RLS enforced) for all business queries and sets
+//! `SET LOCAL app.tenant_id = $job.tenant_id` per job. `admin_pool` is
+//! never used for business logic.
 
-pub mod job;
-pub mod pdf_parser;
-pub mod queue;
-pub mod storage;
 pub mod chunking;
 pub mod embedding;
 pub mod graph;
+pub mod job;
 pub mod ocr;
+pub mod pdf_parser;
 pub mod qdrant_writer;
+pub mod queue;
+pub mod storage;
 
 pub use chunking::{ChunkError, chunk_page_texts};
 pub use embedding::{
@@ -28,32 +26,34 @@ pub use graph::{
     DeepSeekGraphExtractor, ExtractedEdge, ExtractedNode, GraphExtractError, GraphExtraction,
     GraphExtractor, parse_graph_json, select_graph_extractor,
 };
-pub use job::{IngestJob, process_job};
+pub use job::{IngestContext, IngestJob, JobRunner, MAX_ATTEMPTS, process_job_with_retry};
 pub use ocr::{MockOcr, NoOcr, OcrClient, OcrError, OllamaVisionOcr};
-pub use pdf_parser::{ExtractionMethod, MockRenderer, PageRenderer, ParsedDocument, PdfParseError, RenderError, parse_pdf, parse_pdf_with_ocr};
-pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};
+pub use pdf_parser::{
+    ExtractionMethod, MockRenderer, PageRenderer, ParsedDocument, PdfParseError, RenderError,
+    parse_pdf, parse_pdf_with_ocr,
+};
 pub use qdrant_writer::{DualWriteInput, DualWriteResult, IngestError, dual_write_ingestion};
+pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};
 pub use storage::S3Client;
 
 use anyhow::Context as _;
-use gmrag_core::{Config, init_pool};
+use gmrag_core::Config;
 use tracing::info;
 
-/// Boot the worker: load config, init pools, connect Redis, enter poll loop.
+/// Boot the worker: load config, build the ingest context (app_pool +
+/// Qdrant + S3), connect Redis, enter the poll loop.
 ///
-/// The loop runs until `ctrl_c` (SIGTERM). Each iteration either processes
-/// a job (currently a stub) or times out and continues.
+/// Each polled job is run through [`process_job_with_retry`], which updates
+/// `ingest_jobs.status` (processing → completed/failed) and never propagates
+/// a job error to the loop (so a failing job does not crash the worker).
 pub async fn run() -> anyhow::Result<()> {
     let cfg = Config::from_env().context("loading application config")?;
     info!(service = "gmrag-worker", "gmrag-worker starting");
 
-    // Boot-time liveness check only — no business queries on this pool.
-    // T37+ dual-write MUST use init_app_pool (gmrag_app role) + SET LOCAL
-    // app.tenant_id per job.
-    let _pool = init_pool(&cfg.database_url)
+    let ctx = IngestContext::from_config(&cfg)
         .await
-        .context("initialising postgres pool")?;
-    info!("postgres pool ready (worker)");
+        .context("building ingest context")?;
+    info!("ingest context ready (app_pool + qdrant + s3)");
 
     let mut queue = RedisQueue::connect(&cfg.redis.url).await?;
     info!(redis_url = %cfg.redis.url, "redis connected, polling for jobs");
@@ -69,8 +69,8 @@ pub async fn run() -> anyhow::Result<()> {
                 match res? {
                     Some(job) => {
                         info!(job_id = %job.id, tenant_id = %job.tenant_id, "processing job");
-                        if let Err(e) = process_job(&job).await {
-                            tracing::error!(job_id = %job.id, error = %e, "job failed");
+                        if let Err(e) = process_job_with_retry(&ctx, &ctx.pool, &job).await {
+                            tracing::error!(job_id = %job.id, error = %e, "retry wrapper failed (db)");
                         }
                     }
                     None => {

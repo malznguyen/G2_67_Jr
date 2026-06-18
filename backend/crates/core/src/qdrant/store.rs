@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use qdrant_client::qdrant::{
     CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder, Distance,
-    FieldType, VectorParamsBuilder,
+    FieldType, PointStruct, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use uuid::Uuid;
 
@@ -173,6 +173,34 @@ impl QdrantStore {
         Ok(())
     }
 
+    /// Upsert chunk points into the tenant-scoped `chunks_{tenant_id}`
+    /// collection.
+    ///
+    /// Each point is expected to carry a 768-dim vector (matching
+    /// [`EMBED_DIM`]) and a payload conforming to the T28 schema
+    /// (`workspace_id`, `document_id`, `chunk_index`, `filename`,
+    /// `owner_id`, `visibility`). The caller is responsible for embedding
+    /// the chunk text into the vector and building the payload; this
+    /// method only transports them to Qdrant.
+    ///
+    /// `.wait(true)` is set so the upsert is acknowledged (and indexed)
+    /// before the call returns — a subsequent `search_chunks` will see the
+    /// new points. For bulk ingestion of very large batches, consider
+    /// splitting the points upstream and calling this method per chunk to
+    /// avoid gRPC timeouts (Qdrant single-request limit).
+    pub async fn upsert_chunks(
+        &self,
+        tenant_id: Uuid,
+        points: Vec<PointStruct>,
+    ) -> Result<()> {
+        let name = format!("chunks_{tenant_id}");
+        self.client
+            .upsert_points(UpsertPointsBuilder::new(name, points).wait(true))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
     /// Shared helper: create a 768-dim Cosine collection and attach a set of
     /// payload field indexes. Used by `create_chunks_collection` (T28) and
     /// `create_graph_collection` (T29).
@@ -204,7 +232,8 @@ impl QdrantStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qdrant_client::qdrant::{vectors_config::Config, Distance, PayloadSchemaType};
+    use qdrant_client::qdrant::{vectors_config::Config, CountPointsBuilder, Distance, PayloadSchemaType, PointStruct};
+    use qdrant_client::Payload;
     use uuid::Uuid;
 
     /// Qdrant must be reachable for integration tests.
@@ -517,5 +546,81 @@ mod tests {
             .teardown_tenant_collections(tenant_id)
             .await
             .expect("second teardown_tenant_collections must be idempotent (no error)");
+    }
+
+    /// Build a 768-dim unit vector with `1.0` at `pos` and `0.0` elsewhere.
+    /// Used by upsert/search tests to craft orthogonal query vectors with
+    /// deterministic cosine similarity (1.0 for same pos, 0.0 for diff).
+    fn unit_vec(pos: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBED_DIM as usize];
+        v[pos] = 1.0;
+        v
+    }
+
+    /// T31 — `upsert_chunks` inserts points (768-dim vectors + full payload
+    /// schema) into `chunks_{tenant_id}`. Verified via `count` after upsert.
+    #[tokio::test]
+    async fn upsert_chunks_inserts_points_into_chunks_collection() {
+        let store = local_store().await;
+        let tenant_id = Uuid::new_v4();
+        let chunks_name = format!("chunks_{tenant_id}");
+
+        // Provision via T30 pub API (idempotent setup).
+        store
+            .setup_tenant_collections(tenant_id)
+            .await
+            .expect("setup_tenant_collections must provision chunks collection");
+
+        // Build 3 mock chunk points with the full T28 payload schema.
+        let ws = Uuid::new_v4();
+        let doc = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let make_point = |id: u64, idx: i64, filename: &str, vis: &str, vec: Vec<f32>| {
+            PointStruct::new(
+                id,
+                vec,
+                Payload::try_from(serde_json::json!({
+                    "workspace_id": ws.to_string(),
+                    "document_id": doc.to_string(),
+                    "chunk_index": idx,
+                    "filename": filename,
+                    "owner_id": owner.to_string(),
+                    "visibility": vis,
+                }))
+                .expect("payload must build from json"),
+            )
+        };
+        let points = vec![
+            make_point(1, 0, "a.txt", "private", unit_vec(0)),
+            make_point(2, 1, "a.txt", "private", unit_vec(1)),
+            make_point(3, 0, "b.txt", "public", unit_vec(2)),
+        ];
+
+        store
+            .upsert_chunks(tenant_id, points)
+            .await
+            .expect("upsert_chunks must succeed on live Qdrant");
+
+        // Verify all 3 points landed via exact count.
+        let resp = store
+            .client
+            .count(CountPointsBuilder::new(&chunks_name).exact(true))
+            .await
+            .expect("count must succeed after upsert");
+        let count = resp
+            .result
+            .as_ref()
+            .expect("count result must be present")
+            .count;
+        assert_eq!(
+            count, 3,
+            "exactly 3 points must be present in '{chunks_name}' after upsert, got {count}"
+        );
+
+        // Cleanup.
+        store
+            .teardown_tenant_collections(tenant_id)
+            .await
+            .expect("teardown_tenant_collections must clean up");
     }
 }

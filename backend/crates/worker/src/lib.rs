@@ -18,6 +18,7 @@ pub mod chunking;
 pub mod embedding;
 pub mod graph;
 pub mod ocr;
+pub mod qdrant_writer;
 
 pub use chunking::{ChunkError, chunk_page_texts};
 pub use embedding::{
@@ -31,6 +32,7 @@ pub use job::{IngestJob, process_job};
 pub use ocr::{MockOcr, NoOcr, OcrClient, OcrError, OllamaVisionOcr};
 pub use pdf_parser::{ExtractionMethod, MockRenderer, PageRenderer, ParsedDocument, PdfParseError, RenderError, parse_pdf, parse_pdf_with_ocr};
 pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};
+pub use qdrant_writer::{DualWriteInput, DualWriteResult, IngestError, dual_write_ingestion};
 pub use storage::S3Client;
 
 use anyhow::Context as _;

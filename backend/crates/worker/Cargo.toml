@@ -30,6 +30,9 @@ tracing-subscriber.workspace = true
 dotenvy.workspace = true
 uuid.workspace = true
 
+# T42: build PointStruct/Payload for dual-write upserts.
+qdrant-client.workspace = true
+
 redis = { version = "0.25", features = ["tokio-comp", "aio"] }
 async-trait = "0.1"
 

@@ -14,8 +14,10 @@ pub mod job;
 pub mod pdf_parser;
 pub mod queue;
 pub mod storage;
+pub mod chunking;
 pub mod embedding;
 
+pub use chunking::{ChunkError, chunk_page_texts};
 pub use embedding::{
     EmbedError, Embedder, OpenAiEmbedder, OllamaEmbedder, TenantLlmConfig, select_embedder,
 };

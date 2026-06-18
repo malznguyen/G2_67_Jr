@@ -14,7 +14,9 @@ pub mod job;
 pub mod pdf_parser;
 pub mod queue;
 pub mod storage;
+pub mod embedding;
 
+pub use embedding::{EmbedError, OllamaEmbedder};
 pub use job::{IngestJob, process_job};
 pub use pdf_parser::{ExtractionMethod, ParsedDocument, PdfParseError, parse_pdf};
 pub use queue::{JobQueue, MockQueue, RedisQueue, poll_once};

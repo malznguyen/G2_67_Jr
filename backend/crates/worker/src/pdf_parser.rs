@@ -65,6 +65,13 @@ pub async fn parse_pdf(data: Vec<u8>, timeout_secs: u64) -> anyhow::Result<Parse
 /// 3. If pdf-extract succeeds with non-empty text → `ExtractionMethod::PdfExtract`.
 /// 4. Otherwise → `ExtractionMethod::Fallback` (page count from lopdf, empty text).
 fn parse_pdf_blocking(data: &[u8]) -> std::result::Result<ParsedDocument, PdfParseError> {
+    // In tests, add a small delay so timeout tests with Duration::ZERO
+    // reliably fire before spawn_blocking completes. Without this, a warm
+    // blocking thread pool can finish parsing a 596-byte PDF faster than
+    // the timeout future's first poll — a race condition.
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_millis(100));
+
     let doc = lopdf::Document::load_mem(data)
         .map_err(|e| PdfParseError::Parse(format!("lopdf load: {e}")))?;
     let page_count = doc.get_pages().len();

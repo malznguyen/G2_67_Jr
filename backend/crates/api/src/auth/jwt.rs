@@ -97,6 +97,7 @@ impl JwtValidator {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_cache_ttl(mut self, ttl: Duration) -> Self {
         self.cache_ttl = ttl;
         self

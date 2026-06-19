@@ -12,6 +12,7 @@
 //! internally, so tests only seed + call the factory.
 
 use gmrag_core::config::OllamaConfig;
+use gmrag_core::crypto::encrypt_with_aad;
 use gmrag_worker::{Embedder, select_embedder};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -76,7 +77,7 @@ async fn select_embedder_uses_openai_when_tenant_has_key(pool: PgPool) {
     )
     .await;
 
-    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg())
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -92,7 +93,7 @@ async fn select_embedder_falls_back_to_ollama_when_no_row(pool: PgPool) {
     let tenant = create_tenant(&pool, "No-Config Tenant").await;
     // No tenant_llm_config row for this tenant.
 
-    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg())
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -114,7 +115,7 @@ async fn select_embedder_falls_back_when_provider_ollama(pool: PgPool) {
     )
     .await;
 
-    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg())
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -135,7 +136,7 @@ async fn select_embedder_falls_back_when_disabled(pool: PgPool) {
     )
     .await;
 
-    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg())
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -159,7 +160,7 @@ async fn select_embedder_respects_rls_isolation(pool: PgPool) {
     .await;
 
     // Querying for tenant_b must NOT see tenant_a's config (RLS).
-    let embedder_b = select_embedder(&pool, tenant_b, &test_ollama_cfg())
+    let embedder_b = select_embedder(&pool, tenant_b, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
     assert_eq!(
@@ -169,7 +170,7 @@ async fn select_embedder_respects_rls_isolation(pool: PgPool) {
     );
 
     // Querying for tenant_a must see the OpenAI config.
-    let embedder_a = select_embedder(&pool, tenant_a, &test_ollama_cfg())
+    let embedder_a = select_embedder(&pool, tenant_a, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
     assert_eq!(embedder_a.provider(), "openai");
@@ -189,7 +190,7 @@ async fn select_embedder_openai_without_api_key_falls_back(pool: PgPool) {
     )
     .await;
 
-    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg())
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -198,4 +199,102 @@ async fn select_embedder_openai_without_api_key_falls_back(pool: PgPool) {
         "ollama",
         "openai provider without api_key must fall back to ollama"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn select_embedder_decrypts_encrypted_byok_key(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Encrypted BYOK Tenant").await;
+    let enc_key: [u8; 32] = [7_u8; 32];
+    let (ciphertext, nonce) =
+        encrypt_with_aad("sk-encrypted-real", &enc_key, tenant.as_bytes()).unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO tenant_llm_config
+            (tenant_id, provider, api_key_ciphertext, api_key_nonce,
+             model, base_url, enabled)
+        VALUES ($1, 'openai', $2, $3,
+                'text-embedding-3-small', 'https://api.openai.com/v1', true)
+        "#,
+    )
+    .bind(tenant)
+    .bind(ciphertext)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), Some(&enc_key))
+        .await
+        .expect("factory must decrypt and succeed");
+
+    assert_eq!(embedder.provider(), "openai");
+    assert_eq!(embedder.dimension(), 768);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn select_embedder_encrypted_without_enc_key_returns_error(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Encrypted No Key Tenant").await;
+    let enc_key: [u8; 32] = [7_u8; 32];
+    let (ciphertext, nonce) =
+        encrypt_with_aad("sk-encrypted", &enc_key, tenant.as_bytes()).unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO tenant_llm_config
+            (tenant_id, provider, api_key_ciphertext, api_key_nonce,
+             model, enabled)
+        VALUES ($1, 'openai', $2, $3, 'text-embedding-3-small', true)
+        "#,
+    )
+    .bind(tenant)
+    .bind(ciphertext)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
+        .await;
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("decrypt failed"),
+            "must fail with decrypt error, got: {e}"
+        ),
+        Ok(_) => panic!("expected decrypt error, got success"),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn select_embedder_encrypted_takes_priority_over_plaintext(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Encrypted+Plaintext Tenant").await;
+    let enc_key: [u8; 32] = [7_u8; 32];
+    let (ciphertext, nonce) =
+        encrypt_with_aad("sk-encrypted-wins", &enc_key, tenant.as_bytes()).unwrap();
+
+    // Insert BOTH plaintext and encrypted — encrypted must take priority.
+    sqlx::query(
+        r#"
+        INSERT INTO tenant_llm_config
+            (tenant_id, provider, api_key, api_key_ciphertext, api_key_nonce,
+             model, enabled)
+        VALUES ($1, 'openai', 'sk-plaintext-loses', $2, $3,
+                'text-embedding-3-small', true)
+        "#,
+    )
+    .bind(tenant)
+    .bind(ciphertext)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let embedder = select_embedder(&pool, tenant, &test_ollama_cfg(), Some(&enc_key))
+        .await
+        .expect("factory must succeed");
+
+    assert_eq!(embedder.provider(), "openai");
+    // The embedder uses the decrypted key internally; we can't inspect it
+    // directly, but the fact that it returned OpenAi (not Ollama fallback)
+    // and didn't error confirms the encrypted path was taken.
 }

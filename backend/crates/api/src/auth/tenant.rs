@@ -161,8 +161,11 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    #[allow(dead_code)]
     const TEST_PEM_PRIV: &[u8] = include_bytes!("test_keys/test_rsa_private.pem");
+    #[allow(dead_code)]
     const TEST_PEM_PUB: &[u8] = include_bytes!("test_keys/test_rsa_public.pem");
+    #[allow(dead_code)]
     const TEST_KID: &str = "test-kid-1";
 
     fn make_claims() -> JwtClaims {
@@ -180,12 +183,14 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_token(claims: &JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
         encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
     }
 
+    #[allow(dead_code)]
     async fn make_auth_state() -> AuthState {
         let validator = JwtValidator::new(
             "http://localhost:8080/realms/gmrag".to_string(),

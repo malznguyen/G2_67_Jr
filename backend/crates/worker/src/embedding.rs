@@ -79,6 +79,8 @@ pub enum EmbedError {
     CountMismatch { expected: usize, actual: usize },
     #[error("embedding database error: {0}")]
     Db(String),
+    #[error("BYOK api_key decrypt failed: {0}")]
+    Decrypt(String),
 }
 
 impl OllamaEmbedder {
@@ -470,6 +472,8 @@ impl Embedder for OpenAiEmbedder {
 pub struct TenantLlmConfig {
     pub provider: String,
     pub api_key: Option<String>,
+    pub api_key_ciphertext: Option<Vec<u8>>,
+    pub api_key_nonce: Option<Vec<u8>>,
     pub model: String,
     pub base_url: Option<String>,
     pub dimensions: i32,
@@ -480,9 +484,17 @@ pub struct TenantLlmConfig {
 ///
 /// Reads `tenant_llm_config` inside an RLS-enforced transaction
 /// (`SET LOCAL ROLE gmrag_app` + `SET LOCAL app.tenant_id`). If the
-/// tenant has an enabled row with `provider='openai'` and a non-null
-/// `api_key`, returns an `OpenAiEmbedder`; otherwise falls back to the
-/// platform default `OllamaEmbedder` built from `ollama_cfg`.
+/// tenant has an enabled row with `provider='openai'` and a usable
+/// API key (encrypted or plaintext), returns an `OpenAiEmbedder`;
+/// otherwise falls back to the platform default `OllamaEmbedder`.
+///
+/// **Key resolution order** (mirrors `api/src/llm/byok.rs`):
+/// 1. Encrypted fields present → decrypt via `core::crypto::decrypt_with_aad`
+///    (AAD = `tenant_id` bytes). Requires `enc_key` (from
+///    `GMRAG_TENANT_KEY_ENCRYPTION_KEY`). Fails if key is missing or
+///    decryption fails — does NOT silently fall back.
+/// 2. No encrypted fields → use plaintext `api_key` if non-empty (legacy).
+/// 3. Neither → fall back to `OllamaEmbedder`.
 ///
 /// This is the entry point the worker calls per ingest job (T42). The
 /// pool passed in can be either `init_app_pool` (production — role
@@ -492,6 +504,7 @@ pub async fn select_embedder(
     pool: &sqlx::PgPool,
     tenant_id: uuid::Uuid,
     ollama_cfg: &OllamaConfig,
+    enc_key: Option<&[u8; 32]>,
 ) -> Result<Box<dyn Embedder>, EmbedError> {
     let mut tx = pool
         .begin()
@@ -509,7 +522,8 @@ pub async fn select_embedder(
 
     let row = sqlx::query_as::<_, TenantLlmConfig>(
         r#"
-        SELECT provider, api_key, model, base_url, dimensions, enabled
+        SELECT provider, api_key, api_key_ciphertext, api_key_nonce,
+               model, base_url, dimensions, enabled
         FROM tenant_llm_config
         WHERE enabled = true
         "#,
@@ -523,14 +537,53 @@ pub async fn select_embedder(
         .map_err(|e| EmbedError::Db(e.to_string()))?;
 
     match row {
-        Some(cfg) if cfg.provider == "openai" && cfg.api_key.is_some() => {
-            Ok(Box::new(OpenAiEmbedder::new(
-                cfg.api_key.unwrap(),
-                &cfg.model,
-                cfg.base_url.as_deref(),
-            )))
+        Some(cfg) if cfg.provider == "openai" => {
+            let api_key = resolve_byok_api_key(
+                cfg.api_key_ciphertext.as_deref(),
+                cfg.api_key_nonce.as_deref(),
+                cfg.api_key.as_deref(),
+                enc_key,
+                tenant_id,
+            )?;
+            match api_key {
+                Some(key) => Ok(Box::new(OpenAiEmbedder::new(
+                    key,
+                    &cfg.model,
+                    cfg.base_url.as_deref(),
+                ))),
+                None => Ok(Box::new(OllamaEmbedder::new(ollama_cfg))),
+            }
         }
         _ => Ok(Box::new(OllamaEmbedder::new(ollama_cfg))),
+    }
+}
+
+/// Resolve a tenant's BYOK API key from `tenant_llm_config` columns.
+///
+/// Encrypted fields take priority over plaintext. If encrypted fields
+/// are present but `enc_key` is `None` or decryption fails, returns an
+/// error — does NOT silently fall back to plaintext or global defaults.
+/// This matches the security invariant in `api/src/llm/byok.rs`.
+fn resolve_byok_api_key(
+    ciphertext: Option<&[u8]>,
+    nonce: Option<&[u8]>,
+    plaintext_key: Option<&str>,
+    enc_key: Option<&[u8; 32]>,
+    tenant_id: uuid::Uuid,
+) -> Result<Option<String>, EmbedError> {
+    match (ciphertext, nonce) {
+        (Some(ct), Some(n)) => {
+            let key = enc_key.ok_or_else(|| EmbedError::Decrypt(
+                "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured".into(),
+            ))?;
+            let decrypted = gmrag_core::crypto::decrypt_with_aad(ct, n, key, tenant_id.as_bytes())
+                .map_err(|e| EmbedError::Decrypt(e.to_string()))?;
+            Ok(Some(decrypted))
+        }
+        (None, None) => Ok(plaintext_key
+            .filter(|v| !v.trim().is_empty())
+            .map(|s| s.to_string())),
+        _ => Err(EmbedError::Decrypt("encrypted key pair is incomplete (one field NULL)".into())),
     }
 }
 

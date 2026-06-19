@@ -60,6 +60,8 @@ pub enum GraphExtractError {
     Parse(String),
     #[error("graph extraction database error: {0}")]
     Db(String),
+    #[error("BYOK api_key decrypt failed: {0}")]
+    Decrypt(String),
 }
 
 type ExFuture<'a> = Pin<Box<dyn Future<Output = Result<GraphExtraction, GraphExtractError>> + Send + 'a>>;
@@ -260,15 +262,22 @@ const DEFAULT_OPENAI_CHAT_BASE_URL: &str = "https://api.openai.com/v1";
 struct TenantLlmRow {
     provider: String,
     api_key: Option<String>,
+    api_key_ciphertext: Option<Vec<u8>>,
+    api_key_nonce: Option<Vec<u8>>,
     llm_model: Option<String>,
     llm_base_url: Option<String>,
 }
 
 /// Select a graph extractor for a tenant using the 2-layer fallback:
 /// 1. If the tenant has an enabled `tenant_llm_config` row with a usable
-///    API key, build a BYOK extractor pointed at `llm_base_url` with
-///    `llm_model` (OpenAI or DeepSeek — both speak `/chat/completions`).
+///    API key (encrypted or plaintext) AND an `llm_model` override, build
+///    a BYOK extractor pointed at `llm_base_url` with `llm_model`.
 /// 2. Otherwise fall back to the global `DeepSeekConfig`.
+///
+/// **Key resolution** mirrors `select_embedder`: encrypted fields take
+/// priority, then plaintext `api_key` legacy fallback. If encrypted
+/// fields are present but `enc_key` is `None` or decrypt fails, returns
+/// an error — does NOT silently fall back.
 ///
 /// RLS is enforced inside an explicit transaction (`SET LOCAL ROLE
 /// gmrag_app` + `SET LOCAL app.tenant_id`), mirroring `select_embedder`.
@@ -276,6 +285,7 @@ pub async fn select_graph_extractor(
     pool: &sqlx::PgPool,
     tenant_id: uuid::Uuid,
     global_cfg: &DeepSeekConfig,
+    enc_key: Option<&[u8; 32]>,
 ) -> Result<Box<dyn GraphExtractor>, GraphExtractError> {
     let mut tx = pool
         .begin()
@@ -291,7 +301,8 @@ pub async fn select_graph_extractor(
 
     let row = sqlx::query_as::<_, TenantLlmRow>(
         r#"
-        SELECT provider, api_key, llm_model, llm_base_url
+        SELECT provider, api_key, api_key_ciphertext, api_key_nonce,
+               llm_model, llm_base_url
         FROM tenant_llm_config
         WHERE enabled = true
         "#,
@@ -304,30 +315,67 @@ pub async fn select_graph_extractor(
         .map_err(|e| GraphExtractError::Db(e.to_string()))?;
 
     match row {
-        Some(r) if r.api_key.is_some() && r.llm_model.is_some() => {
-            let api_key = r.api_key.unwrap();
-            let model = r.llm_model.unwrap();
-            let base_url = r
-                .llm_base_url
-                .filter(|b| !b.is_empty())
-                .or_else(|| match r.provider.as_str() {
-                    "openai" => Some(DEFAULT_OPENAI_CHAT_BASE_URL.to_string()),
-                    _ => Some(global_cfg.base_url.clone()),
-                })
-                .unwrap_or_else(|| global_cfg.base_url.clone());
-            Ok(Box::new(DeepSeekGraphExtractor::new_with(
-                &base_url,
-                Some(&api_key),
-                &model,
-            )))
+        Some(r) => {
+            let api_key = resolve_graph_api_key(
+                r.api_key_ciphertext.as_deref(),
+                r.api_key_nonce.as_deref(),
+                r.api_key.as_deref(),
+                enc_key,
+                tenant_id,
+            )?;
+            match (api_key, r.llm_model.as_deref().filter(|m| !m.is_empty())) {
+                (Some(key), Some(model)) => {
+                    let base_url = r
+                        .llm_base_url
+                        .filter(|b| !b.is_empty())
+                        .or_else(|| match r.provider.as_str() {
+                            "openai" => Some(DEFAULT_OPENAI_CHAT_BASE_URL.to_string()),
+                            _ => Some(global_cfg.base_url.clone()),
+                        })
+                        .unwrap_or_else(|| global_cfg.base_url.clone());
+                    Ok(Box::new(DeepSeekGraphExtractor::new_with(
+                        &base_url,
+                        Some(&key),
+                        model,
+                    )))
+                }
+                _ => {
+                    // No llm_model override or no usable API key → fall back
+                    // to global DeepSeek (don't call OpenAI chat with an
+                    // embedding model name).
+                    Ok(Box::new(DeepSeekGraphExtractor::new(global_cfg)))
+                }
+            }
         }
-        Some(r) if r.provider == "openai" && r.api_key.is_some() => {
-            // No llm_model override → fall back to global DeepSeek (don't
-            // call OpenAI chat with an embedding model name).
-            let _ = r;
-            Ok(Box::new(DeepSeekGraphExtractor::new(global_cfg)))
+        None => Ok(Box::new(DeepSeekGraphExtractor::new(global_cfg))),
+    }
+}
+
+/// Resolve a tenant's BYOK API key for graph extraction.
+///
+/// Same priority and error semantics as `embedding::resolve_byok_api_key`:
+/// encrypted fields take priority; missing key or decrypt failure is an
+/// error, not a silent fallback.
+fn resolve_graph_api_key(
+    ciphertext: Option<&[u8]>,
+    nonce: Option<&[u8]>,
+    plaintext_key: Option<&str>,
+    enc_key: Option<&[u8; 32]>,
+    tenant_id: uuid::Uuid,
+) -> Result<Option<String>, GraphExtractError> {
+    match (ciphertext, nonce) {
+        (Some(ct), Some(n)) => {
+            let key = enc_key.ok_or_else(|| GraphExtractError::Decrypt(
+                "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured".into(),
+            ))?;
+            let decrypted = gmrag_core::crypto::decrypt_with_aad(ct, n, key, tenant_id.as_bytes())
+                .map_err(|e| GraphExtractError::Decrypt(e.to_string()))?;
+            Ok(Some(decrypted))
         }
-        _ => Ok(Box::new(DeepSeekGraphExtractor::new(global_cfg))),
+        (None, None) => Ok(plaintext_key
+            .filter(|v| !v.trim().is_empty())
+            .map(|s| s.to_string())),
+        _ => Err(GraphExtractError::Decrypt("encrypted key pair is incomplete (one field NULL)".into())),
     }
 }
 

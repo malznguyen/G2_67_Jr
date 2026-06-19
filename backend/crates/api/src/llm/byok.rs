@@ -4,9 +4,8 @@
 //! This function does not create a new transaction; it relies on the caller's
 //! existing `SET LOCAL app.tenant_id` context.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use gmrag_core::config::{DeepSeekConfig, OllamaConfig};
+use gmrag_core::crypto::{CryptoError, decrypt_with_aad};
 use sqlx::PgConnection;
 use thiserror::Error;
 use uuid::Uuid;
@@ -97,10 +96,13 @@ pub async fn resolve_llm_config(
         row.api_key_ciphertext.as_deref(),
         row.api_key_nonce.as_deref(),
     ) {
-        (Some(ciphertext), Some(nonce)) => (
-            decrypt_api_key(tenant_id, ciphertext, nonce, tenant_key_encryption_key)?,
-            LlmConfigSource::TenantEncrypted,
-        ),
+        (Some(ciphertext), Some(nonce)) => {
+            let key = tenant_key_encryption_key.ok_or(ByokError::MissingEncryptionKey)?;
+            let decrypted =
+                decrypt_with_aad(ciphertext, nonce, key, tenant_id.as_bytes())
+                    .map_err(map_crypto_error)?;
+            (decrypted, LlmConfigSource::TenantEncrypted)
+        }
         (None, None) => match row.api_key.filter(|v| !v.trim().is_empty()) {
             Some(key) => (key, LlmConfigSource::TenantPlaintext),
             None => return Ok(global()),
@@ -150,27 +152,13 @@ pub async fn resolve_llm_config(
     Ok(ResolvedLlmConfig { source, provider })
 }
 
-fn decrypt_api_key(
-    tenant_id: Uuid,
-    ciphertext: &[u8],
-    nonce: &[u8],
-    key: Option<&[u8; 32]>,
-) -> Result<String, ByokError> {
-    if nonce.len() != 12 {
-        return Err(ByokError::InvalidNonce(nonce.len()));
+fn map_crypto_error(e: CryptoError) -> ByokError {
+    match e {
+        CryptoError::InvalidNonceLen(n) => ByokError::InvalidNonce(n),
+        CryptoError::Decrypt => ByokError::Decrypt,
+        CryptoError::Utf8 => ByokError::Utf8,
+        CryptoError::Encrypt => ByokError::Decrypt,
     }
-    let key = key.ok_or(ByokError::MissingEncryptionKey)?;
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ByokError::Decrypt)?;
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: ciphertext,
-                aad: tenant_id.as_bytes(),
-            },
-        )
-        .map_err(|_| ByokError::Decrypt)?;
-    String::from_utf8(plaintext).map_err(|_| ByokError::Utf8)
 }
 
 #[cfg(test)]
@@ -217,18 +205,7 @@ mod tests {
     }
 
     fn encrypt(tenant_id: Uuid, key: &[u8; 32], plaintext: &str) -> (Vec<u8>, Vec<u8>) {
-        let nonce = [9_u8; 12];
-        let cipher = Aes256Gcm::new_from_slice(key).unwrap();
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext.as_bytes(),
-                    aad: tenant_id.as_bytes(),
-                },
-            )
-            .unwrap();
-        (ciphertext, nonce.to_vec())
+        gmrag_core::crypto::encrypt_with_aad(plaintext, key, tenant_id.as_bytes()).unwrap()
     }
 
     #[sqlx::test(migrations = "../../migrations")]

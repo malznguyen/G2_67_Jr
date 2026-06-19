@@ -22,3 +22,5 @@ dotenvy.workspace = true
 tokio.workspace = true
 qdrant-client.workspace = true
 base64 = "0.22"
+aes-gcm = "0.10"
+rand = "0.8"

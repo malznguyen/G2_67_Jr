@@ -48,6 +48,7 @@ mod tests {
     use crate::auth::jwt::JwtValidator;
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
 
+    #[allow(dead_code)]
     const TEST_PEM_PRIV: &[u8] = include_bytes!("test_keys/test_rsa_private.pem");
     const TEST_PEM_PUB: &[u8] = include_bytes!("test_keys/test_rsa_public.pem");
     const TEST_KID: &str = "test-kid-1";
@@ -67,6 +68,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_token(claims: &super::super::jwt::JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());

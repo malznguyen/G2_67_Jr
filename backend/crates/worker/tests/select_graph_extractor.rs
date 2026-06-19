@@ -4,6 +4,7 @@
 //! verifies the 2-layer fallback (tenant BYOK → global DeepSeek).
 
 use gmrag_core::config::DeepSeekConfig;
+use gmrag_core::crypto::encrypt_with_aad;
 use gmrag_worker::{DeepSeekGraphExtractor, select_graph_extractor};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -73,7 +74,7 @@ async fn select_graph_extractor_uses_byok_openai_when_configured(pool: PgPool) {
     )
     .await;
 
-    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg())
+    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -87,7 +88,7 @@ async fn select_graph_extractor_uses_byok_openai_when_configured(pool: PgPool) {
 async fn select_graph_extractor_falls_back_to_global_when_no_row(pool: PgPool) {
     let tenant = create_tenant(&pool, "No-Config Graph Tenant").await;
 
-    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg())
+    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
 
@@ -110,7 +111,7 @@ async fn select_graph_extractor_falls_back_when_disabled(pool: PgPool) {
     )
     .await;
 
-    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg())
+    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
     assert!(ext.url().contains("api.deepseek.com"), "disabled BYOK must fall back");
@@ -132,7 +133,7 @@ async fn select_graph_extractor_respects_rls_isolation(pool: PgPool) {
     )
     .await;
 
-    let ext_b = select_graph_extractor(&pool, tenant_b, &global_deepseek_cfg())
+    let ext_b = select_graph_extractor(&pool, tenant_b, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
     assert!(
@@ -140,7 +141,7 @@ async fn select_graph_extractor_respects_rls_isolation(pool: PgPool) {
         "tenant_b must fall back — RLS hides tenant_a config"
     );
 
-    let ext_a = select_graph_extractor(&pool, tenant_a, &global_deepseek_cfg())
+    let ext_a = select_graph_extractor(&pool, tenant_a, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
     assert!(ext_a.url().contains("api.openai.com"));
@@ -151,4 +152,71 @@ async fn select_graph_extractor_respects_rls_isolation(pool: PgPool) {
 fn global_extractor_is_deepseek() {
     let cfg = global_deepseek_cfg();
     let _ = DeepSeekGraphExtractor::new(&cfg);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn select_graph_extractor_decrypts_encrypted_byok_key(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Encrypted Graph BYOK Tenant").await;
+    let enc_key: [u8; 32] = [7_u8; 32];
+    let (ciphertext, nonce) =
+        encrypt_with_aad("sk-encrypted-chat", &enc_key, tenant.as_bytes()).unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO tenant_llm_config
+            (tenant_id, provider, api_key_ciphertext, api_key_nonce,
+             model, enabled, llm_model, llm_base_url)
+        VALUES ($1, 'openai', $2, $3,
+                'text-embedding-3-small', true,
+                'gpt-4o-mini', 'https://api.openai.com/v1')
+        "#,
+    )
+    .bind(tenant)
+    .bind(ciphertext)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), Some(&enc_key))
+        .await
+        .expect("factory must decrypt and succeed");
+
+    assert!(ext.url().contains("api.openai.com"));
+    assert!(ext.url().ends_with("/chat/completions"));
+    assert_eq!(ext.model(), "gpt-4o-mini");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn select_graph_extractor_encrypted_without_enc_key_returns_error(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Encrypted Graph No Key Tenant").await;
+    let enc_key: [u8; 32] = [7_u8; 32];
+    let (ciphertext, nonce) =
+        encrypt_with_aad("sk-encrypted", &enc_key, tenant.as_bytes()).unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO tenant_llm_config
+            (tenant_id, provider, api_key_ciphertext, api_key_nonce,
+             model, enabled, llm_model)
+        VALUES ($1, 'openai', $2, $3,
+                'text-embedding-3-small', true, 'gpt-4o-mini')
+        "#,
+    )
+    .bind(tenant)
+    .bind(ciphertext)
+    .bind(nonce)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
+        .await;
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("decrypt failed"),
+            "must fail with decrypt error, got: {e}"
+        ),
+        Ok(_) => panic!("expected decrypt error, got success"),
+    }
 }

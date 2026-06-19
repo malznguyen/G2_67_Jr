@@ -51,6 +51,7 @@ pub struct IngestContext {
     pub s3: S3Client,
     pub ollama: OllamaConfig,
     pub deepseek: DeepSeekConfig,
+    pub enc_key: Option<[u8; 32]>,
 }
 
 impl IngestContext {
@@ -70,6 +71,7 @@ impl IngestContext {
             s3,
             ollama: cfg.ollama.clone(),
             deepseek: cfg.deepseek.clone(),
+            enc_key: cfg.tenant_key_encryption_key,
         })
     }
 }
@@ -118,7 +120,7 @@ impl IngestContext {
             .map_err(|e| format!("chunking: {e}"))?;
 
         // 4. Embed chunks (per-tenant BYOK or Ollama).
-        let embedder = select_embedder(&self.pool, job.tenant_id, &self.ollama)
+        let embedder = select_embedder(&self.pool, job.tenant_id, &self.ollama, self.enc_key.as_ref())
             .await
             .map_err(|e| format!("select_embedder: {e}"))?;
         let chunk_vectors = embedder
@@ -127,7 +129,7 @@ impl IngestContext {
             .map_err(|e| format!("embed chunks: {e}"))?;
 
         // 5. Graph extract via DeepSeek (global) or tenant BYOK LLM.
-        let extractor = select_graph_extractor(&self.pool, job.tenant_id, &self.deepseek)
+        let extractor = select_graph_extractor(&self.pool, job.tenant_id, &self.deepseek, self.enc_key.as_ref())
             .await
             .map_err(|e| format!("select_graph_extractor: {e}"))?;
         let extraction = extractor

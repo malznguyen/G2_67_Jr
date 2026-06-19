@@ -4,6 +4,7 @@
 //! Anything more (telemetry, tenancy middleware, etc.) belongs to later tasks.
 
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod qdrant;

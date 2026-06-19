@@ -21,3 +21,4 @@ chrono.workspace = true
 dotenvy.workspace = true
 tokio.workspace = true
 qdrant-client.workspace = true
+base64 = "0.22"

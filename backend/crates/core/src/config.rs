@@ -14,6 +14,8 @@
 use std::env;
 use std::net::SocketAddr;
 
+use base64::Engine as _;
+
 use crate::error::Error;
 
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8080";
@@ -98,6 +100,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub ollama: OllamaConfig,
     pub deepseek: DeepSeekConfig,
+    pub tenant_key_encryption_key: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -173,6 +176,8 @@ impl Config {
                 .unwrap_or(DEFAULT_DEEPSEEK_TIMEOUT_S),
         };
 
+        let tenant_key_encryption_key = optional_base64_32_env("GMRAG_TENANT_KEY_ENCRYPTION_KEY")?;
+
         Ok(Self {
             database_url,
             http_bind,
@@ -185,6 +190,7 @@ impl Config {
             redis,
             ollama,
             deepseek,
+            tenant_key_encryption_key,
         })
     }
 
@@ -203,6 +209,23 @@ fn require_env(key: &'static str) -> Result<String, Error> {
 
 fn optional_env(key: &str, default: &str) -> String {
     env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+fn optional_base64_32_env(key: &'static str) -> Result<Option<[u8; 32]>, Error> {
+    let Some(raw) = env::var(key).ok().filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .map_err(|e| Error::Config(format!("invalid {key}: expected base64: {e}")))?;
+    let len = decoded.len();
+    let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+        Error::Config(format!(
+            "invalid {key}: decoded key must be 32 bytes, got {len}"
+        ))
+    })?;
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]
@@ -244,6 +267,7 @@ mod tests {
             "DEEPSEEK_BASE_URL",
             "DEEPSEEK_MODEL",
             "DEEPSEEK_TIMEOUT_S",
+            "GMRAG_TENANT_KEY_ENCRYPTION_KEY",
         ];
         for k in keys {
             env::remove_var(k);
@@ -286,6 +310,7 @@ mod tests {
         assert_eq!(cfg.redis.url, DEFAULT_REDIS_URL);
         assert_eq!(cfg.ollama.host, DEFAULT_OLLAMA_HOST);
         assert!(cfg.deepseek.api_key.is_none());
+        assert!(cfg.tenant_key_encryption_key.is_none());
 
         // Case 3: empty DATABASE_URL also fails.
         env::set_var("DATABASE_URL", "   ");
@@ -293,6 +318,39 @@ mod tests {
         assert!(
             matches!(res, Err(Error::Config(_))),
             "empty DATABASE_URL must surface as Error::Config, got {res:?}"
+        );
+
+        clear_config_env();
+    }
+
+    #[test]
+    fn config_tenant_key_encryption_key_is_base64_32_bytes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_config_env();
+        set_minimal_env();
+
+        env::set_var(
+            "GMRAG_TENANT_KEY_ENCRYPTION_KEY",
+            base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
+        );
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.tenant_key_encryption_key, Some([7_u8; 32]));
+
+        env::set_var("GMRAG_TENANT_KEY_ENCRYPTION_KEY", "not base64");
+        let res = Config::from_process_env();
+        assert!(
+            matches!(res, Err(Error::Config(ref msg)) if msg.contains("GMRAG_TENANT_KEY_ENCRYPTION_KEY")),
+            "invalid base64 must surface as Error::Config, got {res:?}"
+        );
+
+        env::set_var(
+            "GMRAG_TENANT_KEY_ENCRYPTION_KEY",
+            base64::engine::general_purpose::STANDARD.encode([1_u8; 31]),
+        );
+        let res = Config::from_process_env();
+        assert!(
+            matches!(res, Err(Error::Config(ref msg)) if msg.contains("32 bytes")),
+            "wrong key length must surface as Error::Config, got {res:?}"
         );
 
         clear_config_env();

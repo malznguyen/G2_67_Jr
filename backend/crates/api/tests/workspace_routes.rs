@@ -1,4 +1,4 @@
-//! Integration tests for workspace routes (T55).
+//! Integration tests for workspace routes (T55 + T56).
 //!
 //! Require a running PostgreSQL instance. `#[sqlx::test]` provisions an
 //! isolated database and runs migrations automatically. The `DATABASE_URL`
@@ -22,6 +22,10 @@ use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::routes::workspaces::{
     create_workspace, delete_workspace, list_workspaces, update_workspace, CreateWorkspaceBody,
     UpdateWorkspaceBody,
+};
+use gmrag_api::routes::ws_members::{
+    add_member as ws_add_member, list_members as ws_list_members,
+    remove_member as ws_remove_member, AddMemberBody,
 };
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -287,4 +291,199 @@ async fn workspace_update_unknown_id_is_not_found(pool: PgPool) {
     )
     .await;
     assert!(matches!(result, Err(ApiError::NotFound)));
+}
+
+// ─── T56: workspace members ──────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_and_list_workspace_members(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t56.com").await;
+    let member = create_user(&pool, "member@t56.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, member, "member").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, body) = parts(
+        ws_add_member(
+            Path((tenant, ws)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(owner)),
+            Extension(conn.clone()),
+            Json(AddMemberBody {
+                user_id: member,
+                role: Some("editor".into()),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["user_id"].as_str().unwrap(), member.to_string());
+    assert_eq!(body["role"], "editor");
+
+    let (status, body) = parts(
+        ws_list_members(
+            Path((tenant, ws)),
+            Extension(TenantContext(tenant)),
+            Extension(conn),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["user_id"].as_str().unwrap(), member.to_string());
+    assert_eq!(members[0]["email"], "member@t56.com");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_member_defaults_role_to_member(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t56def.com").await;
+    let member = create_user(&pool, "member@t56def.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, member, "member").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, body) = parts(
+        ws_add_member(
+            Path((tenant, ws)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(owner)),
+            Extension(conn),
+            Json(AddMemberBody {
+                user_id: member,
+                role: None,
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["role"], "member");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_member_rejects_path_mismatch(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t56pm.com").await;
+    let member = create_user(&pool, "member@t56pm.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let result = ws_add_member(
+        Path((Uuid::new_v4(), ws)),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(owner)),
+        Extension(conn),
+        Json(AddMemberBody {
+            user_id: member,
+            role: None,
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::BadRequest(_))));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn remove_workspace_member(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t56r.com").await;
+    let member = create_user(&pool, "member@t56r.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, member, "member").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, tenant_id, user_id, role)
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(ws)
+    .bind(tenant)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _) = parts(
+        ws_remove_member(
+            Path((tenant, ws, member)),
+            Extension(TenantContext(tenant)),
+            Extension(conn.clone()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let mut guard = conn.lock().await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(ws)
+    .bind(member)
+    .fetch_one(&mut *guard)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn remove_unknown_workspace_member_is_not_found(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t56n.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let result = ws_remove_member(
+        Path((tenant, ws, Uuid::new_v4())),
+        Extension(TenantContext(tenant)),
+        Extension(conn),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::NotFound)));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_members_is_tenant_isolated(pool: PgPool) {
+    // A member added to tenant B's workspace must not be visible from tenant A.
+    let user_a = create_user(&pool, "a@t56iso.com").await;
+    let user_b = create_user(&pool, "b@t56iso.com").await;
+    let tenant_a = insert_tenant(&pool, "A").await;
+    let tenant_b = insert_tenant(&pool, "B").await;
+    add_tenant_member(&pool, tenant_a, user_a, "owner").await;
+    add_tenant_member(&pool, tenant_b, user_b, "owner").await;
+    let ws_b = insert_workspace(&pool, tenant_b, user_b, "engb").await;
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, tenant_id, user_id, role)
+         VALUES ($1, $2, $3, 'member')",
+    )
+    .bind(ws_b)
+    .bind(tenant_b)
+    .bind(user_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Listing under tenant A's RLS context for tenant B's workspace id returns
+    // nothing (RLS hides tenant B rows even though the workspace id is known).
+    let conn = rls_conn(&pool, tenant_a).await;
+    let (status, body) = parts(
+        ws_list_members(
+            Path((tenant_a, ws_b)),
+            Extension(TenantContext(tenant_a)),
+            Extension(conn),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["members"].as_array().unwrap().len(), 0);
 }

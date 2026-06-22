@@ -99,6 +99,14 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants/:tid/workspaces/:wid",
             patch(routes::workspaces::update_workspace).delete(routes::workspaces::delete_workspace),
         )
+        .route(
+            "/tenants/:tid/workspaces/:wid/members",
+            get(routes::ws_members::list_members).post(routes::ws_members::add_member),
+        )
+        .route(
+            "/tenants/:tid/workspaces/:wid/members/:user_id",
+            delete(routes::ws_members::remove_member),
+        )
         .layer(axum::middleware::from_fn(rls_middleware))
         .layer(axum::middleware::from_fn(tenant_middleware))
         .layer(axum::middleware::from_fn(auth_middleware));

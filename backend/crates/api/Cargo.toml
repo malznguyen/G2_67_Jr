@@ -18,7 +18,7 @@ path = "src/main.rs"
 gmrag-core = { path = "../core" }
 
 tokio.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["macros", "multipart"] }
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
@@ -43,6 +43,12 @@ futures = "0.3"
 async-stream = "0.3"
 qdrant-client.workspace = true
 tiktoken-rs = "0.11"
+
+# T58: document upload → S3 object storage + Redis ingest-job enqueue.
+async-trait = "0.1"
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+redis = { version = "0.25", features = ["tokio-comp", "aio"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

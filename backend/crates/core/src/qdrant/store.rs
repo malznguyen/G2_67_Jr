@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder,
-    Distance, FieldType, Filter, PointStruct, ScoredPoint, SearchPointsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    DeletePointsBuilder, Distance, FieldType, Filter, PointStruct, ScoredPoint,
+    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use uuid::Uuid;
 
@@ -300,6 +300,39 @@ impl QdrantStore {
             .await
             .map_err(Error::from)?;
         Ok(resp.result)
+    }
+
+    /// Delete every chunk point belonging to `document_id` from the
+    /// tenant-scoped `chunks_{tenant_id}` collection (T59 orphan cleanup).
+    ///
+    /// Matches on the `document_id` payload index (created in
+    /// `create_chunks_collection`). Idempotent: if the collection does not
+    /// exist (tenant never ingested anything) this is a no-op so document
+    /// deletion never fails on a missing collection. `.wait(true)` ensures
+    /// the points are gone before the call returns.
+    ///
+    /// Note: graph points (`graph_{tenant_id}`) are intentionally NOT touched
+    /// here — graph nodes are deduplicated per `(tenant, workspace, label,
+    /// kind)` and shared across documents, so there is no per-document point
+    /// set to remove (see T59 progress notes).
+    pub async fn delete_chunks_by_document(
+        &self,
+        tenant_id: Uuid,
+        document_id: Uuid,
+    ) -> Result<()> {
+        let name = format!("chunks_{tenant_id}");
+        if !self.collection_exists(&name).await? {
+            return Ok(());
+        }
+        let filter = Filter::must([Condition::matches(
+            "document_id",
+            document_id.to_string(),
+        )]);
+        self.client
+            .delete_points(DeletePointsBuilder::new(name).points(filter).wait(true))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
     }
 
     /// Shared helper: create a 768-dim Cosine collection and attach a set of

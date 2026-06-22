@@ -7,8 +7,12 @@ pub mod llm;
 pub mod metering;
 pub mod middleware;
 pub mod pool;
+pub mod queue;
 pub mod routes;
+pub mod storage;
+pub mod vector;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -17,12 +21,15 @@ use auth::jwt::JwtValidator;
 use auth::middleware::auth_middleware;
 use auth::tenant::tenant_middleware;
 use axum::{
-    Extension, Router, extract::State, http::StatusCode, response::IntoResponse,
+    Extension, Router, extract::DefaultBodyLimit, extract::State, http::StatusCode,
+    response::IntoResponse,
     routing::{delete, get, patch},
 };
 use gmrag_core::{Config, QdrantStore, init_app_pool, init_pool};
 use middleware::rls::rls_middleware;
 use pool::{AdminPool, AppPool};
+use queue::RedisEnqueuer;
+use storage::S3ObjectStore;
 use serde_json::json;
 use tokio::signal;
 use tracing::{info, warn};
@@ -61,6 +68,19 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("initialising qdrant store")?;
     info!(qdrant_url = %cfg.qdrant.url, "qdrant store ready");
+
+    // T58/T59: document upload/delete dependencies (S3, Redis, vector cleanup).
+    let object_store: Arc<dyn storage::ObjectStore> = Arc::new(S3ObjectStore::new(&cfg.s3));
+    info!(bucket = %cfg.s3.bucket, "s3 object store ready");
+
+    let enqueuer: Arc<dyn queue::JobEnqueuer> = Arc::new(
+        RedisEnqueuer::connect(&cfg.redis.url)
+            .await
+            .context("connecting redis enqueuer")?,
+    );
+    info!(redis_url = %cfg.redis.url, "redis enqueuer ready");
+
+    let vector_cleaner: Arc<dyn vector::VectorCleaner> = Arc::new(qdrant.clone());
 
     let jwt_validator = JwtValidator::new(cfg.oidc.issuer.clone(), cfg.oidc.client_id.clone());
     let auth_state = AuthState { jwt_validator };
@@ -109,8 +129,10 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .route(
             "/tenants/:tid/documents",
-            get(routes::documents::list_documents),
+            get(routes::documents::list_documents).post(routes::documents::upload_document),
         )
+        // Allow large multipart document uploads (default axum limit is 2 MiB).
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(axum::middleware::from_fn(rls_middleware))
         .layer(axum::middleware::from_fn(tenant_middleware))
         .layer(axum::middleware::from_fn(auth_middleware));
@@ -121,6 +143,9 @@ pub async fn run() -> anyhow::Result<()> {
         .layer(Extension(AppPool(app_pool.clone())))
         .layer(Extension(AdminPool(admin_pool.clone())))
         .layer(Extension(qdrant))
+        .layer(Extension(object_store))
+        .layer(Extension(enqueuer))
+        .layer(Extension(vector_cleaner))
         .layer(Extension(auth_state.clone()));
 
     let app = merged.with_state(AppState {

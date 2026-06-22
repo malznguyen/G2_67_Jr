@@ -88,6 +88,9 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -101,6 +104,7 @@ impl ApiError {
             ApiError::NotFound => "not-found".into(),
             ApiError::Forbidden(_) => "forbidden".into(),
             ApiError::BadRequest(_) => "bad-request".into(),
+            ApiError::QuotaExceeded(_) => "quota-exceeded".into(),
             ApiError::Internal(_) => "internal-error".into(),
         }
     }
@@ -112,6 +116,7 @@ impl ApiError {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -228,6 +233,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_error_quota_exceeded_maps_to_429() {
+        let resp = ApiError::QuotaExceeded("storage limit reached".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "quota-exceeded");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage limit reached"));
+    }
+
+    #[tokio::test]
     async fn api_error_internal() {
         let resp = ApiError::Internal("boom".into()).into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -270,6 +287,7 @@ mod tests {
             ApiError::NotFound.into_response(),
             ApiError::Forbidden("x".into()).into_response(),
             ApiError::BadRequest("x".into()).into_response(),
+            ApiError::QuotaExceeded("x".into()).into_response(),
             ApiError::Internal("x".into()).into_response(),
             ApiError::from(gmrag_core::Error::Config("x".into())).into_response(),
         ];

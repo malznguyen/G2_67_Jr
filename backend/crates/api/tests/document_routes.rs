@@ -10,11 +10,17 @@
 //!   OR owner_id = current_user
 //!   OR (workspace_id IS NOT NULL AND current_user ∈ workspace_members).
 
+use std::sync::{Arc, Mutex};
+
+use axum::body::Body;
 use axum::extract::{Extension, Path, Query};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::Router;
 use serde_json::Value;
 use sqlx::PgPool;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use gmrag_api::auth::extractor::AuthUser;
@@ -22,7 +28,10 @@ use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
+use gmrag_api::queue::{IngestJobPayload, JobEnqueuer};
 use gmrag_api::routes::documents::{list_documents, DocListParams};
+use gmrag_api::storage::ObjectStore;
+use gmrag_api::vector::VectorCleaner;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -341,4 +350,330 @@ async fn list_documents_rejects_path_mismatch(pool: PgPool) {
     )
     .await;
     assert!(matches!(result, Err(ApiError::BadRequest(_))));
+}
+
+// ─── T58: upload — S3 + quota + Redis enqueue (mocks) ─────────────────────────
+
+/// Records `put`/`delete` calls and can force a `put` failure.
+#[derive(Default)]
+struct MockObjectStore {
+    put_keys: Mutex<Vec<String>>,
+    deleted_keys: Mutex<Vec<String>>,
+    fail_put: bool,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for MockObjectStore {
+    async fn put(&self, key: &str, _data: Vec<u8>, _content_type: &str) -> Result<(), String> {
+        if self.fail_put {
+            return Err("forced put failure".into());
+        }
+        self.put_keys.lock().unwrap().push(key.to_string());
+        Ok(())
+    }
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.deleted_keys.lock().unwrap().push(key.to_string());
+        Ok(())
+    }
+}
+
+/// Records the enqueued payload and can force a failure (rollback path).
+#[derive(Default)]
+struct MockEnqueuer {
+    jobs: Mutex<Vec<IngestJobPayload>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl JobEnqueuer for MockEnqueuer {
+    async fn enqueue(&self, job: &IngestJobPayload) -> Result<(), String> {
+        if self.fail {
+            return Err("forced redis failure".into());
+        }
+        self.jobs.lock().unwrap().push(job.clone());
+        Ok(())
+    }
+}
+
+/// Records each `(tenant, document)` cleanup request. Used by the T59 tests.
+#[derive(Default)]
+#[allow(dead_code)]
+struct MockVectorCleaner {
+    cleaned: Mutex<Vec<(Uuid, Uuid)>>,
+}
+
+#[async_trait::async_trait]
+impl VectorCleaner for MockVectorCleaner {
+    async fn delete_document_chunks(
+        &self,
+        tenant_id: Uuid,
+        document_id: Uuid,
+    ) -> Result<(), String> {
+        self.cleaned.lock().unwrap().push((tenant_id, document_id));
+        Ok(())
+    }
+}
+
+const BOUNDARY: &str = "X-GMRAG-TEST-BOUNDARY";
+
+/// Build a `multipart/form-data` body with text fields and an optional file part.
+fn build_multipart(
+    text_fields: &[(&str, &str)],
+    file: Option<(&str, &str, &[u8])>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in text_fields {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    if let Some((filename, content_type, bytes)) = file {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_app(
+    conn: SharedConnection,
+    tenant: Uuid,
+    user: Uuid,
+    store: Arc<dyn ObjectStore>,
+    enqueuer: Arc<dyn JobEnqueuer>,
+) -> Router {
+    Router::new()
+        .route(
+            "/tenants/:tid/documents",
+            post(gmrag_api::routes::documents::upload_document),
+        )
+        .layer(Extension(conn))
+        .layer(Extension(TenantContext(tenant)))
+        .layer(Extension(auth_user(user)))
+        .layer(Extension(store))
+        .layer(Extension(enqueuer))
+}
+
+fn upload_request(tenant: Uuid, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/tenants/{tenant}/documents"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn insert_quota(pool: &PgPool, tenant_id: Uuid, max_storage_bytes: i64, max_documents: i32) {
+    sqlx::query(
+        "INSERT INTO tenant_quotas (tenant_id, max_storage_bytes, max_documents)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(tenant_id)
+    .bind(max_storage_bytes)
+    .bind(max_documents)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn upload_succeeds_writes_db_s3_and_enqueues(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t58ok.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let enqueuer = Arc::new(MockEnqueuer::default());
+    let conn = rls_conn(&pool, tenant).await;
+    let app = upload_app(
+        conn.clone(),
+        tenant,
+        owner,
+        store.clone(),
+        enqueuer.clone(),
+    );
+
+    let body = build_multipart(
+        &[
+            ("visibility", "private"),
+            ("workspace_id", &ws.to_string()),
+            ("title", "My Report"),
+        ],
+        Some(("report.pdf", "application/pdf", b"%PDF-1.7 fake bytes")),
+    );
+    let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let doc_id = Uuid::parse_str(v["id"].as_str().unwrap()).unwrap();
+
+    // S3 put called exactly once with the tenant/ws/doc.pdf key.
+    let expected_key = format!("{tenant}/{ws}/{doc_id}.pdf");
+    assert_eq!(*store.put_keys.lock().unwrap(), vec![expected_key.clone()]);
+    assert!(store.deleted_keys.lock().unwrap().is_empty());
+
+    // Document + ingest_jobs rows exist on the shared (RLS) connection.
+    let mut guard = conn.lock().await;
+    let doc: (String, String, Uuid, Option<Uuid>, i64, Option<String>) = sqlx::query_as(
+        "SELECT visibility, status, owner_id, workspace_id, byte_size, s3_key
+         FROM documents WHERE id = $1",
+    )
+    .bind(doc_id)
+    .fetch_one(&mut *guard)
+    .await
+    .unwrap();
+    assert_eq!(doc.0, "private");
+    assert_eq!(doc.1, "uploaded");
+    assert_eq!(doc.2, owner);
+    assert_eq!(doc.3, Some(ws));
+    assert_eq!(doc.4, "%PDF-1.7 fake bytes".len() as i64);
+    assert_eq!(doc.5, Some(expected_key));
+
+    let job: (Uuid, String) =
+        sqlx::query_as("SELECT id, status FROM ingest_jobs WHERE document_id = $1")
+            .bind(doc_id)
+            .fetch_one(&mut *guard)
+            .await
+            .unwrap();
+    drop(guard);
+
+    // Enqueued payload mirrors the row and carries owner_id + visibility.
+    let jobs = enqueuer.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let payload = &jobs[0];
+    assert_eq!(payload.id, job.0, "redis job id must equal ingest_jobs.id");
+    assert_eq!(payload.tenant_id, tenant);
+    assert_eq!(payload.workspace_id, ws);
+    assert_eq!(payload.document_id, doc_id);
+    assert_eq!(payload.owner_id, owner);
+    assert_eq!(payload.visibility, "private");
+    assert_eq!(payload.filename, "report.pdf");
+    assert_eq!(payload.attempts, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn upload_over_quota_returns_429(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t58q.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    // 5-byte storage limit; the upload is far bigger.
+    insert_quota(&pool, tenant, 5, 100).await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let enqueuer = Arc::new(MockEnqueuer::default());
+    let conn = rls_conn(&pool, tenant).await;
+    let app = upload_app(
+        conn.clone(),
+        tenant,
+        owner,
+        store.clone(),
+        enqueuer.clone(),
+    );
+
+    let body = build_multipart(
+        &[("visibility", "private"), ("workspace_id", &ws.to_string())],
+        Some(("big.pdf", "application/pdf", b"this is way more than five bytes")),
+    );
+    let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Quota rejected before any S3 write; no rows created.
+    assert!(store.put_keys.lock().unwrap().is_empty());
+    assert!(enqueuer.jobs.lock().unwrap().is_empty());
+    let mut guard = conn.lock().await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM documents")
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn upload_invalid_visibility_returns_400(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t58v.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let enqueuer = Arc::new(MockEnqueuer::default());
+    let conn = rls_conn(&pool, tenant).await;
+    let app = upload_app(
+        conn.clone(),
+        tenant,
+        owner,
+        store.clone(),
+        enqueuer.clone(),
+    );
+
+    let body = build_multipart(
+        &[("visibility", "public"), ("workspace_id", &ws.to_string())],
+        Some(("x.pdf", "application/pdf", b"bytes")),
+    );
+    let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(store.put_keys.lock().unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t58rb.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let enqueuer = Arc::new(MockEnqueuer {
+        fail: true,
+        ..Default::default()
+    });
+    let conn = rls_conn(&pool, tenant).await;
+    let app = upload_app(
+        conn.clone(),
+        tenant,
+        owner,
+        store.clone(),
+        enqueuer.clone(),
+    );
+
+    let body = build_multipart(
+        &[("visibility", "shared"), ("workspace_id", &ws.to_string())],
+        Some(("doc.pdf", "application/pdf", b"%PDF bytes here")),
+    );
+    let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // S3 object uploaded then deleted (rollback); same key both times.
+    let put = store.put_keys.lock().unwrap().clone();
+    let deleted = store.deleted_keys.lock().unwrap().clone();
+    assert_eq!(put.len(), 1);
+    assert_eq!(deleted, put, "the uploaded key must be deleted on rollback");
+
+    // No document/ingest_jobs rows persisted (ROLLBACK TO SAVEPOINT).
+    let mut guard = conn.lock().await;
+    let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM documents")
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_jobs")
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    assert_eq!(docs, 0, "document insert must be rolled back");
+    assert_eq!(jobs, 0, "ingest_jobs insert must be rolled back");
 }

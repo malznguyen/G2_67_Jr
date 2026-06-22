@@ -16,7 +16,10 @@ use auth::extractor::AuthState;
 use auth::jwt::JwtValidator;
 use auth::middleware::auth_middleware;
 use auth::tenant::tenant_middleware;
-use axum::{Extension, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Extension, Router, extract::State, http::StatusCode, response::IntoResponse,
+    routing::{delete, get, patch},
+};
 use gmrag_core::{Config, QdrantStore, init_app_pool, init_pool};
 use middleware::rls::rls_middleware;
 use pool::{AdminPool, AppPool};
@@ -69,9 +72,33 @@ pub async fn run() -> anyhow::Result<()> {
 
     let authed: Router<AppState> = Router::new()
         .route("/users/me", get(routes::users::get_me))
+        .route(
+            "/tenants",
+            get(routes::tenants::list_tenants).post(routes::tenants::create_tenant),
+        )
         .layer(axum::middleware::from_fn(auth_middleware));
 
     let tenant_scoped: Router<AppState> = Router::new()
+        .route(
+            "/tenants/:tid",
+            patch(routes::tenants::update_tenant).delete(routes::tenants::delete_tenant),
+        )
+        .route(
+            "/tenants/:tid/members",
+            get(routes::tenant_members::list_members).post(routes::tenant_members::invite_member),
+        )
+        .route(
+            "/tenants/:tid/members/:user_id",
+            delete(routes::tenant_members::remove_member),
+        )
+        .route(
+            "/tenants/:tid/workspaces",
+            get(routes::workspaces::list_workspaces).post(routes::workspaces::create_workspace),
+        )
+        .route(
+            "/tenants/:tid/workspaces/:wid",
+            patch(routes::workspaces::update_workspace).delete(routes::workspaces::delete_workspace),
+        )
         .layer(axum::middleware::from_fn(rls_middleware))
         .layer(axum::middleware::from_fn(tenant_middleware))
         .layer(axum::middleware::from_fn(auth_middleware));

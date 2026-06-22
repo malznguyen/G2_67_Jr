@@ -29,7 +29,9 @@ use gmrag_api::auth::tenant::TenantContext;
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::queue::{IngestJobPayload, JobEnqueuer};
-use gmrag_api::routes::documents::{delete_document, list_documents, DocListParams};
+use gmrag_api::routes::documents::{
+    delete_document, list_documents, preview_document, DocListParams,
+};
 use gmrag_api::storage::ObjectStore;
 use gmrag_api::vector::VectorCleaner;
 
@@ -834,4 +836,126 @@ async fn delete_document_cross_tenant_returns_404(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+// ─── T60: preview — metadata + chunks (visibility/ACL) ────────────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn preview_owner_returns_metadata_and_ordered_chunks(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t60o.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let doc = insert_document(&pool, tenant, None, owner, "My Report", "private").await;
+    // Insert out of order to prove ORDER BY chunk_index ASC.
+    insert_chunk(&pool, tenant, doc, 2).await;
+    insert_chunk(&pool, tenant, doc, 0).await;
+    insert_chunk(&pool, tenant, doc, 1).await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, body) = parts(
+        preview_document(
+            Path((tenant, doc)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(owner)),
+            Extension(conn),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["document"]["id"].as_str().unwrap(), doc.to_string());
+    assert_eq!(body["document"]["title"].as_str().unwrap(), "My Report");
+    assert_eq!(body["document"]["visibility"].as_str().unwrap(), "private");
+
+    let chunks = body["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 3);
+    let indices: Vec<i64> = chunks
+        .iter()
+        .map(|c| c["chunk_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indices, vec![0, 1, 2], "chunks must be ordered by chunk_index");
+    assert_eq!(chunks[0]["content"].as_str().unwrap(), "chunk 0");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn preview_shared_document_visible_to_other(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t60s.com").await;
+    let other = create_user(&pool, "other@t60s.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let doc = insert_document(&pool, tenant, None, owner, "Shared", "shared").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, body) = parts(
+        preview_document(
+            Path((tenant, doc)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(other)),
+            Extension(conn),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["document"]["id"].as_str().unwrap(), doc.to_string());
+    assert_eq!(body["chunks"].as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn preview_workspace_member_sees_private_document(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t60w.com").await;
+    let member = create_user(&pool, "member@t60w.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    add_workspace_member(&pool, ws, tenant, member).await;
+    let doc = insert_document(&pool, tenant, Some(ws), owner, "WS Doc", "private").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, body) = parts(
+        preview_document(
+            Path((tenant, doc)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(member)),
+            Extension(conn),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["document"]["id"].as_str().unwrap(), doc.to_string());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn preview_private_hidden_from_non_owner_returns_404(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t60p.com").await;
+    let other = create_user(&pool, "other@t60p.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let doc = insert_document(&pool, tenant, None, owner, "Secret", "private").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let result = preview_document(
+        Path((tenant, doc)),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(other)),
+        Extension(conn),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::NotFound)));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn preview_cross_tenant_returns_404(pool: PgPool) {
+    let user_a = create_user(&pool, "a@t60x.com").await;
+    let user_b = create_user(&pool, "b@t60x.com").await;
+    let tenant_a = insert_tenant(&pool, "A").await;
+    let tenant_b = insert_tenant(&pool, "B").await;
+    let doc_b = insert_document(&pool, tenant_b, None, user_b, "B Shared", "shared").await;
+
+    let conn = rls_conn(&pool, tenant_a).await;
+    let result = preview_document(
+        Path((tenant_a, doc_b)),
+        Extension(TenantContext(tenant_a)),
+        Extension(auth_user(user_a)),
+        Extension(conn),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::NotFound)));
 }

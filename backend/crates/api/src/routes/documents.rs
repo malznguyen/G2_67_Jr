@@ -398,3 +398,86 @@ pub async fn delete_document(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// Document metadata returned by the preview endpoint.
+#[derive(Serialize, sqlx::FromRow)]
+struct DocumentPreview {
+    id: Uuid,
+    title: String,
+    status: String,
+    visibility: String,
+    owner_id: Uuid,
+    workspace_id: Option<Uuid>,
+    mime_type: Option<String>,
+    byte_size: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One chunk row in the preview response.
+#[derive(Serialize, sqlx::FromRow)]
+struct ChunkPreview {
+    chunk_index: i32,
+    content: String,
+    token_count: Option<i32>,
+}
+
+/// Max chunks returned in a single preview.
+const PREVIEW_CHUNK_LIMIT: i64 = 50;
+
+/// `GET /tenants/{tid}/documents/{did}/preview` — metadata + first chunks (T60).
+///
+/// Applies the same visibility + ACL predicate as `list_documents`: the
+/// document is returned iff `visibility = 'shared'`, the caller is the owner,
+/// or the caller is a member of the document's workspace. RLS scopes to the
+/// tenant first, so cross-tenant or unauthorized access both surface as `404`
+/// (no information leak). Returns up to [`PREVIEW_CHUNK_LIMIT`] chunks ordered
+/// by `chunk_index`.
+pub async fn preview_document(
+    Path((tid, did)): Path<(Uuid, Uuid)>,
+    Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
+    Extension(conn): Extension<SharedConnection>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_path_matches_context(tid, &ctx)?;
+
+    let mut guard = conn.lock().await;
+    let document = sqlx::query_as::<_, DocumentPreview>(
+        "SELECT id, title, status, visibility, owner_id, workspace_id, mime_type, byte_size, created_at
+         FROM documents
+         WHERE id = $1
+           AND (
+                 visibility = $2
+                 OR owner_id = $3
+                 OR (workspace_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM workspace_members wm
+                       WHERE wm.workspace_id = documents.workspace_id
+                         AND wm.user_id = $3))
+               )",
+    )
+    .bind(did)
+    .bind(VISIBILITY_SHARED)
+    .bind(auth_user.user_id)
+    .fetch_optional(&mut *guard)
+    .await
+    .map_err(|e| ApiError::Internal(format!("load document: {e}")))?
+    .ok_or(ApiError::NotFound)?;
+
+    let chunks = sqlx::query_as::<_, ChunkPreview>(
+        "SELECT chunk_index, content, token_count
+         FROM document_chunks
+         WHERE document_id = $1
+         ORDER BY chunk_index ASC
+         LIMIT $2",
+    )
+    .bind(did)
+    .bind(PREVIEW_CHUNK_LIMIT)
+    .fetch_all(&mut *guard)
+    .await
+    .map_err(|e| ApiError::Internal(format!("load chunks: {e}")))?;
+    drop(guard);
+
+    Ok(Json(serde_json::json!({
+        "document": document,
+        "chunks": chunks,
+    })))
+}

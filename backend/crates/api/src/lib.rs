@@ -131,6 +131,10 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants/:tid/documents",
             get(routes::documents::list_documents).post(routes::documents::upload_document),
         )
+        .route(
+            "/tenants/:tid/documents/:did",
+            delete(routes::documents::delete_document),
+        )
         // Allow large multipart document uploads (default axum limit is 2 MiB).
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(axum::middleware::from_fn(rls_middleware))

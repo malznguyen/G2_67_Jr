@@ -29,7 +29,7 @@ use gmrag_api::auth::tenant::TenantContext;
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::queue::{IngestJobPayload, JobEnqueuer};
-use gmrag_api::routes::documents::{list_documents, DocListParams};
+use gmrag_api::routes::documents::{delete_document, list_documents, DocListParams};
 use gmrag_api::storage::ObjectStore;
 use gmrag_api::vector::VectorCleaner;
 
@@ -397,7 +397,6 @@ impl JobEnqueuer for MockEnqueuer {
 
 /// Records each `(tenant, document)` cleanup request. Used by the T59 tests.
 #[derive(Default)]
-#[allow(dead_code)]
 struct MockVectorCleaner {
     cleaned: Mutex<Vec<(Uuid, Uuid)>>,
 }
@@ -676,4 +675,163 @@ async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
         .unwrap();
     assert_eq!(docs, 0, "document insert must be rolled back");
     assert_eq!(jobs, 0, "ingest_jobs insert must be rolled back");
+}
+
+// ─── T59: delete — cascade + S3/Qdrant orphan cleanup ─────────────────────────
+
+async fn insert_ingest_job(pool: &PgPool, tenant_id: Uuid, document_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO ingest_jobs (tenant_id, document_id, status) VALUES ($1, $2, 'pending')",
+    )
+    .bind(tenant_id)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_chunk(pool: &PgPool, tenant_id: Uuid, document_id: Uuid, idx: i32) {
+    sqlx::query(
+        "INSERT INTO document_chunks (tenant_id, document_id, chunk_index, content, qdrant_point_id)
+         VALUES ($1, $2, $3, $4, gen_random_uuid())",
+    )
+    .bind(tenant_id)
+    .bind(document_id)
+    .bind(idx)
+    .bind(format!("chunk {idx}"))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_s3_key(pool: &PgPool, document_id: Uuid, key: &str) {
+    sqlx::query("UPDATE documents SET s3_key = $2 WHERE id = $1")
+        .bind(document_id)
+        .bind(key)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_document_owner_cascades_and_cleans_up(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t59ok.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    let doc = insert_document(&pool, tenant, Some(ws), owner, "Doc", "private").await;
+    let s3_key = format!("{tenant}/{ws}/{doc}.pdf");
+    set_s3_key(&pool, doc, &s3_key).await;
+    insert_ingest_job(&pool, tenant, doc).await;
+    insert_chunk(&pool, tenant, doc, 0).await;
+    insert_chunk(&pool, tenant, doc, 1).await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let cleaner = Arc::new(MockVectorCleaner::default());
+    let conn = rls_conn(&pool, tenant).await;
+    let (status, _) = parts(
+        delete_document(
+            Path((tenant, doc)),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(owner)),
+            Extension(conn.clone()),
+            Extension(store.clone() as Arc<dyn ObjectStore>),
+            Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // S3 object + Qdrant chunks cleanup invoked.
+    assert_eq!(*store.deleted_keys.lock().unwrap(), vec![s3_key]);
+    assert_eq!(*cleaner.cleaned.lock().unwrap(), vec![(tenant, doc)]);
+
+    // Postgres cascade removed the document + chunks + ingest job.
+    let mut guard = conn.lock().await;
+    let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
+        .bind(doc)
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_jobs WHERE document_id = $1")
+        .bind(doc)
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    let chunks: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM document_chunks WHERE document_id = $1")
+            .bind(doc)
+            .fetch_one(&mut *guard)
+            .await
+            .unwrap();
+    assert_eq!(docs, 0);
+    assert_eq!(jobs, 0, "ingest_jobs must cascade-delete");
+    assert_eq!(chunks, 0, "document_chunks must cascade-delete");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_document_non_owner_returns_403(pool: PgPool) {
+    let owner = create_user(&pool, "owner@t59f.com").await;
+    let other = create_user(&pool, "other@t59f.com").await;
+    let tenant = insert_tenant(&pool, "Acme").await;
+    let doc = insert_document(&pool, tenant, None, owner, "Doc", "shared").await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let cleaner = Arc::new(MockVectorCleaner::default());
+    let conn = rls_conn(&pool, tenant).await;
+    let result = delete_document(
+        Path((tenant, doc)),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(other)),
+        Extension(conn.clone()),
+        Extension(store.clone() as Arc<dyn ObjectStore>),
+        Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::Forbidden(_))));
+
+    // Nothing cleaned, document still present.
+    assert!(store.deleted_keys.lock().unwrap().is_empty());
+    assert!(cleaner.cleaned.lock().unwrap().is_empty());
+    let mut guard = conn.lock().await;
+    let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
+        .bind(doc)
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
+    assert_eq!(docs, 1, "non-owner delete must not remove the document");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_document_cross_tenant_returns_404(pool: PgPool) {
+    let user_a = create_user(&pool, "a@t59x.com").await;
+    let user_b = create_user(&pool, "b@t59x.com").await;
+    let tenant_a = insert_tenant(&pool, "A").await;
+    let tenant_b = insert_tenant(&pool, "B").await;
+    let doc_b = insert_document(&pool, tenant_b, None, user_b, "B Doc", "shared").await;
+
+    let store = Arc::new(MockObjectStore::default());
+    let cleaner = Arc::new(MockVectorCleaner::default());
+    // Caller operates in tenant A; doc_b belongs to tenant B → RLS hides it.
+    let conn = rls_conn(&pool, tenant_a).await;
+    let result = delete_document(
+        Path((tenant_a, doc_b)),
+        Extension(TenantContext(tenant_a)),
+        Extension(auth_user(user_a)),
+        Extension(conn.clone()),
+        Extension(store.clone() as Arc<dyn ObjectStore>),
+        Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+    )
+    .await;
+    assert!(matches!(result, Err(ApiError::NotFound)));
+    assert!(store.deleted_keys.lock().unwrap().is_empty());
+    assert!(cleaner.cleaned.lock().unwrap().is_empty());
+
+    // Document still exists in tenant B.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM documents WHERE id = $1")
+        .bind(doc_b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
 }

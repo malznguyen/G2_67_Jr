@@ -28,6 +28,7 @@ use crate::middleware::rls::SharedConnection;
 use crate::queue::{IngestJobPayload, JobEnqueuer};
 use crate::routes::tenants::ensure_path_matches_context;
 use crate::storage::ObjectStore;
+use crate::vector::VectorCleaner;
 
 /// Marks a document as readable by anyone in the tenant.
 const VISIBILITY_SHARED: &str = "shared";
@@ -330,4 +331,70 @@ pub async fn upload_document(
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": document_id })),
     ))
+}
+
+/// `DELETE /tenants/{tid}/documents/{did}` — delete a document (T59).
+///
+/// Owner-only. Order: load (RLS-scoped) → owner guard → S3 object delete →
+/// Qdrant chunk-vector cleanup (orphan removal) → Postgres `DELETE` (cascade
+/// removes `document_chunks` + `ingest_jobs`). Cross-tenant rows are hidden by
+/// RLS, so they surface as `404`.
+///
+/// Graph nodes/edges are intentionally NOT cleaned per-document: they are
+/// deduplicated per `(tenant, workspace, label, kind)` and shared across
+/// documents, with no `document_id` link in the schema (see
+/// `QdrantStore::delete_chunks_by_document` and the T59 progress notes).
+///
+/// S3 / Qdrant cleanup is best-effort (failures are logged, not fatal) so a
+/// transient object-store hiccup cannot strand the document row; the Postgres
+/// delete is the authoritative step.
+pub async fn delete_document(
+    Path((tid, did)): Path<(Uuid, Uuid)>,
+    Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
+    Extension(conn): Extension<SharedConnection>,
+    Extension(store): Extension<Arc<dyn ObjectStore>>,
+    Extension(cleaner): Extension<Arc<dyn VectorCleaner>>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_path_matches_context(tid, &ctx)?;
+
+    // 1. Load the document under RLS (cross-tenant → no row → 404).
+    let row: Option<(Option<String>, Uuid)> = {
+        let mut guard = conn.lock().await;
+        sqlx::query_as("SELECT s3_key, owner_id FROM documents WHERE id = $1")
+            .bind(did)
+            .fetch_optional(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load document: {e}")))?
+    };
+    let (s3_key, owner_id) = row.ok_or(ApiError::NotFound)?;
+
+    // 2. Owner-only guard.
+    if owner_id != auth_user.user_id {
+        return Err(ApiError::Forbidden(
+            "only the document owner may delete it".into(),
+        ));
+    }
+
+    // 3. Best-effort external cleanup: S3 object, then Qdrant chunk vectors.
+    if let Some(key) = &s3_key {
+        if let Err(e) = store.delete(key).await {
+            tracing::warn!(error = %e, document_id = %did, "s3 delete failed during document delete");
+        }
+    }
+    if let Err(e) = cleaner.delete_document_chunks(tid, did).await {
+        tracing::warn!(error = %e, document_id = %did, "qdrant cleanup failed during document delete");
+    }
+
+    // 4. Postgres delete (cascade: document_chunks + ingest_jobs).
+    {
+        let mut guard = conn.lock().await;
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(did)
+            .execute(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("delete document: {e}")))?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }

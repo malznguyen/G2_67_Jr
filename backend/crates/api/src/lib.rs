@@ -107,6 +107,10 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants/:tid/workspaces/:wid/members/:user_id",
             delete(routes::ws_members::remove_member),
         )
+        .route(
+            "/tenants/:tid/documents",
+            get(routes::documents::list_documents),
+        )
         .layer(axum::middleware::from_fn(rls_middleware))
         .layer(axum::middleware::from_fn(tenant_middleware))
         .layer(axum::middleware::from_fn(auth_middleware));

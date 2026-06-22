@@ -1,3 +1,4 @@
+pub mod documents;
 pub mod tenant_members;
 pub mod tenants;
 pub mod users;

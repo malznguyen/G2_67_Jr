@@ -71,6 +71,57 @@ pub fn resolve_chunk_index_citations(
     out
 }
 
+/// JSON payload for a single SSE `data:` line (T61).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatSsePayload {
+    Text {
+        content: String,
+    },
+    Citation {
+        index: u32,
+        point_id: Uuid,
+        document_id: Uuid,
+        chunk_index: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
+    CitationUnknown {
+        index: u32,
+    },
+    Done {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+impl From<&EnrichedChatStreamEvent> for ChatSsePayload {
+    fn from(ev: &EnrichedChatStreamEvent) -> Self {
+        match ev {
+            EnrichedChatStreamEvent::Text { content } => ChatSsePayload::Text {
+                content: content.clone(),
+            },
+            EnrichedChatStreamEvent::CitationResolved(c) => ChatSsePayload::Citation {
+                index: c.index,
+                point_id: c.point_id,
+                document_id: c.document_id,
+                chunk_index: c.chunk_index,
+                filename: c.filename.clone(),
+            },
+            EnrichedChatStreamEvent::CitationUnknown { index } => {
+                ChatSsePayload::CitationUnknown { index: *index }
+            }
+            EnrichedChatStreamEvent::Done { finish_reason } => ChatSsePayload::Done {
+                finish_reason: finish_reason.clone(),
+            },
+        }
+    }
+}
+
 /// Enrich parsed stream events: `Citation { index }` → `CitationResolved { .. }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrichedChatStreamEvent {

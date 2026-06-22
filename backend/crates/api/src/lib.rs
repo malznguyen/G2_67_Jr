@@ -8,6 +8,7 @@ pub mod metering;
 pub mod middleware;
 pub mod pool;
 pub mod queue;
+pub mod rbac;
 pub mod routes;
 pub mod storage;
 pub mod vector;
@@ -23,9 +24,10 @@ use auth::tenant::tenant_middleware;
 use axum::{
     Extension, Router, extract::DefaultBodyLimit, extract::State, http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, patch},
+    routing::{delete, get, patch, post},
 };
 use gmrag_core::{Config, QdrantStore, init_app_pool, init_pool};
+use routes::chat::LlmRuntime;
 use middleware::rls::rls_middleware;
 use pool::{AdminPool, AppPool};
 use queue::RedisEnqueuer;
@@ -81,6 +83,12 @@ pub async fn run() -> anyhow::Result<()> {
     info!(redis_url = %cfg.redis.url, "redis enqueuer ready");
 
     let vector_cleaner: Arc<dyn vector::VectorCleaner> = Arc::new(qdrant.clone());
+
+    let llm_runtime = LlmRuntime {
+        deepseek: cfg.deepseek.clone(),
+        ollama: cfg.ollama.clone(),
+        tenant_key_encryption_key: cfg.tenant_key_encryption_key,
+    };
 
     let jwt_validator = JwtValidator::new(cfg.oidc.issuer.clone(), cfg.oidc.client_id.clone());
     let auth_state = AuthState { jwt_validator };
@@ -139,6 +147,30 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants/:tid/documents/:did/preview",
             get(routes::documents::preview_document),
         )
+        .route(
+            "/tenants/:tid/acl",
+            get(routes::acl::list_grants).post(routes::acl::create_grant),
+        )
+        .route(
+            "/tenants/:tid/acl/:grant_id",
+            delete(routes::acl::revoke_grant),
+        )
+        .route(
+            "/tenants/:tid/chat_sessions",
+            get(routes::chat::list_sessions).post(routes::chat::create_session),
+        )
+        .route(
+            "/tenants/:tid/chat_sessions/:sid",
+            delete(routes::chat::delete_session),
+        )
+        .route(
+            "/tenants/:tid/chat_sessions/:sid/chat",
+            post(routes::chat::post_chat),
+        )
+        .route(
+            "/tenants/:tid/workspaces/:wid/graph",
+            get(routes::graph::get_workspace_graph),
+        )
         // Allow large multipart document uploads (default axum limit is 2 MiB).
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(axum::middleware::from_fn(rls_middleware))
@@ -154,6 +186,7 @@ pub async fn run() -> anyhow::Result<()> {
         .layer(Extension(object_store))
         .layer(Extension(enqueuer))
         .layer(Extension(vector_cleaner))
+        .layer(Extension(llm_runtime))
         .layer(Extension(auth_state.clone()));
 
     let app = merged.with_state(AppState {

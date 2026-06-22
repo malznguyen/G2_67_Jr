@@ -1,4 +1,7 @@
+pub mod acl;
+pub mod chat;
 pub mod documents;
+pub mod graph;
 pub mod tenant_members;
 pub mod tenants;
 pub mod users;

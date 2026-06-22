@@ -5,10 +5,12 @@
 //! confines every query to the current tenant. On top of tenant isolation, the
 //! list applies a per-user visibility + ACL filter:
 //!
-//! A document is returned iff
-//!   - `visibility = 'shared'`, OR
-//!   - `owner_id = current_user`, OR
-//!   - it belongs to a workspace the current user is a member of.
+//! A document is returned iff the caller holds the `viewer` relation on it
+//! (ReBAC, T83): `visibility = 'shared'`, owner, a member of the document's
+//! workspace (inheritance), or the recipient of a `resource_acl` grant
+//! (directly or via a workspace-group share). This is the set-compiled form of
+//! [`crate::rbac::check::check_relation`]`(document, viewer, user)` so the
+//! listing stays a single indexed query instead of an N+1 per-row Check.
 //!
 //! An optional `workspace_id` query parameter further narrows the result.
 
@@ -26,6 +28,8 @@ use crate::auth::tenant::TenantContext;
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::queue::{IngestJobPayload, JobEnqueuer};
+use crate::rbac::check::check_relation;
+use crate::rbac::model::{ObjectRef, Principal, Relation, NS_DOCUMENT};
 use crate::routes::tenants::ensure_path_matches_context;
 use crate::storage::ObjectStore;
 use crate::vector::VectorCleaner;
@@ -103,6 +107,18 @@ pub async fn list_documents(
                        SELECT 1 FROM workspace_members wm
                        WHERE wm.workspace_id = documents.workspace_id
                          AND wm.user_id = $2))
+                 OR EXISTS (
+                       SELECT 1 FROM resource_acl ra
+                       WHERE ra.resource_type = 'document'
+                         AND ra.resource_id = documents.id
+                         AND ra.permission IN ('owner', 'editor', 'viewer')
+                         AND (
+                               (ra.principal_type = 'user' AND ra.principal_id = $2)
+                               OR (ra.principal_type = 'workspace' AND EXISTS (
+                                     SELECT 1 FROM workspace_members wmg
+                                     WHERE wmg.workspace_id = ra.principal_id
+                                       AND wmg.user_id = $2))
+                             ))
                )
            AND ($3::uuid IS NULL OR workspace_id = $3)
          ORDER BY created_at DESC",
@@ -358,23 +374,35 @@ pub async fn delete_document(
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
-    // 1. Load the document under RLS (cross-tenant → no row → 404).
-    let row: Option<(Option<String>, Uuid)> = {
+    // 1. Load the document under RLS (cross-tenant → no row → 404), then apply
+    //    the ReBAC owner guard via the Check engine (T83).
+    let s3_key = {
         let mut guard = conn.lock().await;
-        sqlx::query_as("SELECT s3_key, owner_id FROM documents WHERE id = $1")
-            .bind(did)
-            .fetch_optional(&mut *guard)
-            .await
-            .map_err(|e| ApiError::Internal(format!("load document: {e}")))?
-    };
-    let (s3_key, owner_id) = row.ok_or(ApiError::NotFound)?;
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT s3_key FROM documents WHERE id = $1")
+                .bind(did)
+                .fetch_optional(&mut *guard)
+                .await
+                .map_err(|e| ApiError::Internal(format!("load document: {e}")))?;
+        let s3_key = row.ok_or(ApiError::NotFound)?.0;
 
-    // 2. Owner-only guard.
-    if owner_id != auth_user.user_id {
-        return Err(ApiError::Forbidden(
-            "only the document owner may delete it".into(),
-        ));
-    }
+        // 2. Owner-only guard (delete is an owner action in the ResourceBAC matrix).
+        let is_owner = check_relation(
+            &mut guard,
+            &ObjectRef::new(NS_DOCUMENT, did),
+            Relation::Owner,
+            Principal::User(auth_user.user_id),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("owner check: {e}")))?;
+        if !is_owner {
+            drop(guard);
+            return Err(ApiError::Forbidden(
+                "only the document owner may delete it".into(),
+            ));
+        }
+        s3_key
+    };
 
     // 3. Best-effort external cleanup: S3 object, then Qdrant chunk vectors.
     if let Some(key) = &s3_key {
@@ -426,12 +454,13 @@ const PREVIEW_CHUNK_LIMIT: i64 = 50;
 
 /// `GET /tenants/{tid}/documents/{did}/preview` — metadata + first chunks (T60).
 ///
-/// Applies the same visibility + ACL predicate as `list_documents`: the
-/// document is returned iff `visibility = 'shared'`, the caller is the owner,
-/// or the caller is a member of the document's workspace. RLS scopes to the
-/// tenant first, so cross-tenant or unauthorized access both surface as `404`
-/// (no information leak). Returns up to [`PREVIEW_CHUNK_LIMIT`] chunks ordered
-/// by `chunk_index`.
+/// Authorization is the ReBAC `viewer` relation, evaluated by
+/// [`crate::rbac::check::check_relation`] (T83): the document is returned iff
+/// `visibility = 'shared'`, the caller is the owner, a member of the
+/// document's workspace, or the recipient of a `resource_acl` grant (directly
+/// or via a workspace group). RLS scopes to the tenant first, so cross-tenant
+/// or unauthorized access both surface as `404` (no information leak). Returns
+/// up to [`PREVIEW_CHUNK_LIMIT`] chunks ordered by `chunk_index`.
 pub async fn preview_document(
     Path((tid, did)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -441,26 +470,31 @@ pub async fn preview_document(
     ensure_path_matches_context(tid, &ctx)?;
 
     let mut guard = conn.lock().await;
+    // Load the row under RLS, then gate on the viewer relation. A missing row
+    // and a denied check both yield 404 (no existence leak).
     let document = sqlx::query_as::<_, DocumentPreview>(
         "SELECT id, title, status, visibility, owner_id, workspace_id, mime_type, byte_size, created_at
          FROM documents
-         WHERE id = $1
-           AND (
-                 visibility = $2
-                 OR owner_id = $3
-                 OR (workspace_id IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM workspace_members wm
-                       WHERE wm.workspace_id = documents.workspace_id
-                         AND wm.user_id = $3))
-               )",
+         WHERE id = $1",
     )
     .bind(did)
-    .bind(VISIBILITY_SHARED)
-    .bind(auth_user.user_id)
     .fetch_optional(&mut *guard)
     .await
     .map_err(|e| ApiError::Internal(format!("load document: {e}")))?
     .ok_or(ApiError::NotFound)?;
+
+    let can_view = check_relation(
+        &mut guard,
+        &ObjectRef::new(NS_DOCUMENT, did),
+        Relation::Viewer,
+        Principal::User(auth_user.user_id),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("viewer check: {e}")))?;
+    if !can_view {
+        drop(guard);
+        return Err(ApiError::NotFound);
+    }
 
     let chunks = sqlx::query_as::<_, ChunkPreview>(
         "SELECT chunk_index, content, token_count

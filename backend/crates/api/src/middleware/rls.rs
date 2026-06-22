@@ -17,8 +17,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use sqlx::pool::PoolConnection;
-use sqlx::{PgConnection, Postgres};
+use sqlx::{PgConnection, Postgres, PgPool};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::auth::tenant::TenantContext;
 use crate::pool::AppPool;
@@ -39,6 +40,36 @@ impl SharedConnection {
     /// Acquire the connection for query execution.
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, PgConnection> {
         self.0.lock().await
+    }
+}
+
+/// Run `f` inside a fresh RLS-scoped transaction (`BEGIN` → `COMMIT`/`ROLLBACK`).
+///
+/// Used when work must outlive the request middleware transaction — e.g. SSE
+/// post-stream metering/persistence after the handler returns.
+pub async fn with_rls_connection<T, F, Fut>(pool: &PgPool, tenant_id: Uuid, f: F) -> Result<T, sqlx::Error>
+where
+    F: for<'a> FnOnce(&'a mut PgConnection) -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let acquired = pool.acquire().await?;
+    let mut conn = acquired.detach();
+
+    sqlx::Executor::execute(&mut conn, "BEGIN").await?;
+    sqlx::Executor::execute(&mut conn, "SET LOCAL ROLE gmrag_app").await?;
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{tenant_id}'"))
+        .execute(&mut conn)
+        .await?;
+
+    match f(&mut conn).await {
+        Ok(value) => {
+            sqlx::Executor::execute(&mut conn, "COMMIT").await?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = sqlx::Executor::execute(&mut conn, "ROLLBACK").await;
+            Err(err)
+        }
     }
 }
 

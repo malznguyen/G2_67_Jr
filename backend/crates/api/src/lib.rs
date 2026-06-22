@@ -171,6 +171,10 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants/:tid/workspaces/:wid/graph",
             get(routes::graph::get_workspace_graph),
         )
+        .route(
+            "/tenants/:tid/settings/llm",
+            get(routes::settings::get_llm_settings).put(routes::settings::put_llm_settings),
+        )
         // Allow large multipart document uploads (default axum limit is 2 MiB).
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(axum::middleware::from_fn(rls_middleware))

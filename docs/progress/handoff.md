@@ -1,3 +1,9 @@
+> ⚠️ ARCHIVED / STALE — 2026-06-22
+> HEAD lúc viết file này: `5517cb6` — ĐÃ LỖI THỜI.
+> HEAD thực tế: `5c3ae8a`. Toàn bộ T61-T85 ĐÃ committed & clean.
+> Xem `docs/progress/AUDIT_PRE_FRONTEND.md` để biết trạng thái thực tế.
+> ---
+
 # Handoff — ReBAC Authorization Phase (sau T60)
 
 **Repo:** `gm_rag_2.0`  

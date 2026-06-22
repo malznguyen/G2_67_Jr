@@ -80,7 +80,9 @@ impl JwtValidator {
             client_id,
             cache: Arc::new(RwLock::new(JwksCache {
                 keys: HashMap::new(),
-                fetched_at: Instant::now() - Duration::from_secs(3600),
+                fetched_at: Instant::now()
+                    .checked_sub(Duration::from_secs(3600))
+                    .unwrap_or(Instant::now()),
             })),
             cache_ttl: Duration::from_secs(300),
             http_client: reqwest::Client::builder()

@@ -114,7 +114,26 @@ async fn require_owner(
     }
 }
 
-/// `GET /tenants/{tid}/acl` — list the grants on a resource (viewer-gated).
+/// List ACL grants on a resource (viewer-gated).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/acl",
+    tag = "ACL",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("resource_type" = String, Query, description = "document or chat_session"),
+        ("resource_id" = Uuid, Query, description = "Resource UUID"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Grant list", body = crate::openapi::schemas::GrantsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Resource not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_grants(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -161,7 +180,25 @@ pub async fn list_grants(
     Ok(Json(serde_json::json!({ "grants": rows })))
 }
 
-/// `POST /tenants/{tid}/acl` — create a grant (owner-only).
+/// Create an ACL grant (owner-only).
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/acl",
+    tag = "ACL",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::CreateGrantRequest,
+    responses(
+        (status = 201, description = "Grant created", body = crate::openapi::schemas::CreateGrantResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn create_grant(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -228,7 +265,26 @@ pub async fn create_grant(
     ))
 }
 
-/// `DELETE /tenants/{tid}/acl/{grant_id}` — revoke a grant (owner-only).
+/// Revoke an ACL grant (owner-only).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/acl/{grant_id}",
+    tag = "ACL",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("grant_id" = Uuid, Path, description = "Grant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Grant revoked"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Grant not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn revoke_grant(
     Path((tid, grant_id)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,

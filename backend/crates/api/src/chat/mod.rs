@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-/// Resolved chunk citation metadata for client display (T50).
+/// Resolved chunk citation metadata for client display (T50, T84D page metadata).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedCitation {
     pub index: u32,
@@ -26,6 +26,12 @@ pub struct ResolvedCitation {
     pub document_id: Uuid,
     pub chunk_index: i32,
     pub filename: Option<String>,
+    /// T84D Phase 3.1: 1-based page range — `None` when no page metadata
+    /// is recorded for the chunk (legacy rows / non-PDF ingest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_start: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_end: Option<i32>,
 }
 
 impl From<&ChunkHit> for ResolvedCitation {
@@ -36,6 +42,8 @@ impl From<&ChunkHit> for ResolvedCitation {
             document_id: hit.document_id,
             chunk_index: hit.chunk_index,
             filename: hit.filename.clone(),
+            page_start: hit.page_start,
+            page_end: hit.page_end,
         }
     }
 }
@@ -71,7 +79,7 @@ pub fn resolve_chunk_index_citations(
     out
 }
 
-/// JSON payload for a single SSE `data:` line (T61).
+/// JSON payload for a single SSE `data:` line (T61, T84D page metadata).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatSsePayload {
@@ -85,6 +93,11 @@ pub enum ChatSsePayload {
         chunk_index: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// T84D Phase 3.1: nullable page range in the citation SSE.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page_start: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page_end: Option<i32>,
     },
     CitationUnknown {
         index: u32,
@@ -111,6 +124,8 @@ impl From<&EnrichedChatStreamEvent> for ChatSsePayload {
                 document_id: c.document_id,
                 chunk_index: c.chunk_index,
                 filename: c.filename.clone(),
+                page_start: c.page_start,
+                page_end: c.page_end,
             },
             EnrichedChatStreamEvent::CitationUnknown { index } => {
                 ChatSsePayload::CitationUnknown { index: *index }
@@ -212,6 +227,8 @@ mod tests {
             content: content.into(),
             filename: Some(format!("doc{index}.pdf")),
             score: 1.0,
+            page_start: None,
+            page_end: None,
         }
     }
 

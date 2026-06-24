@@ -44,7 +44,7 @@ async fn create_user(pool: &PgPool, email: &str) -> Uuid {
         .bind(email)
         .execute(pool)
         .await
-        .unwrap();
+        .unwrap(); 
     id
 }
 
@@ -111,6 +111,9 @@ fn test_llm_runtime(key: Option<[u8; 32]>) -> LlmRuntime {
             keep_alive: "30m".into(),
         },
         tenant_key_encryption_key: key,
+        // T84D Phase 3.3: chat history limit (default 10) — keeps the
+        // pre-T84D tests passing without touching history behaviour.
+        chat_history_limit: 10,
     }
 }
 

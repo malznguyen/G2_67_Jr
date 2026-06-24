@@ -45,7 +45,23 @@ pub struct UpdateWorkspaceBody {
     pub slug: String,
 }
 
-/// `GET /tenants/{tid}/workspaces` — list workspaces of the current tenant.
+/// List workspaces in the current tenant.
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/workspaces",
+    tag = "Workspaces",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Workspace list", body = crate::openapi::schemas::WorkspacesResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_workspaces(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -67,11 +83,24 @@ pub async fn list_workspaces(
     Ok(Json(serde_json::json!({ "workspaces": rows })))
 }
 
-/// `POST /tenants/{tid}/workspaces` — create a workspace.
-///
-/// `created_by` is the authenticated caller. RLS `USING (tenant_id =
-/// gmrag_current_tenant())` doubles as the `WITH CHECK` for the insert, so
-/// binding `tenant_id = tid` (which equals the resolved context) succeeds.
+/// Create a workspace in the current tenant.
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/workspaces",
+    tag = "Workspaces",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::CreateWorkspaceRequest,
+    responses(
+        (status = 201, description = "Workspace created", body = crate::openapi::schemas::CreateWorkspaceResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn create_workspace(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -117,7 +146,26 @@ pub async fn create_workspace(
     ))
 }
 
-/// `PATCH /tenants/{tid}/workspaces/{wid}` — rename a workspace.
+/// Update a workspace name and slug.
+#[utoipa::path(
+    patch,
+    path = "/tenants/{tid}/workspaces/{wid}",
+    tag = "Workspaces",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("wid" = Uuid, Path, description = "Workspace ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::UpdateWorkspaceRequest,
+    responses(
+        (status = 200, description = "Workspace updated", body = crate::openapi::schemas::UpdateWorkspaceResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn update_workspace(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -156,10 +204,25 @@ pub async fn update_workspace(
     })))
 }
 
-/// `DELETE /tenants/{tid}/workspaces/{wid}` — delete a workspace.
-///
-/// `ON DELETE CASCADE` on child FKs (workspace_members, documents) removes
-/// dependent rows. Referential cascades are not subject to RLS policies.
+/// Delete a workspace (cascade).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/workspaces/{wid}",
+    tag = "Workspaces",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("wid" = Uuid, Path, description = "Workspace ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Workspace deleted"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn delete_workspace(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,

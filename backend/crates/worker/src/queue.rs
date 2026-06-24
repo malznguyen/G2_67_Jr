@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use anyhow::Context as _;
+use redis::AsyncCommands;
 
 use crate::job::IngestJob;
 
@@ -32,6 +33,15 @@ pub trait JobQueue: Send {
         key: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<Option<Vec<u8>>>;
+
+    /// T84D Phase 1.1: non-blocking push used by the outbox relay to
+    /// dispatch pending payloads onto `gmrag:ingest_jobs`. The default
+    /// impl returns `Err("not implemented")` so backends that never push
+    /// (none in production) stay trivial.
+    async fn lpush(&mut self, key: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+        let _ = (key, payload);
+        Err(anyhow::anyhow!("lpush not implemented for this JobQueue"))
+    }
 }
 
 /// Single-connection Redis queue backed by `BRPOP`.
@@ -70,21 +80,41 @@ impl JobQueue for RedisQueue {
             .map_err(|e| anyhow::anyhow!("redis BRPOP error: {e}"))?;
         Ok(result.map(|(_key, value)| value))
     }
+
+    async fn lpush(&mut self, key: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+        let mut conn = self.conn.clone();
+        conn.lpush::<_, _, ()>(key, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("redis LPUSH '{key}': {e}"))?;
+        Ok(())
+    }
 }
 
 /// In-memory mock queue for tests — no live Redis required.
 ///
 /// `brpop_timeout` pops the front item immediately. When the deque is empty
 /// it returns `Ok(None)` (simulating a BRPOP timeout).
+///
+/// `lpush` prepends to the deque (mirrors Redis LPUSH semantics). Pushed
+/// payloads are also recorded in `pushed` so the outbox relay test can
+/// assert what was LPUSHed without consuming the deque.
 pub struct MockQueue {
     items: Mutex<VecDeque<Vec<u8>>>,
+    pushed: Mutex<Vec<Vec<u8>>>,
 }
 
 impl MockQueue {
     pub fn new(items: Vec<Vec<u8>>) -> Self {
         Self {
             items: Mutex::new(items.into()),
+            pushed: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Snapshot of every payload ever LPUSHed since the queue was constructed
+    /// (in insertion order). Used by the outbox relay test.
+    pub fn pushed(&self) -> Vec<Vec<u8>> {
+        self.pushed.lock().expect("mock queue mutex poisoned").clone()
     }
 }
 
@@ -97,6 +127,21 @@ impl JobQueue for MockQueue {
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let mut items = self.items.lock().expect("mock queue mutex poisoned");
         Ok(items.pop_front())
+    }
+
+    async fn lpush(&mut self, key: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+        if key != INGEST_JOBS_KEY {
+            return Err(anyhow::anyhow!("unexpected lpush key '{key}'"));
+        }
+        {
+            let mut items = self.items.lock().expect("mock queue mutex poisoned");
+            items.push_front(payload.clone());
+        }
+        self.pushed
+            .lock()
+            .expect("mock queue pushed poisoned")
+            .push(payload);
+        Ok(())
     }
 }
 

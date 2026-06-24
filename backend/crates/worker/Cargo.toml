@@ -53,6 +53,18 @@ text-splitter = { version = "0.30", features = ["tiktoken-rs"] }
 # T37: OCR fallback — base64 encoding for Ollama vision API images.
 base64 = "0.22"
 
+# T84D Phase 1.3: feature-flagged native PDF page rasterizer. OFF by
+# default so the Docker build never bakes libpdfium in; operators who
+# ship OCR flip the feature on AND wire the real renderer in pdf_parser.rs.
+pdfium-render = { version = "0.8", optional = true }
+
+[features]
+default = []
+# Enables PdfiumRenderer (pdfium-render + libpdfium at link time). The
+# T84D plan leaves this OFF for the stock Docker image.
+ocr-pdfium = ["dep:pdfium-render"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

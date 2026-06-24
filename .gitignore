@@ -51,3 +51,5 @@ junit.xml
 test-results/
 playwright-report/
 playwright/.cache/
+
+.doc/

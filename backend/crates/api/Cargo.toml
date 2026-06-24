@@ -50,6 +50,10 @@ aws-sdk-s3 = "1"
 aws-credential-types = "1"
 redis = { version = "0.25", features = ["tokio-comp", "aio"] }
 
+# OpenAPI / Swagger UI (T84A)
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = "0.6"

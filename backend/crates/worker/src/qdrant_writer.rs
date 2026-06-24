@@ -27,7 +27,7 @@ pub struct DualWriteInput<'a> {
     pub owner_id: Uuid,
     pub visibility: &'a str,
     pub filename: &'a str,
-    pub chunks: &'a [String],
+    pub chunks: &'a [crate::chunking::Chunk],
     pub chunk_vectors: Vec<Vec<f32>>,
     pub extraction: &'a GraphExtraction,
     pub node_vectors: Vec<Vec<f32>>,
@@ -123,17 +123,23 @@ pub async fn dual_write_ingestion(
     {
         let row_id: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO document_chunks (tenant_id, document_id, chunk_index, content, qdrant_point_id)
-            VALUES ($1, $2, $3, $4, gen_random_uuid())
+            INSERT INTO document_chunks (tenant_id, document_id, chunk_index, content, qdrant_point_id, page_start, page_end)
+            VALUES ($1, $2, $3, $4, gen_random_uuid(), $5, $6)
             ON CONFLICT (document_id, chunk_index) DO UPDATE
-                SET content = EXCLUDED.content
+                SET content = EXCLUDED.content,
+                    page_start = EXCLUDED.page_start,
+                    page_end = EXCLUDED.page_end
             RETURNING qdrant_point_id
             "#,
         )
         .bind(input.tenant_id)
         .bind(input.document_id)
         .bind(idx as i32)
-        .bind(text)
+        .bind(&text.text)
+        // T84D Phase 3.1: persist page_start / page_end (NULL when the
+        // chunker has no page info — page_start==0 signals "no metadata").
+        .bind(if text.page_start > 0 { Some(text.page_start) } else { None })
+        .bind(if text.page_end > 0 { Some(text.page_end) } else { None })
         .fetch_one(&mut *tx)
         .await?;
         let point_id = row_id.0;
@@ -146,6 +152,8 @@ pub async fn dual_write_ingestion(
             "filename": input.filename,
             "owner_id": input.owner_id.to_string(),
             "visibility": input.visibility,
+            "page_start": if text.page_start > 0 { Some(text.page_start) } else { None },
+            "page_end":   if text.page_end   > 0 { Some(text.page_end)   } else { None },
         }))
         .map_err(|e| IngestError::Qdrant(e.to_string()))?;
         chunk_points.push(PointStruct::new(point_id.to_string(), vector.clone(), payload));
@@ -182,6 +190,22 @@ pub async fn dual_write_ingestion(
         label_to_id
             .entry(node.label.clone())
             .or_insert(node_id);
+
+        // T84D Phase 2.1 — record graph provenance: a node is shared across
+        // documents, so this node↔document link is what lets the retrieval
+        // layer ACL-filter nodes by `accessible_document_ids`.
+        sqlx::query(
+            r#"
+            INSERT INTO graph_node_documents (node_id, document_id, tenant_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (node_id, document_id) DO NOTHING
+            "#,
+        )
+        .bind(node_id)
+        .bind(input.document_id)
+        .bind(input.tenant_id)
+        .execute(&mut *tx)
+        .await?;
 
         let payload = Payload::try_from(serde_json::json!({
             "node_id": node_id.to_string(),

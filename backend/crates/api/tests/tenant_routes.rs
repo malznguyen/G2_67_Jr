@@ -6,6 +6,8 @@
 //! through a [`SharedConnection`] built like `rls_middleware` does:
 //! `BEGIN; SET LOCAL ROLE gmrag_app; SET LOCAL app.tenant_id = '<uuid>'`.
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -26,6 +28,36 @@ use gmrag_api::routes::tenant_members::{
 use gmrag_api::routes::tenants::{
     create_tenant, delete_tenant, list_tenants, update_tenant, CreateTenantBody, UpdateTenantBody,
 };
+use gmrag_api::storage::ObjectStore;
+use gmrag_core::config::QdrantConfig;
+use gmrag_core::QdrantStore;
+
+/// T84D Phase 2.2: a no-op ObjectStore so delete_tenant tests don't need
+/// live MinIO. The handler best-effort-logs `delete_prefix` failures and
+/// continues, so returning `Ok(())` here keeps the cascade delete intact.
+struct NoopObjectStore;
+#[async_trait::async_trait]
+impl ObjectStore for NoopObjectStore {
+    async fn put(&self, _key: &str, _data: Vec<u8>, _content_type: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn delete_prefix(&self, _prefix: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+async fn maybe_qdrant() -> Option<QdrantStore> {
+    QdrantStore::new(&QdrantConfig {
+        url: "http://localhost:6334".into(),
+        api_key: None,
+        collection_default: "gmrag_chunks".into(),
+    })
+    .await
+    .ok()
+}
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -261,12 +293,21 @@ async fn owner_can_delete_tenant_with_cascade(pool: PgPool) {
     add_member(&pool, tenant, owner, "owner").await;
 
     let conn = rls_conn(&pool, tenant).await;
+    // T84D Phase 2.2: handler now requires QdrantStore + Arc<dyn ObjectStore>.
+    // Skip when live Qdrant isn't available; otherwise inject a no-op store.
+    let qdrant = match maybe_qdrant().await {
+        Some(s) => s,
+        None => return,
+    };
+    let object_store: Arc<dyn ObjectStore> = Arc::new(NoopObjectStore);
     let (status, _) = parts(
         delete_tenant(
             Path(tenant),
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(qdrant),
+            Extension(object_store),
         )
         .await,
     )
@@ -302,11 +343,21 @@ async fn non_owner_cannot_delete_tenant(pool: PgPool) {
     add_member(&pool, tenant, member, "member").await;
 
     let conn = rls_conn(&pool, tenant).await;
+    // Non-owner path bails on the require_owner guard BEFORE touching Qdrant
+    // or S3, so live Qdrant availability doesn't matter. Still pass stubs
+    // to satisfy the new handler signature.
+    let qdrant = match maybe_qdrant().await {
+        Some(s) => s,
+        None => return,
+    };
+    let object_store: Arc<dyn ObjectStore> = Arc::new(NoopObjectStore);
     let result = delete_tenant(
         Path(tenant),
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(conn),
+        Extension(qdrant),
+        Extension(object_store),
     )
     .await;
     assert!(matches!(result, Err(ApiError::Forbidden(_))));

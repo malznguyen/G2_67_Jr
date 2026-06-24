@@ -26,11 +26,19 @@ struct TenantRow {
     role: String,
 }
 
-/// `GET /users/me` — Return the authenticated user's profile and tenant memberships.
-///
-/// Uses [`AdminPool`] (superuser, bypasses RLS) because this endpoint is
-/// cross-tenant: it lists ALL tenants the user is a member of, not just the
-/// active tenant. `AuthUser` is populated by `auth_middleware`.
+/// Return the authenticated user's profile and tenant memberships.
+#[utoipa::path(
+    get,
+    path = "/users/me",
+    tag = "Users",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "User profile and tenant list", body = crate::openapi::schemas::MeResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "User not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn get_me(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,

@@ -62,7 +62,24 @@ struct TenantLlmConfigRow {
     api_key_nonce: Option<Vec<u8>>,
 }
 
-/// `GET /tenants/{tid}/settings/llm` — read BYOK config with masked API key.
+/// Read tenant LLM / BYOK settings (owner-only, masked API key).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/settings/llm",
+    tag = "Settings",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "LLM settings", body = crate::openapi::schemas::LlmSettingsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn get_llm_settings(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -120,7 +137,25 @@ pub async fn get_llm_settings(
     }))
 }
 
-/// `PUT /tenants/{tid}/settings/llm` — upsert BYOK config with encrypted API key.
+/// Upsert tenant LLM / BYOK settings (owner-only).
+#[utoipa::path(
+    put,
+    path = "/tenants/{tid}/settings/llm",
+    tag = "Settings",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::PutLlmSettingsRequest,
+    responses(
+        (status = 200, description = "Updated LLM settings", body = crate::openapi::schemas::LlmSettingsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn put_llm_settings(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,

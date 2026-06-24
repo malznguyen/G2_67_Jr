@@ -37,6 +37,9 @@ pub struct LlmRuntime {
     pub deepseek: DeepSeekConfig,
     pub ollama: OllamaConfig,
     pub tenant_key_encryption_key: Option<[u8; 32]>,
+    /// T84D Phase 3.3: how many past messages to thread into the LLM
+    /// context per turn (`GMRAG_CHAT_HISTORY_LIMIT`, default 10).
+    pub chat_history_limit: usize,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -68,6 +71,16 @@ struct SessionContext {
     model: Option<String>,
 }
 
+/// T84D Phase 3.2 — one row of `chat_messages` for the history endpoint.
+#[derive(Serialize, sqlx::FromRow)]
+pub struct ChatMessageRow {
+    pub id: Uuid,
+    pub role: String,
+    pub content: String,
+    pub token_count: Option<i32>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 fn sse_from_enriched(ev: &EnrichedChatStreamEvent) -> Event {
     let payload = ChatSsePayload::from(ev);
     Event::default()
@@ -84,7 +97,23 @@ fn sse_error(code: &str, message: impl Into<String>) -> Event {
         .expect("error payload serializes")
 }
 
-/// `GET /tenants/{tid}/chat_sessions` — list sessions visible to the caller (T62).
+/// List chat sessions visible to the caller.
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/chat_sessions",
+    tag = "Chat",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Session list (unpaginated)", body = crate::openapi::schemas::ChatSessionsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_sessions(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -128,7 +157,24 @@ pub async fn list_sessions(
     Ok(Json(serde_json::json!({ "sessions": rows })))
 }
 
-/// `POST /tenants/{tid}/chat_sessions` — create session owned by caller (T62).
+/// Create a chat session owned by the caller.
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/chat_sessions",
+    tag = "Chat",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::CreateChatSessionRequest,
+    responses(
+        (status = 201, description = "Session created", body = crate::openapi::schemas::CreateChatSessionResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn create_session(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -158,7 +204,26 @@ pub async fn create_session(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id.0 }))))
 }
 
-/// `DELETE /tenants/{tid}/chat_sessions/{sid}` — owner-only delete (T62).
+/// Delete a chat session (owner-only).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/chat_sessions/{sid}",
+    tag = "Chat",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("sid" = Uuid, Path, description = "Chat session ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Session deleted"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Session not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn delete_session(
     Path((tid, sid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -203,7 +268,89 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /tenants/{tid}/chat_sessions/{sid}/chat` — RAG chat SSE (T61).
+/// T84D Phase 3.2 — list messages for a chat session (viewer-gated).
+///
+/// Returns `chat_messages` for `sid` ordered by `created_at ASC`. Caller
+/// must hold the `viewer` relation on the chat session (ReBAC T64);
+/// missing or denied → 404 (no existence leak).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/chat_sessions/{sid}/messages",
+    tag = "Chat",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("sid" = Uuid, Path, description = "Chat session ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Messages ordered by created_at ASC",
+            body = crate::openapi::schemas::ChatMessagesResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Session not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
+pub async fn list_messages(
+    Path((tid, sid)): Path<(Uuid, Uuid)>,
+    Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
+    Extension(conn): Extension<SharedConnection>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_path_matches_context(tid, &ctx)?;
+
+    // Viewer-gate (404 on missing-or-denied — no existence leak).
+    {
+        let mut guard = conn.lock().await;
+        authorize_chat_session(&mut guard, sid, auth_user.user_id).await?;
+    }
+
+    let mut guard = conn.lock().await;
+    let rows = sqlx::query_as::<_, ChatMessageRow>(
+        "SELECT id, role, content, token_count, created_at
+         FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY created_at ASC",
+    )
+    .bind(sid)
+    .fetch_all(&mut *guard)
+    .await
+    .map_err(|e| ApiError::Internal(format!("list chat messages: {e}")))?;
+    drop(guard);
+
+    Ok(Json(serde_json::json!({ "messages": rows })))
+}
+
+/// RAG chat over Server-Sent Events (viewer-gated).
+///
+/// Response is `text/event-stream` with JSON `data:` lines matching [`ChatSseEvent`].
+/// In-stream failures use `{ "type": "error", "code": "...", "message": "..." }`
+/// (not the HTTP `{ "error": { ... } }` envelope). Codes include `stream-failed`
+/// and `persist-failed`. Pre-stream validation errors still use the standard HTTP
+/// error JSON. Swagger UI has limited SSE support; use curl or EventSource for
+/// full stream testing.
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/chat_sessions/{sid}/chat",
+    tag = "Chat",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("sid" = Uuid, Path, description = "Chat session ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::PostChatRequest,
+    responses(
+        (status = 200, description = "SSE stream of ChatSseEvent payloads",
+            content_type = "text/event-stream",
+            body = crate::openapi::schemas::ChatSseEvent),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Session not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn post_chat(
     Path((tid, sid)): Path<(Uuid, Uuid)>,
@@ -245,6 +392,7 @@ pub async fn post_chat(
         app_pool,
         &qdrant,
         provider,
+        llm_runtime.chat_history_limit,
     )
     .await
 }
@@ -294,6 +442,44 @@ async fn load_session_for_chat(
     })
 }
 
+/// T84D Phase 3.3 — load the last `limit` chat messages for `sid` (in
+/// chronological order) to thread into the LLM context. Returns
+/// `Vec<ChatMessage>` ready to prepend between system + current user
+/// messages in `stream_rag_response`.
+async fn load_chat_history(
+    conn: &mut sqlx::PgConnection,
+    sid: Uuid,
+    limit: usize,
+) -> Result<Vec<crate::llm::provider::ChatMessage>, ApiError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    // DESC LIMIT then reverse → chronological order, the last `limit`
+    // messages recorded for this session (excluding the turn we just
+    // inserted, which the caller inserts BEFORE invoking this helper).
+    let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        r#"
+        SELECT role, content, created_at
+        FROM chat_messages
+        WHERE session_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(sid)
+    .bind(limit_i64)
+    .fetch_all(conn)
+    .await
+    .map_err(|e| ApiError::Internal(format!("load chat history: {e}")))?;
+    let mut ordered: Vec<_> = rows
+        .into_iter()
+        .map(|(role, content, _)| crate::llm::provider::ChatMessage::new(role, content))
+        .collect();
+    ordered.reverse();
+    Ok(ordered)
+}
+
 /// Core SSE chat implementation.
 #[allow(clippy::too_many_arguments)]
 async fn post_chat_sse(
@@ -305,11 +491,12 @@ async fn post_chat_sse(
     pool: AppPool,
     qdrant: &QdrantStore,
     provider: Arc<dyn LlmProvider>,
+    chat_history_limit: usize,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let sid = session.session_id;
 
     // Phase A — request transaction: history, user message, retrieval.
-    let (chunks, graph) = {
+    let (chunks, graph, history) = {
         let mut guard = conn.lock().await;
 
         sqlx::query(
@@ -332,18 +519,23 @@ async fn post_chat_sse(
             (Vec::new(), GraphContext::default())
         };
 
+        // T84D Phase 3.3: load the session history (now including the user
+        // message we just inserted) and thread it into the LLM context.
+        let history = load_chat_history(&mut guard, sid, chat_history_limit).await?;
+
         sqlx::query("UPDATE chat_sessions SET updated_at = now() WHERE id = $1")
             .bind(sid)
             .execute(&mut *guard)
             .await
             .map_err(|e| ApiError::Internal(format!("touch session: {e}")))?;
 
-        (chunks, graph)
+        (chunks, graph, history)
     };
 
     let query = user_message.clone();
     let chunks_for_stream = chunks.clone();
     let graph_for_stream = graph.clone();
+    let history_for_stream = history.clone();
     let pool_for_post = pool.clone();
     let provider_for_stream = Arc::clone(&provider);
 
@@ -355,6 +547,7 @@ async fn post_chat_sse(
             &chunks_for_stream,
             &graph_for_stream,
             &query,
+            &history_for_stream,
         )
         .await
         {
@@ -552,6 +745,10 @@ async fn post_chat_sse_with_context_inner(
             &chunks_for_stream,
             &graph_for_stream,
             &query,
+            // T84D Phase 3.3: the with-context test helper does NOT load
+            // chat history (its tests inject pre-built retrieval context
+            // directly). Pass an empty slice to preserve prior behaviour.
+            &[],
         )
         .await
         {

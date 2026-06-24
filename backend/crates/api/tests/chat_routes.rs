@@ -106,6 +106,39 @@ async fn insert_chat_session(
     id
 }
 
+async fn insert_workspace(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    created_by: Uuid,
+    name: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workspaces (id, tenant_id, name, slug, created_by) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(format!("ws-{id}"))
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn add_workspace_member(pool: &PgPool, ws_id: Uuid, tenant_id: Uuid, user_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, tenant_id, user_id) VALUES ($1, $2, $3)",
+    )
+    .bind(ws_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn insert_grant(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -213,6 +246,8 @@ fn sample_chunk() -> ChunkHit {
         content: "excerpt".into(),
         filename: Some("doc.pdf".into()),
         score: 1.0,
+        page_start: None,
+        page_end: None,
     }
 }
 
@@ -345,6 +380,64 @@ async fn list_sessions_returns_owned_and_shared(pool: PgPool) {
 
     assert!(ids.contains(&shared));
     assert!(!ids.contains(&owned));
+}
+
+/// C14 regression: a chat_session in a workspace where the caller is a member
+/// (but has no explicit `resource_acl` grant and is not the owner) must be
+/// visible in `list_sessions` via workspace inheritance — mirroring
+/// `check_relation(chat_session, viewer, user)` rewrite
+/// `tuple_to_userset(workspace → member)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_sessions_includes_workspace_member_inheritance(pool: PgPool) {
+    let tenant = insert_tenant(&pool, "list-ws-inheritance").await;
+    let owner = create_user(&pool, "ws-owner@test.com").await;
+    let member = create_user(&pool, "ws-member@test.com").await;
+    add_tenant_member(&pool, tenant, owner, "member").await;
+    add_tenant_member(&pool, tenant, member, "member").await;
+
+    let ws = insert_workspace(&pool, tenant, owner, "Shared WS").await;
+    add_workspace_member(&pool, ws, tenant, owner).await;
+    add_workspace_member(&pool, ws, tenant, member).await;
+
+    // Owner creates a session in the workspace. `member` has no explicit
+    // grant and is not the owner — visibility comes only from workspace
+    // membership inheritance.
+    let ws_session = insert_chat_session(&pool, tenant, owner, Some(ws), "ws session").await;
+
+    // A session with no workspace_id must NOT leak via workspace inheritance.
+    let private_session = insert_chat_session(&pool, tenant, owner, None, "private").await;
+
+    let conn = rls_conn(&pool, tenant).await;
+    let resp = list_sessions(
+        Path(tenant),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(member)),
+        Extension(conn),
+    )
+    .await
+    .unwrap()
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<Uuid> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| Uuid::parse_str(s["id"].as_str().unwrap()).unwrap())
+        .collect();
+
+    assert!(
+        ids.contains(&ws_session),
+        "workspace member must see workspace-scoped session via inheritance"
+    );
+    assert!(
+        !ids.contains(&private_session),
+        "non-owner must not see private session without grant"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

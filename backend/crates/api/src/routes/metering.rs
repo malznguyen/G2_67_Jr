@@ -57,7 +57,24 @@ struct AuditLogRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// `GET /tenants/{tid}/metering/usage` — aggregate usage by metric.
+/// Aggregate usage by metric (owner-only).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/metering/usage",
+    tag = "Metering",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Usage aggregates", body = crate::openapi::schemas::UsageResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn get_usage(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -86,7 +103,24 @@ pub async fn get_usage(
     Ok(Json(serde_json::json!({ "usage": rows })))
 }
 
-/// `GET /tenants/{tid}/quotas` — read tenant quota limits.
+/// Read tenant quota limits (owner-only).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/quotas",
+    tag = "Metering",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Quota limits", body = crate::openapi::schemas::QuotaResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn get_quotas(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -132,7 +166,24 @@ pub async fn get_quotas(
     Ok(Json(response))
 }
 
-/// `GET /tenants/{tid}/audit_logs` — recent audit log entries (newest first).
+/// Recent audit log entries, newest first (max 100, owner-only).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/audit_logs",
+    tag = "Metering",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Audit logs (capped at 100)", body = crate::openapi::schemas::AuditLogsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn get_audit_logs(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,

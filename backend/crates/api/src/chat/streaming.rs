@@ -128,18 +128,26 @@ fn holdback_len(s: &str) -> usize {
     0
 }
 
-/// Stream a RAG answer: system prompt + user query → parsed text/citation events.
+/// Stream a RAG answer: system prompt + chat history + user query → parsed
+/// text/citation events.
+///
+/// T84D Phase 3.3: the `history` slice is prepended between the system
+/// message and the current user message in the `messages` array passed to
+/// the provider, so the model can reason over the prior turns of this
+/// session. Pass `&[]` for the no-history behaviour (preserved by older
+/// callers).
 pub async fn stream_rag_response(
     provider: &dyn LlmProvider,
     chunks: &[ChunkHit],
     graph: &GraphContext,
     user_query: &str,
+    history: &[ChatMessage],
 ) -> Result<ParsedChatStream, StreamingError> {
     let system = assemble_system_prompt(chunks, graph);
-    let messages = [
-        ChatMessage::new("system", system),
-        ChatMessage::new("user", user_query),
-    ];
+    let mut messages = Vec::with_capacity(2 + history.len());
+    messages.push(ChatMessage::new("system", system));
+    messages.extend(history.iter().cloned());
+    messages.push(ChatMessage::new("user", user_query));
     let upstream = provider.chat_stream(&messages).await?;
 
     let stream = async_stream::try_stream! {
@@ -391,6 +399,7 @@ mod tests {
             &[],
             &GraphContext::default(),
             "question?",
+            &[],
         )
         .await
         .expect("stream");
@@ -450,6 +459,7 @@ mod tests {
             &[],
             &GraphContext::default(),
             "hi",
+            &[],
         )
         .await
         .expect("stream");

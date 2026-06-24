@@ -21,7 +21,9 @@ use crate::error::Error;
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_LOG_FILTER: &str = "info,gmrag_core=debug,gmrag_api=debug";
 const DEFAULT_TENANT_HEADER: &str = "X-Tenant-ID";
-const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
+/// Qdrant gRPC port (6334). The rust `qdrant-client` uses gRPC, not the
+/// REST port 6333. Using 6333 causes `FRAME_SIZE_ERROR` at connection time.
+const DEFAULT_QDRANT_URL: &str = "http://localhost:6334";
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_S3_FORCE_PATH_STYLE: bool = true;
 const DEFAULT_REDIS_URL: &str = "redis://localhost:6379/0";
@@ -101,6 +103,24 @@ pub struct Config {
     pub ollama: OllamaConfig,
     pub deepseek: DeepSeekConfig,
     pub tenant_key_encryption_key: Option<[u8; 32]>,
+
+    /// T84D Phase 1.3: feature-flag for the OCR fallback path. Off by
+    /// default so the Docker image never bakes native libpdfium in.
+    pub ocr_enabled: bool,
+
+    /// T84D Phase 1.1: how often the worker relay polls `ingest_outbox`
+    /// (seconds).
+    pub outbox_poll_interval_secs: u64,
+    /// T84D Phase 1.2: how often the worker sweeps stuck ingestion jobs
+    /// (seconds).
+    pub sweep_interval_secs: u64,
+
+    /// T84D Phase 4.1: explicit, testable cap read for `init_pool`.
+    pub database_max_connections: u32,
+
+    /// T84D Phase 3.3: number of past chat messages threaded into the LLM
+    /// context per turn.
+    pub chat_history_limit: usize,
 }
 
 impl Config {
@@ -178,6 +198,15 @@ impl Config {
 
         let tenant_key_encryption_key = optional_base64_32_env("GMRAG_TENANT_KEY_ENCRYPTION_KEY")?;
 
+        // T84D Phase 1.3 / 1.1 / 1.2 / 3.3 / 4.1: numeric + flag env vars.
+        let ocr_enabled = parse_bool_env("GMRAG_OCR_ENABLED", false);
+        let outbox_poll_interval_secs =
+            parse_usize_env("GMRAG_OUTBOX_POLL_INTERVAL_SECS", 3).max(1) as u64;
+        let sweep_interval_secs =
+            parse_usize_env("GMRAG_SWEEP_INTERVAL_SECS", 60).max(1) as u64;
+        let database_max_connections = parse_usize_env("DATABASE_MAX_CONNECTIONS", 10) as u32;
+        let chat_history_limit = parse_usize_env("GMRAG_CHAT_HISTORY_LIMIT", 10);
+
         Ok(Self {
             database_url,
             http_bind,
@@ -191,6 +220,11 @@ impl Config {
             ollama,
             deepseek,
             tenant_key_encryption_key,
+            ocr_enabled,
+            outbox_poll_interval_secs,
+            sweep_interval_secs,
+            database_max_connections,
+            chat_history_limit,
         })
     }
 
@@ -209,6 +243,23 @@ fn require_env(key: &'static str) -> Result<String, Error> {
 
 fn optional_env(key: &str, default: &str) -> String {
     env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+/// Parse a boolean env var: "true"/"1" (case-insensitive) → true, else default.
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    match env::var(key).ok().filter(|v| !v.trim().is_empty()) {
+        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"),
+        None => default,
+    }
+}
+
+/// Parse an unsigned env var with a fallback default. Empty/invalid → default.
+fn parse_usize_env(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn optional_base64_32_env(key: &'static str) -> Result<Option<[u8; 32]>, Error> {
@@ -268,6 +319,11 @@ mod tests {
             "DEEPSEEK_MODEL",
             "DEEPSEEK_TIMEOUT_S",
             "GMRAG_TENANT_KEY_ENCRYPTION_KEY",
+            "GMRAG_OCR_ENABLED",
+            "GMRAG_OUTBOX_POLL_INTERVAL_SECS",
+            "GMRAG_SWEEP_INTERVAL_SECS",
+            "DATABASE_MAX_CONNECTIONS",
+            "GMRAG_CHAT_HISTORY_LIMIT",
         ];
         for k in keys {
             env::remove_var(k);
@@ -306,11 +362,36 @@ mod tests {
         assert_eq!(cfg.tenant_header, "X-Tenant-ID");
         assert_eq!(cfg.oidc.issuer, "http://kc:8080/realms/test");
         assert_eq!(cfg.qdrant.url, DEFAULT_QDRANT_URL);
+        assert!(
+            DEFAULT_QDRANT_URL.ends_with(":6334"),
+            "Qdrant default URL must use gRPC port 6334, got {DEFAULT_QDRANT_URL}"
+        );
         assert_eq!(cfg.s3.region, DEFAULT_S3_REGION);
         assert_eq!(cfg.redis.url, DEFAULT_REDIS_URL);
         assert_eq!(cfg.ollama.host, DEFAULT_OLLAMA_HOST);
         assert!(cfg.deepseek.api_key.is_none());
         assert!(cfg.tenant_key_encryption_key.is_none());
+
+        // T84D defaults: OCR off, sane relay/sweep intervals, pool cap 10,
+        // chat history 10.
+        assert!(!cfg.ocr_enabled);
+        assert_eq!(cfg.outbox_poll_interval_secs, 3);
+        assert_eq!(cfg.sweep_interval_secs, 60);
+        assert_eq!(cfg.database_max_connections, 10);
+        assert_eq!(cfg.chat_history_limit, 10);
+
+        // T84D overrides are honoured.
+        env::set_var("GMRAG_OCR_ENABLED", "true");
+        env::set_var("GMRAG_OUTBOX_POLL_INTERVAL_SECS", "7");
+        env::set_var("GMRAG_SWEEP_INTERVAL_SECS", "120");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "25");
+        env::set_var("GMRAG_CHAT_HISTORY_LIMIT", "20");
+        let cfg = Config::from_process_env().expect("config should parse");
+        assert!(cfg.ocr_enabled);
+        assert_eq!(cfg.outbox_poll_interval_secs, 7);
+        assert_eq!(cfg.sweep_interval_secs, 120);
+        assert_eq!(cfg.database_max_connections, 25);
+        assert_eq!(cfg.chat_history_limit, 20);
 
         // Case 3: empty DATABASE_URL also fails.
         env::set_var("DATABASE_URL", "   ");

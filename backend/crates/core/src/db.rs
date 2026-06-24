@@ -23,12 +23,13 @@ use crate::error::{Error, Result};
 /// downgrades every connection to the `gmrag_app` role so PostgreSQL RLS
 /// policies are enforced.
 ///
-/// `max_connections` defaults to 10 — sufficient for skeleton phase. Worker
-/// processes that want a different ceiling should override via
-/// `PgPoolOptions::max_connections` directly (added in later tasks).
+/// `max_connections` is read from the `DATABASE_MAX_CONNECTIONS` process env
+/// (default 10). Reading the env internally keeps the call signature stable
+/// so existing call sites (`init_pool(&cfg.database_url)`) need no churn.
 pub async fn init_pool(database_url: &str) -> Result<PgPool> {
+    let max_connections = env_max_connections();
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Some(Duration::from_secs(300)))
@@ -53,8 +54,9 @@ pub async fn init_pool(database_url: &str) -> Result<PgPool> {
 /// `SET LOCAL app.tenant_id = '<uuid>'`) by the RLS middleware for
 /// `gmrag_current_tenant()` to return the active tenant.
 pub async fn init_app_pool(database_url: &str) -> Result<PgPool> {
+    let max_connections = env_max_connections();
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Some(Duration::from_secs(300)))
@@ -71,6 +73,16 @@ pub async fn init_app_pool(database_url: &str) -> Result<PgPool> {
     // Liveness check on the downgraded role.
     sqlx::query("SELECT 1").execute(&pool).await?;
     Ok(pool)
+}
+
+/// Read `DATABASE_MAX_CONNECTIONS` from the process env (default 10).
+/// Used internally by `init_pool` / `init_app_pool`.
+fn env_max_connections() -> u32 {
+    std::env::var("DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10)
 }
 
 /// Type alias re-exported so consumers don't have to depend on `sqlx` directly.

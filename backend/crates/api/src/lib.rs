@@ -6,6 +6,7 @@ pub mod error;
 pub mod llm;
 pub mod metering;
 pub mod middleware;
+pub mod openapi;
 pub mod pool;
 pub mod queue;
 pub mod rbac;
@@ -88,6 +89,7 @@ pub async fn run() -> anyhow::Result<()> {
         deepseek: cfg.deepseek.clone(),
         ollama: cfg.ollama.clone(),
         tenant_key_encryption_key: cfg.tenant_key_encryption_key,
+        chat_history_limit: cfg.chat_history_limit,
     };
 
     let jwt_validator = JwtValidator::new(cfg.oidc.issuer.clone(), cfg.oidc.client_id.clone());
@@ -96,7 +98,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     let public: Router<AppState> = Router::new()
         .route("/health", get(health))
-        .route("/healthz", get(healthz));
+        .route("/healthz", get(healthz))
+        .merge(openapi::swagger_router());
 
     let authed: Router<AppState> = Router::new()
         .route("/users/me", get(routes::users::get_me))
@@ -164,6 +167,10 @@ pub async fn run() -> anyhow::Result<()> {
             delete(routes::chat::delete_session),
         )
         .route(
+            "/tenants/:tid/chat_sessions/:sid/messages",
+            get(routes::chat::list_messages),
+        )
+        .route(
             "/tenants/:tid/chat_sessions/:sid/chat",
             post(routes::chat::post_chat),
         )
@@ -202,9 +209,11 @@ pub async fn run() -> anyhow::Result<()> {
         .layer(Extension(llm_runtime))
         .layer(Extension(auth_state.clone()));
 
-    let app = merged.with_state(AppState {
-        started_at: chrono::Utc::now(),
-    });
+    let app = merged
+        .layer(middleware::cors::layer_from_env())
+        .with_state(AppState {
+            started_at: chrono::Utc::now(),
+        });
 
     let listener = tokio::net::TcpListener::bind(cfg.http_bind)
         .await
@@ -219,6 +228,15 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Liveness probe — process is up.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Service is running", body = crate::openapi::schemas::HealthResponse),
+    )
+)]
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let body = json!({
         "status": "ok",
@@ -228,6 +246,16 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, axum::Json(body))
 }
 
+/// Readiness probe — database connectivity check.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Database reachable", body = crate::openapi::schemas::HealthzResponse),
+        (status = 503, description = "Database unreachable", body = crate::openapi::schemas::HealthzResponse),
+    )
+)]
 async fn healthz(Extension(AdminPool(pool)): Extension<AdminPool>) -> impl IntoResponse {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&pool)

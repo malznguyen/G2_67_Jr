@@ -272,6 +272,168 @@ pub async fn parse_pdf_with_ocr(
     })
 }
 
+// =========================================================
+// T84D Phase 1.3 — Page-aware ingest dispatcher + feature-
+// gated PdfiumRenderer.
+// =========================================================
+
+/// Per-page extracted text (1-based `page_number`). Returned by
+/// [`parse_pdf_for_ingest`]; consumed by the chunking pipeline (Phase 3
+/// maps each chunk's char range back to these page numbers to compute
+/// `page_start` / `page_end`).
+#[derive(Debug, Clone)]
+pub struct PageText {
+    pub page_number: u32,
+    pub text: String,
+}
+
+/// Feature-flagged native renderer backed by `pdfium-render` + libpdfium.
+/// Compiled only when the `ocr-pdfium` Cargo feature is on; the feature is
+/// OFF by default so the Docker build never bakes libpdfium in.
+#[cfg(feature = "ocr-pdfium")]
+pub struct PdfiumRenderer {
+    #[allow(dead_code)]
+    private: (),
+}
+
+#[cfg(feature = "ocr-pdfium")]
+impl PdfiumRenderer {
+    pub fn new() -> Self {
+        Self { private: () }
+    }
+}
+
+#[cfg(feature = "ocr-pdfium")]
+impl PageRenderer for PdfiumRenderer {
+    fn render_page_to_png(
+        &self,
+        _data: &[u8],
+        _page_number: u32,
+    ) -> Result<Vec<u8>, RenderError> {
+        // The pdfium-render bindings require unsafe FFI + a bundled
+        // libpdfium at link time. T84D intentionally leaves the wiring
+        // off-by-default (the feature is gated); operators who build the
+        // native image flip the feature on AND land the real impl here.
+        Err(RenderError::Render(
+            "PdfiumRenderer::render_page_to_png not implemented on this build".into(),
+        ))
+    }
+}
+
+/// Page-aware extraction entry point — replaces the legacy
+/// `parse_pdf(...)` + `vec![parsed.text]` pair in `process_job`.
+///
+/// Behaviour:
+/// - Always extract per-page text via `extract_pages_blocking` (the
+///   shared lopdf + pdf_extract path the OCR fallback already uses).
+/// - If OCR is requested (`ocr_enabled = true`) AND the `ocr-pdfium`
+///   Cargo feature is on → use the OCR fallback to rasterize/OCR
+///   scanned pages (Phase 1 stubs the renderer because the feature is
+///   off by default; Phase 1 just ensures the dispatcher reaches the
+///   OCR branch under the feature flag).
+/// - Otherwise → join per-page text, set [`ExtractionMethod::PdfExtract`]
+///   when text was produced, else [`ExtractionMethod::Fallback`].
+///
+/// Returns `(Vec<PageText>, ExtractionMethod)` — the chunking layer in
+/// Phase 3 maps each chunk back to page numbers.
+pub async fn parse_pdf_for_ingest(
+    data: Vec<u8>,
+    timeout_secs: u64,
+    ocr_enabled: bool,
+    ocr: Option<&dyn crate::ocr::OcrClient>,
+) -> anyhow::Result<(Vec<PageText>, ExtractionMethod)> {
+    #[cfg(feature = "ocr-pdfium")]
+    let use_ocr = ocr_enabled;
+    #[cfg(not(feature = "ocr-pdfium"))]
+    {
+        // Suppress unused-variable lint when the feature is off.
+        let _ = ocr_enabled;
+        let _ = ocr;
+    }
+    #[cfg(not(feature = "ocr-pdfium"))]
+    let use_ocr = false;
+
+    let parse_result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tokio::task::spawn_blocking(move || extract_pages_blocking(&data)),
+    )
+    .await;
+
+    let pages = match parse_result {
+        Ok(Ok(Ok(pages))) => pages,
+        Ok(Ok(Err(e))) => return Err(anyhow::Error::new(e)),
+        Ok(Err(je)) => return Err(anyhow::anyhow!("PDF parse thread error: {je}")),
+        Err(_) => return Err(anyhow::Error::new(PdfParseError::Timeout(timeout_secs))),
+    };
+
+    let page_count = pages.len();
+
+    if use_ocr {
+        let ocr = ocr.ok_or_else(|| {
+            anyhow::anyhow!("ocr_enabled=true but no OcrClient supplied to parse_pdf_for_ingest")
+        })?;
+        let _data_for_render: &[u8] = &[];
+        #[cfg(feature = "ocr-pdfium")]
+        let renderer = PdfiumRenderer::new();
+        let mut out = Vec::with_capacity(page_count);
+        let mut pages_iter = pages.into_iter();
+        let mut used_ocr = false;
+        while let Some(page) = pages_iter.next() {
+            #[allow(unused_mut)]
+            let mut text = page.text;
+            if page.needs_ocr {
+                #[cfg(feature = "ocr-pdfium")]
+                {
+                    let image_bytes = renderer
+                        .render_page_to_png(_data_for_render, page.page_number)
+                        .map_err(|e| anyhow::anyhow!("render error: {e}"))?;
+                    let ocr_text = ocr
+                        .ocr_image(&image_bytes)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("ocr error: {e}"))?;
+                    if !text.trim().is_empty() && !ocr_text.trim().is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&ocr_text);
+                    used_ocr = true;
+                }
+                #[cfg(not(feature = "ocr-pdfium"))]
+                {
+                    let _ = ocr;
+                    let _ = &mut used_ocr;
+                }
+            }
+            out.push(PageText {
+                page_number: page.page_number,
+                text,
+            });
+        }
+        let method = if used_ocr {
+            ExtractionMethod::Ocr
+        } else if out.iter().any(|p| !p.text.trim().is_empty()) {
+            ExtractionMethod::PdfExtract
+        } else {
+            ExtractionMethod::Fallback
+        };
+        return Ok((out, method));
+    }
+
+    let any_text = pages.iter().any(|p| !p.text.trim().is_empty());
+    let method = if any_text {
+        ExtractionMethod::PdfExtract
+    } else {
+        ExtractionMethod::Fallback
+    };
+    let out = pages
+        .into_iter()
+        .map(|p| PageText {
+            page_number: p.page_number,
+            text: p.text,
+        })
+        .collect();
+    Ok((out, method))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

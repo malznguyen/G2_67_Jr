@@ -39,7 +39,24 @@ pub struct AddMemberBody {
     pub role: Option<String>,
 }
 
-/// `GET /tenants/{tid}/workspaces/{wid}/members` — list members of a workspace.
+/// List members of a workspace.
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/workspaces/{wid}/members",
+    tag = "WorkspaceMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("wid" = Uuid, Path, description = "Workspace ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Member list", body = crate::openapi::schemas::WorkspaceMembersResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_members(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -64,10 +81,25 @@ pub async fn list_members(
     Ok(Json(serde_json::json!({ "members": rows })))
 }
 
-/// `POST /tenants/{tid}/workspaces/{wid}/members` — add a member to a workspace.
-///
-/// `tenant_id` is denormalized on `workspace_members`; binding it to the
-/// resolved tenant satisfies the RLS `USING`/`WITH CHECK` predicate.
+/// Add a member to a workspace.
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/workspaces/{wid}/members",
+    tag = "WorkspaceMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("wid" = Uuid, Path, description = "Workspace ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::AddWorkspaceMemberRequest,
+    responses(
+        (status = 201, description = "Member added", body = crate::openapi::schemas::AddWorkspaceMemberResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn add_member(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -109,7 +141,26 @@ pub async fn add_member(
     ))
 }
 
-/// `DELETE /tenants/{tid}/workspaces/{wid}/members/{user_id}` — remove a member.
+/// Remove a member from a workspace.
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/workspaces/{wid}/members/{user_id}",
+    tag = "WorkspaceMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("wid" = Uuid, Path, description = "Workspace ID"),
+        ("user_id" = Uuid, Path, description = "Member user ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Member removed"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Member not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn remove_member(
     Path((tid, wid, target_user_id)): Path<(Uuid, Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,

@@ -64,8 +64,27 @@ export function AclShareDialog({
   }, [client, resourceType, resourceId]);
 
   useEffect(() => {
-    if (open) void refresh();
-  }, [open, refresh]);
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await client.list(resourceType, resourceId);
+        if (!cancelled) {
+          setGrants(result);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "Failed to load shares");
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, client, resourceType, resourceId]);
 
   async function handleAdd(event: React.FormEvent) {
     event.preventDefault();

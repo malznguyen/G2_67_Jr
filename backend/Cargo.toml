@@ -18,7 +18,7 @@ publish = false
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = { version = "1", features = ["full"] }
 
 # Database
@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+
+# OpenAPI / Swagger UI (T84A)
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # Vector DB — pinned to 1.12.1 to match the running Qdrant server v1.12.4
 # (1.12.4 client does not exist on crates.io; 1.12.1 is the closest

@@ -117,6 +117,14 @@ async fn job_status(pool: &PgPool, job_id: Uuid) -> (String, i32, Option<String>
     row
 }
 
+async fn doc_status(pool: &PgPool, doc_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM documents WHERE id = $1")
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn retry_succeeds_on_second_attempt(pool: PgPool) {
     let (_tenant, job) = seed_job(&pool).await;
@@ -136,6 +144,9 @@ async fn retry_succeeds_on_second_attempt(pool: PgPool) {
     assert_eq!(status, "completed");
     assert_eq!(attempts, 1, "one failed attempt recorded before success");
     assert!(last_error.is_none(), "completed job clears last_error");
+
+    let doc_st = doc_status(&pool, job.document_id).await;
+    assert_eq!(doc_st, "indexed", "document status must be 'indexed' on success");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -159,6 +170,9 @@ async fn retry_marks_failed_after_three_attempts(pool: PgPool) {
         Some("permanent failure"),
         "last_error must be the final error message"
     );
+
+    let doc_st = doc_status(&pool, job.document_id).await;
+    assert_eq!(doc_st, "failed", "document status must be 'failed' after max retries");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -178,4 +192,10 @@ async fn retry_first_attempt_success_marks_completed_immediately(pool: PgPool) {
     assert_eq!(status, "completed");
     assert_eq!(attempts, 0, "no failures on first-try success");
     assert!(last_error.is_none());
+
+    let doc_st = doc_status(&pool, job.document_id).await;
+    assert_eq!(
+        doc_st, "indexed",
+        "document status must be 'indexed' on first-try success"
+    );
 }

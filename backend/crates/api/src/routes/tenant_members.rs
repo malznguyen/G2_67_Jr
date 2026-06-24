@@ -49,7 +49,23 @@ struct InvitationRow {
     status: String,
 }
 
-/// `GET /tenants/{tid}/members` — list members of the current tenant.
+/// List members of the current tenant.
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/members",
+    tag = "TenantMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Member list", body = crate::openapi::schemas::TenantMembersResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_members(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -72,11 +88,25 @@ pub async fn list_members(
     Ok(Json(serde_json::json!({ "members": rows })))
 }
 
-/// `POST /tenants/{tid}/members` — invite a user to the tenant by email.
-///
-/// Owner-only. Creates a pending `invitations` row. RLS `WITH CHECK
-/// (tenant_id = gmrag_current_tenant())` is satisfied because `tid` equals the
-/// resolved tenant context.
+/// Invite a user to the tenant by email (owner-only).
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/members",
+    tag = "TenantMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::InviteMemberRequest,
+    responses(
+        (status = 201, description = "Invitation created", body = crate::openapi::schemas::InviteMemberResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn invite_member(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -127,10 +157,26 @@ pub async fn invite_member(
     ))
 }
 
-/// `DELETE /tenants/{tid}/members/{user_id}` — remove a member (owner-only).
-///
-/// Refuses to remove the tenant's last remaining `owner` so the tenant can
-/// never become ownerless.
+/// Remove a tenant member (owner-only).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/members/{user_id}",
+    tag = "TenantMembers",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("user_id" = Uuid, Path, description = "Member user ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Member removed"),
+        (status = 400, description = "Cannot remove last owner", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Member not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn remove_member(
     Path((tid, target_user_id)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,

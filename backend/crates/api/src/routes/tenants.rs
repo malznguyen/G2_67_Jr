@@ -9,6 +9,8 @@
 //!   chain and execute on the per-request [`SharedConnection`] so RLS is
 //!   enforced.
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -21,6 +23,8 @@ use crate::auth::tenant::TenantContext;
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::pool::AdminPool;
+use crate::storage::ObjectStore;
+use gmrag_core::QdrantStore;
 
 /// Role assigned to the user who creates a tenant.
 const ROLE_OWNER: &str = "owner";
@@ -43,10 +47,18 @@ pub struct UpdateTenantBody {
     pub name: String,
 }
 
-/// `GET /tenants` — list every tenant the authenticated user belongs to.
-///
-/// Cross-tenant: uses [`AdminPool`] (bypasses RLS) because the listing spans
-/// all of the user's memberships, not a single active tenant.
+/// List every tenant the authenticated user belongs to.
+#[utoipa::path(
+    get,
+    path = "/tenants",
+    tag = "Tenants",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Tenant list", body = crate::openapi::schemas::TenantsResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_tenants(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,
@@ -66,11 +78,20 @@ pub async fn list_tenants(
     Ok(Json(serde_json::json!({ "tenants": rows })))
 }
 
-/// `POST /tenants` — create a tenant and make the creator its `owner`.
-///
-/// Cross-tenant: uses [`AdminPool`]. The `tenants` table has `FORCE` RLS with
-/// `WITH CHECK (id = gmrag_current_tenant())`, so the insert can only succeed
-/// on a connection that bypasses RLS (no tenant context exists yet).
+/// Create a tenant; caller becomes `owner`.
+#[utoipa::path(
+    post,
+    path = "/tenants",
+    tag = "Tenants",
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::CreateTenantRequest,
+    responses(
+        (status = 201, description = "Tenant created", body = crate::openapi::schemas::CreateTenantResponse),
+        (status = 400, description = "Invalid name", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn create_tenant(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,
@@ -114,7 +135,26 @@ pub async fn create_tenant(
     ))
 }
 
-/// `PATCH /tenants/{tid}` — rename a tenant (owner-only).
+/// Rename a tenant (owner-only).
+#[utoipa::path(
+    patch,
+    path = "/tenants/{tid}",
+    tag = "Tenants",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body = crate::openapi::schemas::UpdateTenantRequest,
+    responses(
+        (status = 200, description = "Tenant updated", body = crate::openapi::schemas::UpdateTenantResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Tenant not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn update_tenant(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -147,19 +187,49 @@ pub async fn update_tenant(
     Ok(Json(serde_json::json!({ "id": tid, "name": name })))
 }
 
-/// `DELETE /tenants/{tid}` — delete a tenant and cascade its data (owner-only).
-///
-/// `ON DELETE CASCADE` on the child FKs removes members, workspaces, documents,
-/// etc. Referential cascades are performed by the system and are not subject to
-/// RLS policies.
+/// Delete a tenant and cascade its data (owner-only).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}",
+    tag = "Tenants",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Tenant deleted"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Tenant not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn delete_tenant(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(qdrant): Extension<QdrantStore>,
+    Extension(object_store): Extension<Arc<dyn ObjectStore>>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
     require_owner(&conn, auth_user.user_id).await?;
+
+    // T84D Phase 2.2 (SEC-4): teardown the tenant's external state BEFORE
+    // the cascade SQL delete — the Qdrant collections + the S3 object
+    // prefix `{tid}/`. Both are best-effort, warn-logged on failure, and
+    // never block the cascade delete: leaving orphan rows because cleanup
+    // succeeded is fine; leaving a tenant alive because cleanup failed is
+    // worse.
+    if let Err(e) = qdrant.teardown_tenant_collections(tid).await {
+        tracing::warn!(error = %e, tenant_id = %tid, "qdrant teardown failed during tenant delete");
+    }
+    let prefix = format!("{tid}/");
+    if let Err(e) = object_store.delete_prefix(&prefix).await {
+        tracing::warn!(error = %e, prefix = %prefix, "s3 prefix delete failed during tenant delete");
+    }
 
     let mut guard = conn.lock().await;
     let deleted = sqlx::query("DELETE FROM tenants WHERE id = $1")

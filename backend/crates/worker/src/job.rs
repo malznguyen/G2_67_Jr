@@ -8,12 +8,12 @@
 use std::time::Duration;
 
 use gmrag_core::config::{DeepSeekConfig, OllamaConfig};
-use gmrag_core::{QdrantStore, init_app_pool};
+use gmrag_core::{QdrantStore, init_app_pool, init_pool};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::qdrant_writer::{DualWriteInput, dual_write_ingestion};
-use crate::{S3Client, chunk_page_texts, parse_pdf, select_embedder, select_graph_extractor};
+use crate::{S3Client, chunk_page_texts_with_pages, parse_pdf_for_ingest, select_embedder, select_graph_extractor};
 
 /// Maximum number of attempts before a job is marked `failed`.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -45,13 +45,27 @@ pub struct IngestJob {
 /// Dependencies needed to run one ingestion job end-to-end.
 ///
 /// Built once in `run()` and reused for every polled job.
+///
+/// T84D Phase 1.1/1.2: also exposes an `admin_pool` (role-unscoped,
+/// bypasses RLS) used by the relay + sweeper background tasks. Business
+/// code in `process_job` never touches `admin_pool`; per-job queries go
+/// through `pool` (`gmrag_app` role, RLS-scoped per tx).
 pub struct IngestContext {
     pub pool: PgPool,
+    /// Admin pool (bypasses RLS). Used ONLY by the outbox relay and the
+    /// job recovery sweeper — both are cross-tenant platform maintenance
+    /// ops, the explicit sanctioned exception to the "worker uses
+    /// app_pool" invariant (see plan §1.2).
+    pub admin_pool: PgPool,
     pub qdrant: QdrantStore,
     pub s3: S3Client,
     pub ollama: OllamaConfig,
     pub deepseek: DeepSeekConfig,
     pub enc_key: Option<[u8; 32]>,
+    /// T84D Phase 1.3: OCR feature flag (`GMRAG_OCR_ENABLED`). Oxygen on
+    /// the OCR pipeline; the `ocr-pdfium` Cargo feature still gates the
+    /// native renderer.
+    pub ocr_enabled: bool,
 }
 
 impl IngestContext {
@@ -61,17 +75,22 @@ impl IngestContext {
         let pool = init_app_pool(&cfg.database_url)
             .await
             .map_err(|e| anyhow::anyhow!("init_app_pool failed: {e}"))?;
+        let admin_pool = init_pool(&cfg.database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("init_pool (admin) failed: {e}"))?;
         let qdrant = QdrantStore::new(&cfg.qdrant)
             .await
             .map_err(|e| anyhow::anyhow!("QdrantStore::new failed: {e}"))?;
         let s3 = S3Client::new(&cfg.s3);
         Ok(Self {
             pool,
+            admin_pool,
             qdrant,
             s3,
             ollama: cfg.ollama.clone(),
             deepseek: cfg.deepseek.clone(),
             enc_key: cfg.tenant_key_encryption_key,
+            ocr_enabled: cfg.ocr_enabled,
         })
     }
 }
@@ -107,24 +126,52 @@ impl IngestContext {
             .await
             .map_err(|e| format!("s3 download: {e}"))?;
 
-        // 2. Parse PDF (text path; OCR fallback wiring lands with
-        //    PdfiumRenderer — see T37 blocker).
-        let parsed = parse_pdf(bytes, PDF_PARSE_TIMEOUT_SECS)
-            .await
-            .map_err(|e| format!("pdf parse: {e}"))?;
-        let full_text = parsed.text.clone();
-        let page_texts = vec![parsed.text];
+        // 2. Parse PDF per-page (text path by default; OCR falls in via
+        //    GMRAG_OCR_ENABLED + the `ocr-pdfium` Cargo feature — Phase 1.3).
+        //    When OCR is requested we hand the dispatcher an Ollama vision
+        //    client built from the context's Ollama config.
+        let ocr_client: Option<crate::ocr::OllamaVisionOcr> =
+            if self.ocr_enabled {
+                Some(crate::ocr::OllamaVisionOcr::new(&self.ollama))
+            } else {
+                None
+            };
+        let ocr_ref = ocr_client.as_ref().map(|c| c as &dyn crate::ocr::OcrClient);
+        let (page_texts, _method) = parse_pdf_for_ingest(
+            bytes,
+            PDF_PARSE_TIMEOUT_SECS,
+            self.ocr_enabled,
+            ocr_ref,
+        )
+        .await
+        .map_err(|e| format!("pdf parse: {e}"))?;
 
-        // 3. Chunk.
-        let chunks = chunk_page_texts(&page_texts)
+        let full_text = page_texts
+            .iter()
+            .map(|p| p.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // T84D Phase 3.1: per-page strings typed as `Vec<String>` for the
+        // page-aware chunker. The chunker maps each chunk's byte range back
+        // to page numbers and emits `Chunk { text, page_start, page_end }`.
+        let chunk_inputs: Vec<String> = page_texts
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+
+        // 3. Chunk (page-aware — feeds Phase 3 page metadata).
+        let chunks = chunk_page_texts_with_pages(&chunk_inputs)
             .map_err(|e| format!("chunking: {e}"))?;
 
         // 4. Embed chunks (per-tenant BYOK or Ollama).
         let embedder = select_embedder(&self.pool, job.tenant_id, &self.ollama, self.enc_key.as_ref())
             .await
             .map_err(|e| format!("select_embedder: {e}"))?;
+        let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let chunk_vectors = embedder
-            .embed_batch(&chunks)
+            .embed_batch(&chunk_texts)
             .await
             .map_err(|e| format!("embed chunks: {e}"))?;
 
@@ -182,9 +229,10 @@ impl IngestContext {
 /// Run a job with up to [`MAX_ATTEMPTS`] attempts, in-memory exponential
 /// backoff, and `ingest_jobs` status tracking.
 ///
-/// - On success: `status='completed'`.
+/// - On success: `ingest_jobs.status='completed'`, `documents.status='indexed'`.
 /// - On each failure: `attempts++`, `last_error` recorded, backoff sleep.
-/// - After exhausting attempts: `status='failed'`.
+/// - After exhausting attempts: `ingest_jobs.status='failed'`,
+///   `documents.status='failed'`.
 ///
 /// Returns `Ok(())` once the job is either completed or marked failed
 /// (so the poll loop never crashes the worker). Returns `Err` only if the
@@ -196,6 +244,7 @@ pub async fn process_job_with_retry(
 ) -> anyhow::Result<()> {
     update_job_status(pool, job.tenant_id, job.id, "processing", job.attempts as i32, None)
         .await?;
+    update_document_status(pool, job.tenant_id, job.document_id, "processing").await?;
 
     let mut last_error = String::new();
     for attempt in 0..MAX_ATTEMPTS {
@@ -203,6 +252,7 @@ pub async fn process_job_with_retry(
             Ok(()) => {
                 update_job_status(pool, job.tenant_id, job.id, "completed", attempt as i32, None)
                     .await?;
+                update_document_status(pool, job.tenant_id, job.document_id, "indexed").await?;
                 tracing::info!(job_id = %job.id, attempt, "job completed");
                 return Ok(());
             }
@@ -237,6 +287,7 @@ pub async fn process_job_with_retry(
         Some(&last_error),
     )
     .await?;
+    update_document_status(pool, job.tenant_id, job.document_id, "failed").await?;
     tracing::error!(job_id = %job.id, error = %last_error, "job marked failed after max attempts");
     Ok(())
 }
@@ -261,7 +312,11 @@ async fn update_job_status(
     sqlx::query(
         r#"
         UPDATE ingest_jobs
-        SET status = $1, attempts = $2, last_error = $3, updated_at = now()
+        SET status = $1,
+            attempts = $2,
+            last_error = $3,
+            updated_at = now(),
+            claimed_at = CASE WHEN $1 = 'processing' THEN now() ELSE claimed_at END
         WHERE id = $4
         "#,
     )
@@ -272,6 +327,40 @@ async fn update_job_status(
     .execute(&mut *tx)
     .await
     .map_err(|e| anyhow::anyhow!("UPDATE ingest_jobs: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("commit: {e}"))?;
+    Ok(())
+}
+
+/// Update `documents.status` inside an RLS-scoped tx (C7 lifecycle:
+/// `uploaded` → `processing` → `indexed` / `failed`).
+async fn update_document_status(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    document_id: Uuid,
+    status: &str,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::Executor::execute(&mut *tx, "SET LOCAL ROLE gmrag_app")
+        .await
+        .map_err(|e| anyhow::anyhow!("SET ROLE: {e}"))?;
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{tenant_id}'"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("SET tenant: {e}"))?;
+    sqlx::query(
+        r#"
+        UPDATE documents
+        SET status = $1, updated_at = now()
+        WHERE id = $2
+        "#,
+    )
+    .bind(status)
+    .bind(document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| anyhow::anyhow!("UPDATE documents: {e}"))?;
     tx.commit()
         .await
         .map_err(|e| anyhow::anyhow!("commit: {e}"))?;

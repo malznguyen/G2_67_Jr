@@ -82,11 +82,24 @@ pub struct DocListParams {
     pub workspace_id: Option<Uuid>,
 }
 
-/// `GET /tenants/{tid}/documents` — list documents visible to the caller.
-///
-/// RLS already restricts rows to the current tenant; the `WHERE` clause then
-/// applies the visibility + ACL predicate. `$2` (the optional `workspace_id`)
-/// is cast to `uuid` so the `IS NULL` short-circuit works when omitted.
+/// List documents visible to the caller.
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/documents",
+    tag = "Documents",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("workspace_id" = Option<Uuid>, Query, description = "Optional workspace filter"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Document list (unpaginated)", body = crate::openapi::schemas::DocumentsResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn list_documents(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -134,21 +147,29 @@ pub async fn list_documents(
     Ok(Json(serde_json::json!({ "documents": rows })))
 }
 
-/// `POST /tenants/{tid}/documents` — upload a document (T58).
-///
-/// All-or-nothing across S3 + Postgres + Redis. Because `rls_middleware`
-/// owns the request transaction and COMMITs it unconditionally after the
-/// handler returns (even on error), atomicity is achieved at the handler
-/// level: S3 is written first, the DB inserts run inside a `SAVEPOINT`, and
-/// on any post-upload failure we `ROLLBACK TO SAVEPOINT` (undoing both
-/// inserts within the outer tx) and delete the S3 object before returning an
-/// error.
-///
-/// Multipart form fields:
-/// - `file`        — the document bytes (required; filename + content-type read)
-/// - `visibility`  — `shared` | `private` (required, Serde-validated)
-/// - `workspace_id`— owning workspace UUID (required; the worker job needs it)
-/// - `title`       — optional display title (defaults to the filename)
+/// Upload a document (multipart form).
+#[utoipa::path(
+    post,
+    path = "/tenants/{tid}/documents",
+    tag = "Documents",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    request_body(
+        content = crate::openapi::schemas::UploadDocumentForm,
+        content_type = "multipart/form-data",
+        description = "Fields: file (binary), visibility (shared|private), workspace_id, optional title"
+    ),
+    responses(
+        (status = 201, description = "Document uploaded", body = crate::openapi::schemas::CreateDocumentResponse),
+        (status = 400, description = "Invalid form", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 429, description = "Quota exceeded", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn upload_document(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
@@ -306,6 +327,38 @@ pub async fn upload_document(
         .fetch_one(&mut *guard)
         .await
         .map_err(|e| ApiError::Internal(format!("insert ingest_job: {e}")))?;
+
+        // T84D Phase 1.1: instead of LPUSHing to Redis here (which is
+        // post-commit unsafe because the RLS middleware owns COMMIT),
+        // the handler writes one `ingest_outbox` row inside the same
+        // transaction. A worker relay drains pending rows and LPUSHes
+        // them onto `gmrag:ingest_jobs` after COMMIT — atomic with the
+        // documents/ingest_jobs inserts, so a DB failure rolls the whole
+        // thing back (no orphan Redis job) and a relay failure leaves a
+        // pending row the sweeper can flip.
+        let payload = IngestJobPayload {
+            id: job_id.0,
+            tenant_id: tid,
+            workspace_id,
+            document_id,
+            s3_key: s3_key.clone(),
+            filename: filename.clone(),
+            owner_id: owner,
+            visibility: visibility.as_str().to_string(),
+            attempts: 0,
+        };
+        let payload_json = serde_json::to_value(&payload)
+            .map_err(|e| ApiError::Internal(format!("serialize ingest payload: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ingest_outbox (tenant_id, document_id, payload)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(tid)
+        .bind(document_id)
+        .bind(payload_json)
+        .execute(&mut *guard)
+        .await
+        .map_err(|e| ApiError::Internal(format!("insert ingest_outbox: {e}")))?;
         Ok(job_id.0)
     }
     .await;
@@ -321,25 +374,13 @@ pub async fn upload_document(
         }
     };
 
-    // 6. Enqueue the fully-populated ingest job (owner_id + visibility per T43).
-    let payload = IngestJobPayload {
-        id: job_id,
-        tenant_id: tid,
-        workspace_id,
-        document_id,
-        s3_key: s3_key.clone(),
-        filename: filename.clone(),
-        owner_id: owner,
-        visibility: visibility.as_str().to_string(),
-        attempts: 0,
-    };
-    if let Err(e) = enqueuer.enqueue(&payload).await {
-        let _ = sqlx::Executor::execute(&mut *guard, "ROLLBACK TO SAVEPOINT sp_upload").await;
-        drop(guard);
-        let _ = store.delete(&s3_key).await;
-        return Err(ApiError::Internal(format!("enqueue ingest job: {e}")));
-    }
+    // The JobEnqueuer extension is retained for tests/legacy callers but is
+    // no longer used at runtime — `enqueuer` is intentionally unused here so
+    // the outbox insert is the sole enqueue path. Drop the unused reference
+    // explicitly to make the invariant obvious.
+    drop(enqueuer);
 
+    let _ = job_id; // job_id is recorded in ingest_outbox; no further use.
     let _ = sqlx::Executor::execute(&mut *guard, "RELEASE SAVEPOINT sp_upload").await;
     drop(guard);
 
@@ -349,21 +390,26 @@ pub async fn upload_document(
     ))
 }
 
-/// `DELETE /tenants/{tid}/documents/{did}` — delete a document (T59).
-///
-/// Owner-only. Order: load (RLS-scoped) → owner guard → S3 object delete →
-/// Qdrant chunk-vector cleanup (orphan removal) → Postgres `DELETE` (cascade
-/// removes `document_chunks` + `ingest_jobs`). Cross-tenant rows are hidden by
-/// RLS, so they surface as `404`.
-///
-/// Graph nodes/edges are intentionally NOT cleaned per-document: they are
-/// deduplicated per `(tenant, workspace, label, kind)` and shared across
-/// documents, with no `document_id` link in the schema (see
-/// `QdrantStore::delete_chunks_by_document` and the T59 progress notes).
-///
-/// S3 / Qdrant cleanup is best-effort (failures are logged, not fatal) so a
-/// transient object-store hiccup cannot strand the document row; the Postgres
-/// delete is the authoritative step.
+/// Delete a document (owner-only).
+#[utoipa::path(
+    delete,
+    path = "/tenants/{tid}/documents/{did}",
+    tag = "Documents",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("did" = Uuid, Path, description = "Document ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Document deleted"),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Document not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn delete_document(
     Path((tid, did)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
@@ -452,15 +498,25 @@ struct ChunkPreview {
 /// Max chunks returned in a single preview.
 const PREVIEW_CHUNK_LIMIT: i64 = 50;
 
-/// `GET /tenants/{tid}/documents/{did}/preview` — metadata + first chunks (T60).
-///
-/// Authorization is the ReBAC `viewer` relation, evaluated by
-/// [`crate::rbac::check::check_relation`] (T83): the document is returned iff
-/// `visibility = 'shared'`, the caller is the owner, a member of the
-/// document's workspace, or the recipient of a `resource_acl` grant (directly
-/// or via a workspace group). RLS scopes to the tenant first, so cross-tenant
-/// or unauthorized access both surface as `404` (no information leak). Returns
-/// up to [`PREVIEW_CHUNK_LIMIT`] chunks ordered by `chunk_index`.
+/// Document metadata and first chunks (viewer-gated, max 50 chunks).
+#[utoipa::path(
+    get,
+    path = "/tenants/{tid}/documents/{did}/preview",
+    tag = "Documents",
+    params(
+        ("tid" = Uuid, Path, description = "Tenant ID"),
+        ("did" = Uuid, Path, description = "Document ID"),
+        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Document preview", body = crate::openapi::schemas::DocumentPreviewResponse),
+        (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
+    )
+)]
 pub async fn preview_document(
     Path((tid, did)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,

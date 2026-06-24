@@ -27,7 +27,7 @@ WORKDIR /app
 # Native build deps for ring/rustls/sqlx-postgres.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev ca-certificates \
+      pkg-config libssl-dev ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=planner /app/recipe.json recipe.json
@@ -36,6 +36,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY backend/Cargo.toml backend/Cargo.lock* ./
 COPY backend/crates ./crates
 COPY backend/migrations ./migrations
+COPY backend/.sqlx ./.sqlx
+
+ENV SQLX_OFFLINE=true
 
 # Build only the binaries we need. Adding new bins here is fine; this
 # keeps the image slim and the build deterministic.

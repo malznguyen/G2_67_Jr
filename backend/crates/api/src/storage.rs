@@ -29,6 +29,16 @@ pub trait ObjectStore: Send + Sync {
     /// Delete the object at `key`. Idempotent (S3 returns success even if the
     /// key is already absent) — used for rollback of a partial upload.
     async fn delete(&self, key: &str) -> Result<(), String>;
+
+    /// T84D Phase 2.2 (SEC-4): best-effort delete of every object under
+    /// `prefix` (e.g. `{tenant_id}/`). Used by the tenant-teardown path.
+    /// The default impl returns `Err("not implemented")` so the mock in
+    /// tests stays trivial. Implementations paginate `list_objects_v2`
+    /// and call `delete_objects` in batches of 1000.
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), String> {
+        let _ = prefix;
+        Err("delete_prefix not implemented for this ObjectStore".into())
+    }
 }
 
 /// S3-compatible object storage (MinIO in dev, any S3 in prod).
@@ -85,6 +95,54 @@ impl ObjectStore for S3ObjectStore {
             .send()
             .await
             .map_err(|e| format!("S3 delete_object '{key}' failed: {e}"))?;
+        Ok(())
+    }
+
+    /// T84D Phase 2.2 (SEC-4): paginated S3 prefix delete used by the
+    /// tenant teardown path. Lists objects under `prefix` and deletes
+    /// them in batches of 1000 (the AWS `delete_objects` cap).
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), String> {
+        use aws_sdk_s3::types::ObjectIdentifier;
+
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut list = self.client.list_objects_v2().bucket(&self.bucket).prefix(prefix);
+            if let Some(token) = continuation.as_deref() {
+                list = list.continuation_token(token);
+            }
+            let resp = list
+                .send()
+                .await
+                .map_err(|e| format!("S3 list_objects_v2 '{prefix}' failed: {e}"))?;
+
+            let keys: Vec<ObjectIdentifier> = resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(|k| k.to_string()))
+                .map(|k| ObjectIdentifier::builder().key(k).build().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if !keys.is_empty() {
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .set_delete(Some(
+                        aws_sdk_s3::types::Delete::builder()
+                            .set_objects(Some(keys))
+                            .build()
+                            .map_err(|e| format!("S3 delete batch build: {e}"))?,
+                    ))
+                    .send()
+                    .await
+                    .map_err(|e| format!("S3 delete_objects '{prefix}' failed: {e}"))?;
+            }
+
+            if resp.is_truncated().unwrap_or(false) {
+                continuation = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 }

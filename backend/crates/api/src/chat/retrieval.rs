@@ -24,6 +24,11 @@ pub struct ChunkHit {
     pub content: String,
     pub filename: Option<String>,
     pub score: f32,
+    /// T84D Phase 3.1: page range from `document_chunks.page_start` /
+    /// `page_end` (1-based). `None` when the chunker had no page info
+    /// (legacy rows or non-PDF ingest).
+    pub page_start: Option<i32>,
+    pub page_end: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,7 +111,17 @@ impl From<gmrag_core::Error> for RetrievalError {
     }
 }
 
-/// Document ids the user may read within a workspace (visibility + owner + ACL).
+/// Document ids the user may read within a workspace (ReBAC viewer relation).
+///
+/// This is the set-compiled form of [`crate::rbac::check::check_relation`]`
+/// `(document, viewer, user)` so the filter stays a single indexed query
+/// instead of an N+1 per-document Check. A document is accessible iff the
+/// caller holds the `viewer` relation on it (T83/C1/C5):
+/// - `visibility = 'shared'` (publicly readable in the tenant), or
+/// - the caller is the owner (`owner_id`), or
+/// - the caller is a member of the document's workspace (inheritance), or
+/// - the caller is the recipient of a `resource_acl` grant — directly or via
+///   a workspace-group share — with `permission IN ('owner','editor','viewer')`.
 pub async fn accessible_document_ids(
     conn: &mut PgConnection,
     workspace_id: Uuid,
@@ -116,17 +131,28 @@ pub async fn accessible_document_ids(
         r#"
         SELECT DISTINCT d.id
         FROM documents d
-        LEFT JOIN resource_acl ra
-          ON ra.resource_type = 'document'
-         AND ra.resource_id = d.id
-         AND ra.principal_type = 'user'
-         AND ra.principal_id = $2
-         AND ra.permission = 'read'
         WHERE d.workspace_id = $1
           AND (
-            d.visibility IN ('workspace', 'public')
+            d.visibility = 'shared'
             OR d.owner_id = $2
-            OR ra.id IS NOT NULL
+            OR EXISTS (
+              SELECT 1 FROM workspace_members wm
+              WHERE wm.workspace_id = d.workspace_id
+                AND wm.user_id = $2
+            )
+            OR EXISTS (
+              SELECT 1 FROM resource_acl ra
+              WHERE ra.resource_type = 'document'
+                AND ra.resource_id = d.id
+                AND ra.permission IN ('owner', 'editor', 'viewer')
+                AND (
+                  (ra.principal_type = 'user' AND ra.principal_id = $2)
+                  OR (ra.principal_type = 'workspace' AND EXISTS (
+                        SELECT 1 FROM workspace_members wmg
+                        WHERE wmg.workspace_id = ra.principal_id
+                          AND wmg.user_id = $2))
+                )
+            )
           )
         "#,
     )
@@ -235,9 +261,9 @@ pub async fn retrieve_chunks_with_vector(
             continue;
         }
 
-        let row: Option<(String, i32, Option<String>)> = sqlx::query_as(
+        let row: Option<(String, i32, Option<String>, Option<i32>, Option<i32>)> = sqlx::query_as(
             r#"
-            SELECT dc.content, dc.chunk_index, d.title
+            SELECT dc.content, dc.chunk_index, d.title, dc.page_start, dc.page_end
             FROM document_chunks dc
             JOIN documents d ON d.id = dc.document_id
             WHERE dc.qdrant_point_id = $1
@@ -247,7 +273,7 @@ pub async fn retrieve_chunks_with_vector(
         .fetch_optional(&mut *conn)
         .await?;
 
-        let Some((content, chunk_index, title)) = row else {
+        let Some((content, chunk_index, title, page_start, page_end)) = row else {
             continue;
         };
 
@@ -259,6 +285,8 @@ pub async fn retrieve_chunks_with_vector(
             content,
             filename: title,
             score: point.score,
+            page_start,
+            page_end,
         });
     }
 
@@ -396,7 +424,15 @@ async fn load_graph_edges(
         .collect())
 }
 
-/// Graph kNN + ILIKE fallback + edge expansion (T47).
+/// Graph kNN + ILIKE fallback + edge expansion (T47, T84D ACL provenance).
+///
+/// T84D Phase 2.1 (SEC-1): graph nodes are deduped and shared across
+/// documents, so the kNN results may include a node extracted only from
+/// a private document the caller cannot read. Post-filter:
+/// a node is kept iff `EXISTS (graph_node_documents gnd WHERE
+/// gnd.node_id = node AND gnd.document_id = ANY($accessible))`.
+/// The ILIKE fallback path applies the same filter. Edges whose src or
+/// dst was filtered out are dropped.
 pub async fn retrieve_graph_context(
     conn: &mut PgConnection,
     qdrant: &QdrantStore,
@@ -405,6 +441,7 @@ pub async fn retrieve_graph_context(
     workspace_id: Uuid,
     query_text: &str,
     top_k: u64,
+    accessible_document_ids: &[Uuid],
 ) -> Result<GraphContext, RetrievalError> {
     let scored = qdrant
         .search_graph_nodes(tenant_id, workspace_id, query_vector.to_vec(), top_k)
@@ -428,7 +465,9 @@ pub async fn retrieve_graph_context(
         }
 
         if let Some(hit) = hydrate_graph_node(conn, node_id, Some(point.score)).await? {
-            nodes.push(hit);
+            if node_visible_via_provenance(conn, node_id, accessible_document_ids).await? {
+                nodes.push(hit);
+            }
         }
     }
 
@@ -442,18 +481,56 @@ pub async fn retrieve_graph_context(
         )
         .await?;
         for hit in fallback {
-            seen.insert(hit.node_id);
-            nodes.push(hit);
-            if nodes.len() >= top_k as usize {
-                break;
+            if node_visible_via_provenance(conn, hit.node_id, accessible_document_ids).await? {
+                seen.insert(hit.node_id);
+                nodes.push(hit);
+                if nodes.len() >= top_k as usize {
+                    break;
+                }
+            } else {
+                // Record the skip so the next ILIKE iteration doesn't
+                // re-hydrate the same filtered node.
+                seen.insert(hit.node_id);
             }
         }
     }
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.node_id).collect();
-    let edges = load_graph_edges(conn, tenant_id, &node_ids).await?;
+    let mut edges = load_graph_edges(conn, tenant_id, &node_ids).await?;
+
+    // Drop edges whose endpoints were filtered out by the ACL check above.
+    let allowed: HashSet<Uuid> = node_ids.iter().copied().collect();
+    edges.retain(|e| allowed.contains(&e.src_node_id) && allowed.contains(&e.dst_node_id));
 
     Ok(GraphContext { nodes, edges })
+}
+
+/// T84D Phase 2.1: ACL provenance check — a node is visible to the caller
+/// iff ANY of its source documents is in the caller's
+/// `accessible_document_ids` set.
+pub(crate) async fn node_visible_via_provenance(
+    conn: &mut PgConnection,
+    node_id: Uuid,
+    accessible: &[Uuid],
+) -> Result<bool, RetrievalError> {
+    if accessible.is_empty() {
+        return Ok(false);
+    }
+    let visible: Option<(bool,)> = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM graph_node_documents gnd
+            WHERE gnd.node_id = $1
+              AND gnd.document_id = ANY($2)
+        )
+        "#,
+    )
+    .bind(node_id)
+    .bind(accessible)
+    .fetch_optional(conn)
+    .await?;
+    Ok(visible.map(|r| r.0).unwrap_or(false))
 }
 
 /// Single embed + chunk/graph retrieval (orchestrator for T49).
@@ -466,6 +543,12 @@ pub async fn retrieve_all_with_provider(
     let query_vector = llm.embed_query(&params.query).await?;
     let chunks =
         retrieve_chunks_with_vector(conn, qdrant, &query_vector, params).await?;
+    // T84D Phase 2.1: compute the accessible set once before the graph
+    // call (the chunk path already produces it inside
+    // `retrieve_chunks_with_vector`, but that one is private to its
+    // scope — compute it again here so the graph ACL matches the chunk
+    // ACL exactly).
+    let accessible = accessible_document_ids(conn, params.workspace_id, params.user_id).await?;
     let graph = retrieve_graph_context(
         conn,
         qdrant,
@@ -474,6 +557,7 @@ pub async fn retrieve_all_with_provider(
         params.workspace_id,
         &params.query,
         params.top_k,
+        &accessible,
     )
     .await?;
     Ok((chunks, graph))
@@ -498,6 +582,7 @@ pub async fn retrieve_all_with_metering(
 
     let chunks =
         retrieve_chunks_with_vector(conn, qdrant, &query_vector, params).await?;
+    let accessible = accessible_document_ids(conn, params.workspace_id, params.user_id).await?;
     let graph = retrieve_graph_context(
         conn,
         qdrant,
@@ -506,6 +591,7 @@ pub async fn retrieve_all_with_metering(
         params.workspace_id,
         &params.query,
         params.top_k,
+        &accessible,
     )
     .await?;
     Ok((chunks, graph))
@@ -663,135 +749,201 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_doc(
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+        id: Uuid,
+        tenant: Uuid,
+        ws: Uuid,
+        owner: Uuid,
+        title: &str,
+        visibility: &str,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
+               VALUES ($1, $2, $3, $4, $5, 'ready', $6, 'k')"#,
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(ws)
+        .bind(owner)
+        .bind(title)
+        .bind(visibility)
+        .execute(&mut **conn)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_doc_grant(
+        pool: &PgPool,
+        tenant: Uuid,
+        doc_id: Uuid,
+        principal_type: &str,
+        principal_id: Uuid,
+        permission: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO resource_acl (tenant_id, resource_type, resource_id, principal_type, principal_id, permission)
+             VALUES ($1, 'document', $2, $3, $4, $5)",
+        )
+        .bind(tenant)
+        .bind(doc_id)
+        .bind(principal_type)
+        .bind(principal_id)
+        .bind(permission)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// C1 regression: a non-member (no workspace membership, no grant) can see
+    /// only their own documents and `visibility='shared'` documents. Foreign
+    /// private documents are excluded. This replaces the old false-positive
+    /// test that used `visibility='public'` (a value T58 can never produce).
     #[sqlx::test(migrations = "../../migrations")]
-    async fn accessible_docs_excludes_private_foreign_owner(pool: PgPool) {
-        let tenant = seed_tenant(&pool, "acl-tenant").await;
-        let owner = seed_user(&pool).await;
+    async fn accessible_docs_non_member_sees_owned_and_shared_only(pool: PgPool) {
+        let tenant = seed_tenant(&pool, "acl-non-member").await;
+        let caller = seed_user(&pool).await;
         let other = seed_user(&pool).await;
-        let ws = seed_workspace(&pool, tenant, owner).await;
-        add_workspace_member(&pool, ws, tenant, owner).await;
+        let ws = seed_workspace(&pool, tenant, other).await;
+        add_workspace_member(&pool, ws, tenant, other).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
 
         let owned_doc = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'owned', 'ready', 'private', 'k')"#,
-        )
-        .bind(owned_doc)
-        .bind(tenant)
-        .bind(ws)
-        .bind(owner)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        insert_doc(&mut conn, owned_doc, tenant, ws, caller, "mine", "private").await;
+
+        let shared_doc = Uuid::new_v4();
+        insert_doc(&mut conn, shared_doc, tenant, ws, other, "theirs-shared", "shared").await;
 
         let foreign_private = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'foreign', 'ready', 'private', 'k')"#,
-        )
-        .bind(foreign_private)
-        .bind(tenant)
-        .bind(ws)
-        .bind(other)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        insert_doc(&mut conn, foreign_private, tenant, ws, other, "theirs-private", "private")
+            .await;
 
-        let public_doc = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'public doc', 'ready', 'public', 'k')"#,
-        )
-        .bind(public_doc)
-        .bind(tenant)
-        .bind(ws)
-        .bind(other)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        assert!(ids.contains(&owned_doc), "caller sees own private doc");
+        assert!(
+            ids.contains(&shared_doc),
+            "caller sees visibility='shared' doc"
+        );
+        assert!(
+            !ids.contains(&foreign_private),
+            "non-member without grant cannot see foreign private doc"
+        );
+    }
 
-        let ids = accessible_document_ids(&mut conn, ws, owner).await.unwrap();
-        assert!(ids.contains(&owned_doc));
-        assert!(ids.contains(&public_doc));
-        assert!(!ids.contains(&foreign_private));
+    /// C1/C5 regression: a workspace member sees ALL documents in the workspace
+    /// (ReBAC `tuple_to_userset(workspace → member)` inheritance), including
+    /// foreign private documents.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn accessible_docs_workspace_member_sees_all(pool: PgPool) {
+        let tenant = seed_tenant(&pool, "acl-ws-member").await;
+        let caller = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        let ws = seed_workspace(&pool, tenant, other).await;
+        add_workspace_member(&pool, ws, tenant, other).await;
+        add_workspace_member(&pool, ws, tenant, caller).await;
+
+        let mut conn = rls_conn(&pool, tenant).await;
+
+        let owned_doc = Uuid::new_v4();
+        insert_doc(&mut conn, owned_doc, tenant, ws, caller, "mine", "private").await;
+
+        let foreign_private = Uuid::new_v4();
+        insert_doc(&mut conn, foreign_private, tenant, ws, other, "theirs-private", "private")
+            .await;
+
+        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        assert!(ids.contains(&owned_doc), "member sees own doc");
+        assert!(
+            ids.contains(&foreign_private),
+            "workspace member sees foreign private doc via inheritance"
+        );
+    }
+
+    /// C1/C5 regression: a non-member with a `resource_acl` grant
+    /// `permission='viewer'` can see a private document (production-realistic
+    /// ReBAC data per T64 CHECK + T67 grant flow).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn accessible_docs_grant_sees_private_doc(pool: PgPool) {
+        let tenant = seed_tenant(&pool, "acl-grant").await;
+        let caller = seed_user(&pool).await;
+        let other = seed_user(&pool).await;
+        let ws = seed_workspace(&pool, tenant, other).await;
+        add_workspace_member(&pool, ws, tenant, other).await;
+
+        let mut conn = rls_conn(&pool, tenant).await;
+
+        let granted_doc = Uuid::new_v4();
+        insert_doc(&mut conn, granted_doc, tenant, ws, other, "granted", "private").await;
+
+        let ungranted_doc = Uuid::new_v4();
+        insert_doc(&mut conn, ungranted_doc, tenant, ws, other, "ungranted", "private").await;
+
+        insert_doc_grant(&pool, tenant, granted_doc, "user", caller, "viewer").await;
+
+        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        assert!(
+            ids.contains(&granted_doc),
+            "non-member with viewer grant sees private doc"
+        );
+        assert!(
+            !ids.contains(&ungranted_doc),
+            "non-member without grant cannot see private doc"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn retrieve_chunks_empty_when_no_accessible_docs(pool: PgPool) {
+    async fn retrieve_chunks_empty_when_no_chunks_indexed(pool: PgPool) {
         let tenant = seed_tenant(&pool, "empty-acl").await;
         let owner = seed_user(&pool).await;
-        let other = seed_user(&pool).await;
         let ws = seed_workspace(&pool, tenant, owner).await;
         add_workspace_member(&pool, ws, tenant, owner).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
 
-        let foreign_private = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'hidden', 'ready', 'private', 'k')"#,
-        )
-        .bind(foreign_private)
-        .bind(tenant)
-        .bind(ws)
-        .bind(other)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        let doc = Uuid::new_v4();
+        insert_doc(&mut conn, doc, tenant, ws, owner, "no-chunks", "private").await;
 
         let qdrant = match QdrantStore::new(&local_qdrant()).await {
             Ok(s) => s,
             Err(_) => return,
         };
+        qdrant.setup_tenant_collections(tenant).await.unwrap();
 
         let params = RetrievalParams::new(tenant, ws, owner, "test query");
         let hits = retrieve_chunks_with_vector(&mut conn, &qdrant, &unit_vec(0), &params)
             .await
             .unwrap();
-        assert!(hits.is_empty());
+        assert!(hits.is_empty(), "no Qdrant points → no hits");
+
+        let _ = qdrant.teardown_tenant_collections(tenant).await;
     }
 
+    /// C1 regression: retrieval is scoped to the caller's workspace. Documents
+    /// in another workspace are excluded by both the SQL `workspace_id` filter
+    /// and the Qdrant `must` payload filter, even when the caller owns them.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn retrieve_chunks_returns_top_scored_accessible(pool: PgPool) {
+    async fn retrieve_chunks_scoped_to_workspace(pool: PgPool) {
         let qdrant = QdrantStore::new(&local_qdrant())
             .await
             .expect("Qdrant at localhost:6334 required");
 
-        let tenant = seed_tenant(&pool, "chunk-retrieval").await;
+        let tenant = seed_tenant(&pool, "chunk-scoping").await;
         let owner = seed_user(&pool).await;
         let other = seed_user(&pool).await;
         let ws = seed_workspace(&pool, tenant, owner).await;
         add_workspace_member(&pool, ws, tenant, owner).await;
+        let other_ws = seed_workspace(&pool, tenant, other).await;
+        add_workspace_member(&pool, other_ws, tenant, other).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
 
         let allowed_doc = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'allowed.pdf', 'ready', 'private', 'k')"#,
-        )
-        .bind(allowed_doc)
-        .bind(tenant)
-        .bind(ws)
-        .bind(owner)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        insert_doc(&mut conn, allowed_doc, tenant, ws, owner, "allowed.pdf", "private").await;
 
         let blocked_doc = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, 'blocked.pdf', 'ready', 'private', 'k')"#,
-        )
-        .bind(blocked_doc)
-        .bind(tenant)
-        .bind(ws)
-        .bind(other)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+        insert_doc(&mut conn, blocked_doc, tenant, other_ws, other, "blocked.pdf", "private")
+            .await;
 
         let allowed_point = Uuid::new_v4();
         sqlx::query(
@@ -819,29 +971,28 @@ mod tests {
 
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
-        let make_point =
-            |point_id: Uuid, doc_id: Uuid, idx: i64, text: &str, vec: Vec<f32>| -> PointStruct {
-                PointStruct::new(
-                    point_id.to_string(),
-                    vec,
-                    Payload::try_from(serde_json::json!({
-                        "workspace_id": ws.to_string(),
-                        "document_id": doc_id.to_string(),
-                        "chunk_index": idx,
-                        "filename": text,
-                        "owner_id": owner.to_string(),
-                        "visibility": "private",
-                    }))
-                    .unwrap(),
-                )
-            };
+        let make_point = |point_id: Uuid, ws_id: Uuid, doc_id: Uuid, text: &str, vec: Vec<f32>| -> PointStruct {
+            PointStruct::new(
+                point_id.to_string(),
+                vec,
+                Payload::try_from(serde_json::json!({
+                    "workspace_id": ws_id.to_string(),
+                    "document_id": doc_id.to_string(),
+                    "chunk_index": 0_i64,
+                    "filename": text,
+                    "owner_id": owner.to_string(),
+                    "visibility": "private",
+                }))
+                .unwrap(),
+            )
+        };
 
         qdrant
             .upsert_chunks(
                 tenant,
                 vec![
-                    make_point(allowed_point, allowed_doc, 0, "allowed.pdf", unit_vec(0)),
-                    make_point(blocked_point, blocked_doc, 0, "blocked.pdf", unit_vec(0)),
+                    make_point(allowed_point, ws, allowed_doc, "allowed.pdf", unit_vec(0)),
+                    make_point(blocked_point, other_ws, blocked_doc, "blocked.pdf", unit_vec(0)),
                 ],
             )
             .await
@@ -868,6 +1019,12 @@ mod tests {
 
         let mut conn = rls_conn(&pool, tenant).await;
 
+        // T84D Phase 2.1: the node is extracted only from a document the
+        // caller owns, so it must be returned. Without the provenance
+        // link the new ACL post-filter would (correctly) drop the node.
+        let doc = Uuid::new_v4();
+        insert_doc(&mut conn, doc, tenant, ws, owner, "keycloak-pdf", "private").await;
+
         let node_id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO graph_nodes (id, tenant_id, workspace_id, kind, label, properties)
@@ -879,6 +1036,16 @@ mod tests {
         .execute(&mut *conn)
         .await
         .unwrap();
+        sqlx::query(
+            r#"INSERT INTO graph_node_documents (node_id, document_id, tenant_id)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(node_id)
+        .bind(doc)
+        .bind(tenant)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
         let qdrant = QdrantStore::new(&local_qdrant())
             .await
@@ -886,9 +1053,19 @@ mod tests {
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
         let zero = vec![0.0f32; 768];
-        let ctx = retrieve_graph_context(&mut conn, &qdrant, &zero, tenant, ws, "keycloak", 5)
-            .await
-            .unwrap();
+        let accessible = accessible_document_ids(&mut conn, ws, owner).await.unwrap();
+        let ctx = retrieve_graph_context(
+            &mut conn,
+            &qdrant,
+            &zero,
+            tenant,
+            ws,
+            "keycloak",
+            5,
+            &accessible,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ctx.nodes.len(), 1);
         assert_eq!(ctx.nodes[0].label, "Keycloak");
@@ -944,5 +1121,108 @@ mod tests {
         let vector = provider.embed_query("hello").await.unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(vector.len(), 768);
+    }
+
+    /// T84D Phase 2.1 regression (SEC-1): a graph node extracted only from
+    /// a private document the caller cannot read MUST NOT leak through the
+    /// ILIKE fallback. The plan calls out two cases:
+    ///   - a non-member: filtered out (no accessible document).
+    ///   - a non-member holding a `viewer` grant on the private document:
+    ///     returned (the document is now accessible).
+    ///
+    /// Pure SQL + ILIKE fallback — no Qdrant needed (the kNN result set is
+    /// empty, so the fallback path runs).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_acl_provenance_filters_private_node_for_non_member(pool: PgPool) {
+        let tenant = seed_tenant(&pool, "graph-acl").await;
+        let owner = seed_user(&pool).await;
+        let stranger = seed_user(&pool).await;
+        let viewer = seed_user(&pool).await;
+        let ws = seed_workspace(&pool, tenant, owner).await;
+        add_workspace_member(&pool, ws, tenant, owner).await;
+
+        let mut conn = rls_conn(&pool, tenant).await;
+
+        let private_doc = Uuid::new_v4();
+        insert_doc(&mut conn, private_doc, tenant, ws, owner, "secret.pdf", "private").await;
+
+        let node_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO graph_nodes (id, tenant_id, workspace_id, kind, label, properties)
+               VALUES ($1, $2, $3, 'Project', 'Secret', '{"description":"top secret"}'::jsonb)"#,
+        )
+        .bind(node_id)
+        .bind(tenant)
+        .bind(ws)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO graph_node_documents (node_id, document_id, tenant_id)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(node_id)
+        .bind(private_doc)
+        .bind(tenant)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // Stranger: no workspace membership + no grant → empty accessible set
+        // → node filtered out via the ILIKE fallback.
+        let zero = vec![0.0f32; 768];
+        let qdrant = match QdrantStore::new(&local_qdrant()).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        qdrant.setup_tenant_collections(tenant).await.unwrap();
+
+        let accessible_stranger = accessible_document_ids(&mut conn, ws, stranger).await.unwrap();
+        assert!(
+            accessible_stranger.is_empty(),
+            "stranger sees no documents in this workspace"
+        );
+        let ctx = retrieve_graph_context(
+            &mut conn,
+            &qdrant,
+            &zero,
+            tenant,
+            ws,
+            "secret",
+            5,
+            &accessible_stranger,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ctx.nodes.iter().all(|n| n.node_id != node_id),
+            "non-member must NOT see the private-only graph node"
+        );
+
+        // Viewer grant on the private document → node returned.
+        insert_doc_grant(&pool, tenant, private_doc, "user", viewer, "viewer").await;
+        let accessible_viewer = accessible_document_ids(&mut conn, ws, viewer).await.unwrap();
+        assert!(
+            accessible_viewer.contains(&private_doc),
+            "viewer grant makes the private doc accessible"
+        );
+        let ctx = retrieve_graph_context(
+            &mut conn,
+            &qdrant,
+            &zero,
+            tenant,
+            ws,
+            "secret",
+            5,
+            &accessible_viewer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ctx.nodes.iter().any(|n| n.node_id == node_id),
+            "viewer grant holder MUST see the private-only graph node"
+        );
+
+        let _ = qdrant.teardown_tenant_collections(tenant).await;
     }
 }

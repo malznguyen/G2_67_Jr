@@ -92,7 +92,12 @@ pub async fn run() -> anyhow::Result<()> {
         chat_history_limit: cfg.chat_history_limit,
     };
 
-    let jwt_validator = JwtValidator::new(cfg.oidc.issuer.clone(), cfg.oidc.client_id.clone());
+    let jwt_validator = JwtValidator::new(
+        cfg.oidc.issuer.clone(),
+        cfg.oidc.issuer_verify.clone(),
+        vec![cfg.oidc.client_id.clone(), cfg.oidc.frontend_client_id.clone()],
+        cfg.oidc.client_id.clone(),
+    );
     let auth_state = AuthState { jwt_validator };
     info!(issuer = %cfg.oidc.issuer, "auth state ready");
 

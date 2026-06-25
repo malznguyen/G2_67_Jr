@@ -35,7 +35,16 @@ const DEFAULT_DEEPSEEK_TIMEOUT_S: u64 = 60;
 /// OIDC / Keycloak configuration.
 #[derive(Debug, Clone)]
 pub struct OidcConfig {
+    /// Container-internal issuer used to fetch the OIDC discovery document /
+    /// JWKS (e.g. `http://keycloak:8080/realms/gmrag`). The backend cannot
+    /// resolve the host's `localhost`.
     pub issuer: String,
+    /// Issuer used to verify the `iss` claim in tokens. Keycloak emits `iss`
+    /// using the host-side origin (e.g. `http://localhost:8080/realms/gmrag`),
+    /// so this must match what the IdP puts in the token — not the internal
+    /// discovery URL. Defaults to `issuer` when `KEYCLOAK_ISSUER_VERIFY` is
+    /// unset (single-host deployments).
+    pub issuer_verify: String,
     pub client_id: String,
     pub client_secret: String,
     pub frontend_client_id: String,
@@ -144,8 +153,13 @@ impl Config {
         let service_name = optional_env("GMRAG_SERVICE_NAME", "gmrag-api");
 
         // OIDC / Keycloak
+        let oidc_issuer = require_env("KEYCLOAK_ISSUER")?;
+        // `iss` claim verification value — defaults to the public issuer env
+        // (host-side origin) when present, otherwise to the internal issuer.
+        let issuer_verify = optional_env("KEYCLOAK_ISSUER_VERIFY", &oidc_issuer);
         let oidc = OidcConfig {
-            issuer: require_env("KEYCLOAK_ISSUER")?,
+            issuer: oidc_issuer,
+            issuer_verify,
             client_id: require_env("KEYCLOAK_CLIENT_ID")?,
             client_secret: require_env("KEYCLOAK_CLIENT_SECRET")?,
             frontend_client_id: optional_env("KEYCLOAK_FRONTEND_CLIENT_ID", "gmrag-frontend"),

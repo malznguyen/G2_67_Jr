@@ -62,8 +62,14 @@ impl JwksCache {
 /// JWT validator that fetches and caches JWKS from the OIDC issuer.
 #[derive(Clone)]
 pub struct JwtValidator {
+    /// Issuer URL used to fetch discovery + JWKS (container-internal).
     issuer: String,
-    client_id: String,
+    /// Value expected in the token `iss` claim (may differ from `issuer` when
+    /// the IdP emits tokens with a host-side origin).
+    issuer_verify: String,
+    /// Accepted `aud` values — backend client + frontend client (tokens minted
+    /// for the browser carry the frontend client id in `aud`).
+    accepted_audiences: Vec<String>,
     cache: Arc<RwLock<JwksCache>>,
     cache_ttl: Duration,
     http_client: reqwest::Client,
@@ -72,12 +78,24 @@ pub struct JwtValidator {
 impl JwtValidator {
     /// Create a new validator.
     ///
-    /// `issuer` is the Keycloak realm URL (e.g. `http://keycloak:8080/realms/gmrag`).
-    /// `client_id` is the expected `azp` claim.
-    pub fn new(issuer: String, client_id: String) -> Self {
+    /// `issuer` is the Keycloak realm URL used for discovery (container-internal,
+    /// e.g. `http://keycloak:8080/realms/gmrag`). `issuer_verify` is the value
+    /// expected in the token `iss` claim (host-side, e.g.
+    /// `http://localhost:8080/realms/gmrag`). `accepted_audiences` lists every
+    /// `aud` value the backend accepts (backend client + frontend client).
+    /// `client_id` is retained for callers that still pass it (unused beyond
+    /// construction for now — audience is governed by `accepted_audiences`).
+    pub fn new(
+        issuer: String,
+        issuer_verify: String,
+        accepted_audiences: Vec<String>,
+        _client_id: String,
+    ) -> Self {
+        let _ = _client_id;
         Self {
             issuer,
-            client_id,
+            issuer_verify,
+            accepted_audiences,
             cache: Arc::new(RwLock::new(JwksCache {
                 keys: HashMap::new(),
                 fetched_at: Instant::now()
@@ -125,8 +143,8 @@ impl JwtValidator {
         let entry = self.get_key(&kid).await?;
 
         let mut validation = Validation::new(entry.algorithm);
-        validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.client_id]);
+        validation.set_issuer(&[&self.issuer_verify]);
+        validation.set_audience(&self.accepted_audiences);
 
         let token_data: TokenData<JwtClaims> =
             decode(token, &entry.key, &validation)
@@ -297,6 +315,8 @@ mod tests {
         let _decoding_key = DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap();
         let validator = JwtValidator::new(
             "http://localhost:8080/realms/gmrag".to_string(),
+            "http://localhost:8080/realms/gmrag".to_string(),
+            vec!["gmrag-backend".to_string()],
             "gmrag-backend".to_string(),
         );
         // We'll inject the key in async context.
@@ -444,6 +464,8 @@ mod tests {
 
         let validator = JwtValidator::new(
             "http://localhost:8080/realms/gmrag".to_string(),
+            "http://localhost:8080/realms/gmrag".to_string(),
+            vec!["gmrag-backend".to_string()],
             "gmrag-backend".to_string(),
         )
         .with_http_client(reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap());
@@ -473,6 +495,8 @@ mod tests {
     async fn jwks_fetch_unreachable_server_fails() {
         let validator = JwtValidator::new(
             "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            vec!["gmrag-backend".to_string()],
             "gmrag-backend".to_string(),
         )
         .with_http_client(

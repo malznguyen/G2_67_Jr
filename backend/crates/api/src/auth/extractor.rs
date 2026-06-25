@@ -78,6 +78,8 @@ mod tests {
     async fn make_auth_state() -> AuthState {
         let validator = JwtValidator::new(
             "http://localhost:8080/realms/gmrag".to_string(),
+            "http://localhost:8080/realms/gmrag".to_string(),
+            vec!["gmrag-backend".to_string()],
             "gmrag-backend".to_string(),
         );
         validator

@@ -29,6 +29,12 @@ export interface paths {
     get: operations["listDocuments"];
     post: operations["uploadDocument"];
   };
+  "/tenants/{tid}/documents/{doc_id}": {
+    delete: operations["deleteDocument"];
+  };
+  "/tenants/{tid}/documents/{doc_id}/preview": {
+    get: operations["previewDocument"];
+  };
   "/tenants/{tid}/chat_sessions": {
     get: operations["listChatSessions"];
     post: operations["createChatSession"];
@@ -147,6 +153,26 @@ export interface operations {
       };
     };
   };
+  deleteDocument: {
+    parameters: {
+      path: { tid: string; doc_id: string };
+    };
+    responses: {
+      204: { content: never };
+    };
+  };
+  previewDocument: {
+    parameters: {
+      path: { tid: string; doc_id: string };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components_schemas.DocumentPreviewResponse;
+        };
+      };
+    };
+  };
   uploadDocument: {
     parameters: {
       path: { tid: string };
@@ -231,9 +257,23 @@ export interface components_schemas {
       title: string;
       filename: string;
       visibility: "shared" | "private";
-      workspace_id: string;
+      workspace_id: string | null;
       owner_id: string;
+      status: DocumentStatus;
       created_at: string;
+    }[];
+  };
+  DocumentStatus: "uploaded" | "processing" | "indexed" | "failed";
+  DocumentPreviewResponse: {
+    document_id: string;
+    title: string;
+    status: DocumentStatus;
+    visibility: "shared" | "private";
+    mime_type: string | null;
+    byte_size: number;
+    chunks: {
+      index: number;
+      text: string;
     }[];
   };
   UploadDocumentForm: {

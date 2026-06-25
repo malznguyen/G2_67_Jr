@@ -1,8 +1,18 @@
 "use client";
 
-import { useState } from "react";
-import { SessionProvider } from "next-auth/react";
+import { useEffect, useState } from "react";
+import { SessionProvider, useSession } from "next-auth/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+import { setClientToken } from "@/lib/api/auth-token.client";
+
+function SessionTokenBridge() {
+  const { data: session } = useSession();
+  useEffect(() => {
+    setClientToken(session?.access_token ?? null);
+  }, [session?.access_token]);
+  return null;
+}
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -16,7 +26,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   return (
     <SessionProvider>
-      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      <QueryClientProvider client={queryClient}>
+        <SessionTokenBridge />
+        {children}
+      </QueryClientProvider>
     </SessionProvider>
   );
 }

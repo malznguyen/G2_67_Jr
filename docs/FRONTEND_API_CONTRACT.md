@@ -620,16 +620,41 @@ GET /users/me
 GET /tenants/{tid}/settings/llm
 ```
 
+> Chỉ tenant **owner** mới được gọi endpoint này.
+
 **Response `200`:**
 
 ```json
 {
-  "model": "deepseek-chat",
-  "api_key_set": true,
-  "temperature": 0.7,
-  "max_tokens": 4096
+  "configured": true,
+  "provider": "ollama",
+  "model": "nomic-embed-text",
+  "base_url": "http://ollama:11434",
+  "dimensions": 768,
+  "enabled": true,
+  "llm_model": "deepseek-chat",
+  "llm_base_url": "https://api.deepseek.com/v1",
+  "has_api_key": false,
+  "api_key_masked": "sk-…ab12"
 }
 ```
+
+**Chi tiết field:**
+
+| Field | Kiểu | Mô tả |
+|-------|------|-------|
+| `configured` | boolean | Tenant đã có cấu hình LLM hay chưa |
+| `provider` | string \| null | `"ollama"` hoặc `"openai"` (embedding provider) |
+| `model` | string \| null | Tên model embedding |
+| `base_url` | string \| null | Endpoint của embedding provider |
+| `dimensions` | number \| null | Số chiều vector embedding (thường `768`) |
+| `enabled` | boolean \| null | Bật/tắt BYOK embedding cho tenant |
+| `llm_model` | string \| null | Tên model LLM dùng cho chat (ví dụ `deepseek-chat`) |
+| `llm_base_url` | string \| null | Endpoint của LLM provider |
+| `has_api_key` | boolean | Tenant đã set API key hay chưa (không bao giờ trả raw key) |
+| `api_key_masked` | string \| null | API key đã mask (chỉ hiện khi `has_api_key = true`) |
+
+> **Lưu ý:** Không có trường `temperature`, `max_tokens`, hay `api_key_set`. Trường `api_key_set` ở phiên bản tài liệu cũ tương đương `has_api_key` hiện tại.
 
 ---
 
@@ -640,18 +665,35 @@ PUT /tenants/{tid}/settings/llm
 Content-Type: application/json
 ```
 
+> Chỉ tenant **owner** mới được gọi. API key (nếu gửi) sẽ được **mã hóa AES-256-GCM** trước khi lưu.
+
 **Request body:**
 
 ```json
 {
-  "model": "deepseek-chat",
+  "provider": "openai",
+  "model": "text-embedding-3-small",
+  "base_url": null,
   "api_key": "sk-...",
-  "temperature": 0.7,
-  "max_tokens": 4096
+  "dimensions": 768,
+  "enabled": true,
+  "llm_model": "deepseek-chat",
+  "llm_base_url": "https://api.deepseek.com/v1"
 }
 ```
 
-**Response `200`:** Object settings đã cập nhật.
+| Field | Bắt buộc | Mô tả |
+|-------|----------|-------|
+| `provider` | Có | `"ollama"` hoặc `"openai"` |
+| `model` | Có | Tên model embedding |
+| `base_url` | Không | Endpoint embedding provider |
+| `api_key` | Không | API key raw (sẽ được mã hóa khi lưu); gửi `null`/bỏ qua để giữ key cũ |
+| `dimensions` | Không | Số chiều vector (default `768`) |
+| `enabled` | Không | Bật/tắt BYOK embedding |
+| `llm_model` | Không | Model LLM cho chat |
+| `llm_base_url` | Không | Endpoint LLM provider |
+
+**Response `200`:** Object settings đã cập nhật (cùng shape với `GET`, key trả về dạng `api_key_masked`).
 
 ---
 
@@ -663,17 +705,30 @@ Content-Type: application/json
 GET /tenants/{tid}/usage
 ```
 
+> Chỉ tenant **owner** mới được gọi.
+
 **Response `200`:**
 
 ```json
 {
-  "storage_used_bytes": 104857600,
-  "document_count": 42,
-  "chat_message_count": 1500,
-  "period_start": "2026-06-01T00:00:00Z",
-  "period_end": "2026-06-30T23:59:59Z"
+  "usage": [
+    { "metric": "llm_tokens", "total": 1500 },
+    { "metric": "embedding_tokens", "total": 8200 },
+    { "metric": "document_count", "total": 42 },
+    { "metric": "storage_used_bytes", "total": 104857600 }
+  ]
 }
 ```
+
+**Chi tiết field:**
+
+| Field | Kiểu | Mô tả |
+|-------|------|-------|
+| `usage` | array | Danh sách metric; mỗi item có `{ metric: string, total: number }` |
+| `usage[].metric` | string | Tên metric (ví dụ `llm_tokens`, `embedding_tokens`, `document_count`, `storage_used_bytes`) |
+| `usage[].total` | number | Tổng giá trị tích lũy của metric |
+
+> **Lưu ý:** Không phải object phẳng như phiên bản cũ. Mỗi metric là một phần tử trong mảng `usage`. Không có trường `period_start`/`period_end`.
 
 ---
 
@@ -683,16 +738,33 @@ GET /tenants/{tid}/usage
 GET /tenants/{tid}/quota
 ```
 
+> Chỉ tenant **owner** mới được gọi.
+
 **Response `200`:**
 
 ```json
 {
+  "configured": true,
+  "max_documents": 500,
+  "max_workspaces": 10,
   "max_storage_bytes": 5368709120,
-  "max_document_count": 500,
-  "max_workspace_count": 10,
-  "max_member_count": 50
+  "max_members": 50,
+  "updated_at": "2026-06-23T10:00:00Z"
 }
 ```
+
+**Chi tiết field:**
+
+| Field | Kiểu | Mô tả |
+|-------|------|-------|
+| `configured` | boolean | Tenant đã có row quota hay dùng default |
+| `max_documents` | number | Giới hạn số document |
+| `max_workspaces` | number | Giới hạn số workspace |
+| `max_storage_bytes` | number | Giới hạn dung lượng storage (bytes) |
+| `max_members` | number | Giới hạn số thành viên tenant |
+| `updated_at` | string (RFC3339) \| null | Lần cập nhật quota cuối |
+
+> **Đổi tên field so với phiên bản cũ:** `max_document_count` → `max_documents`, `max_workspace_count` → `max_workspaces`, `max_member_count` → `max_members`. Thêm `configured` và `updated_at`.
 
 ---
 
@@ -702,6 +774,8 @@ GET /tenants/{tid}/quota
 GET /tenants/{tid}/audit_logs
 ```
 
+> Chỉ tenant **owner** mới được gọi.
+
 **Response `200`:**
 
 ```json
@@ -710,12 +784,23 @@ GET /tenants/{tid}/audit_logs
     "id": "uuid",
     "actor_id": "uuid",
     "action": "document.upload",
+    "resource_type": "document",
     "resource_id": "uuid",
-    "created_at": "2026-06-23T10:00:00Z",
-    "metadata": {}
+    "metadata": {},
+    "created_at": "2026-06-23T10:00:00Z"
   }
 ]
 ```
+
+| Field | Kiểu | Mô tả |
+|-------|------|-------|
+| `id` | string (UUID) | ID log entry |
+| `actor_id` | string (UUID) \| null | User thực hiện action |
+| `action` | string | Tên action (ví dụ `document.upload`, `acl.grant.create`) |
+| `resource_type` | string \| null | Loại resource bị tác động |
+| `resource_id` | string (UUID) \| null | ID resource bị tác động |
+| `metadata` | object \| null | Thông tin bổ sung (JSON tùy chọn) |
+| `created_at` | string (RFC3339) | Thời điểm tạo |
 
 ---
 
@@ -926,7 +1011,7 @@ Có **5 loại event**, phân biệt qua field `type`:
 | `point_id` | string (UUID) | ID của vector point trong Qdrant |
 | `document_id` | string (UUID) | ID tài liệu gốc |
 | `chunk_index` | number | Vị trí chunk trong tài liệu (0-based) |
-| `filename` | string | Tên file tài liệu gốc |
+| `filename` | string \| null | Tên file tài liệu gốc, `null` nếu không tra được |
 | `page_start` | number \| null | Trang bắt đầu của chunk (1-based), `null` nếu không xác định |
 | `page_end` | number \| null | Trang kết thúc của chunk (1-based), `null` nếu không xác định |
 
@@ -1113,7 +1198,7 @@ async function sendMessage(tid, sid, message, onText, onCitation, onDone, onErro
           onCitation({
             index: parsed.index,
             documentId: parsed.document_id,
-            filename: parsed.filename,
+            filename: parsed.filename,        // có thể null
             chunkIndex: parsed.chunk_index,
             pageStart: parsed.page_start,  // có thể null
             pageEnd: parsed.page_end,      // có thể null
@@ -1146,13 +1231,14 @@ function renderCitation(citation) {
     return `<span class="citation citation--unknown">[?]</span>`;
   }
 
+  const filename = citation.filename ?? '—';  // filename có thể là null
   const pageInfo = citation.pageStart
     ? `tr. ${citation.pageStart}${citation.pageEnd !== citation.pageStart ? `–${citation.pageEnd}` : ''}`
     : '';
 
   return `
     <a class="citation" href="/documents/${citation.documentId}/preview#chunk-${citation.chunkIndex}">
-      [${citation.index}] ${citation.filename} ${pageInfo}
+      [${citation.index}] ${filename} ${pageInfo}
     </a>
   `;
 }

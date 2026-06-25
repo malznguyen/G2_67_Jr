@@ -87,8 +87,8 @@ async fn paths_populated() {
     let doc = ApiDoc::openapi();
     let op_count = count_operations(&doc);
     assert!(
-        op_count >= 34,
-        "expected at least 34 operations, got {op_count}"
+        op_count >= 35,
+        "expected at least 35 operations, got {op_count}"
     );
 }
 

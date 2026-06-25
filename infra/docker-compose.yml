@@ -269,6 +269,13 @@ services:
     build:
       context: ..
       dockerfile: infra/frontend.Dockerfile
+      args:
+        # NEXT_PUBLIC_* are build-time inlined — inject them into the builder.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+        NEXT_PUBLIC_KEYCLOAK_URL: ${NEXT_PUBLIC_KEYCLOAK_URL}
+        NEXT_PUBLIC_KEYCLOAK_REALM: ${NEXT_PUBLIC_KEYCLOAK_REALM}
+        NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${NEXT_PUBLIC_KEYCLOAK_CLIENT_ID}
+        NEXT_PUBLIC_TENANT_HEADER: ${NEXT_PUBLIC_TENANT_HEADER}
     image: gmrag/frontend:dev
     container_name: gmrag-frontend
     <<: *restart_policy

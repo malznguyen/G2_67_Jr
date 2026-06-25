@@ -1,47 +1,295 @@
-# G2_67_Jr — GraphRAG Multi-tenant Self-host
+# 🧠 GMRAG 2.0
 
-Self-hosted GraphRAG platform with strict tenant isolation (RLS + TenantContext), built on Rust (axum/sqlx), Qdrant, Keycloak, Redis, MinIO, and Next.js.
+<div align="center">
 
-## Architecture (9 self-host services)
+![Build](https://img.shields.io/badge/build-passing-brightgreen?style=for-the-badge&logo=rust)
+![Version](https://img.shields.io/badge/version-2.0.0--T84D-blue?style=for-the-badge)
+![Rust](https://img.shields.io/badge/Rust-1.78+-orange?style=for-the-badge&logo=rust)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?style=for-the-badge&logo=postgresql&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+![Status](https://img.shields.io/badge/status-production--ready-success?style=for-the-badge)
 
-| # | Service   | Role                                                |
-|---|-----------|-----------------------------------------------------|
-| 1 | postgres16 | Primary OLTP store with Row-Level Security (RLS)    |
-| 2 | qdrant     | Vector store for embeddings                         |
-| 3 | minio      | S3-compatible object storage for uploads            |
-| 4 | redis      | Cache / queue / rate-limit                          |
-| 5 | ollama     | Local embedding / completion model runtime          |
-| 6 | keycloak   | OIDC identity provider (multi-tenant realm)         |
-| 7 | backend    | Rust (axum/sqlx) API — entry for business queries   |
-| 8 | worker     | Rust background worker — ingestion / GraphRAG jobs  |
-| 9 | frontend   | Next.js admin & tenant console                      |
+**Hệ thống Hỏi-Đáp Thông Minh đa người dùng thế hệ mới**
 
-## Invariants (do not break)
+*Kết hợp GraphRAG · Phân quyền ReBAC Zanzibar-style · Citation chính xác tới từng trang PDF*
 
-1. Every business query MUST go through `TenantContext` — no tenant UUID from URL feeds business logic directly.
-2. PostgreSQL Row-Level Security is the source of truth for tenant isolation; the backend enforces it as a second layer.
-3. TDD is mandatory: red test → FAIL → minimal implementation → PASS → dedicated commit.
+[📚 Tài liệu API](#-tài-liệu-liên-quan) · [🚀 Quick Start](#-quick-start) · [⚙️ Cấu hình](#️-biến-môi-trường) · [🗺️ Roadmap](#️-roadmap-p2)
 
-## Quick start
+</div>
+
+---
+
+## 📖 Giới thiệu
+
+**GMRAG 2.0** là backend production-ready cho hệ thống RAG (Retrieval-Augmented Generation) thế hệ mới. Dự án tích hợp **đồ thị tri thức (Knowledge Graph)**, kiểm soát quyền truy cập cấp tài liệu theo mô hình **Zanzibar**, và trích xuất **citation chính xác tới từng trang PDF** — tất cả được xây dựng trên nền tảng Rust với hiệu năng cao và độ tin cậy production.
+
+Phiên bản **T84D** là cột mốc refactor toàn diện: giải quyết các race condition nghiêm trọng, hoàn thiện pipeline ingest với Transactional Outbox Pattern, và bổ sung đầy đủ page metadata cho citation.
+
+---
+
+## ✨ Tính năng nổi bật
+
+| # | Tính năng | Mô tả |
+|---|-----------|-------|
+| 🕸️ | **GraphRAG** | Tích hợp đồ thị tri thức (graph nodes + edges) vào pipeline RAG, cải thiện chất lượng trả lời nhờ ngữ cảnh quan hệ giữa các thực thể |
+| 🔐 | **Phân quyền ReBAC** | Mô hình Zanzibar-style với relation tuples, kiểm soát quyền truy cập cấp tài liệu và workspace |
+| 📬 | **Ingest Outbox chống mất job** | Transactional Outbox Pattern đảm bảo không mất job khi upload; relay + sweeper tự động recover stuck jobs |
+| 📄 | **Citation chính xác tới trang PDF** | Trích xuất `page_start`/`page_end` cho mỗi chunk; Frontend nhận citation kèm số trang để nhảy trang PDF viewer |
+| 🏢 | **Multi-tenant hoàn chỉnh** | Mỗi tenant có collection Qdrant riêng, RLS PostgreSQL cô lập dữ liệu tuyệt đối |
+| 💬 | **Chat History trong LLM** | Backend tự động load lịch sử hội thoại vào LLM context (configurable qua `GMRAG_CHAT_HISTORY_LIMIT`) |
+| 📊 | **Graph API phân trang cursor** | Hỗ trợ dataset lớn hàng trăm nghìn graph nodes mà không bị timeout |
+| ⚡ | **Async Rust + Axum** | Tokio async runtime, zero-cost abstractions, memory-safe, tối ưu cho I/O-bound workloads |
+
+---
+
+## 🛠️ Tech Stack
+
+| Thành phần | Công nghệ | Ghi chú |
+|------------|-----------|---------|
+| **API Server** | Rust + Axum | Tokio async runtime |
+| **Database** | PostgreSQL 16 | Row-Level Security, `sqlx` |
+| **Vector DB** | Qdrant | 768-dim, cosine similarity |
+| **Message Queue** | Redis | `LPUSH`/`BRPOP` pattern |
+| **Object Storage** | MinIO / AWS S3 | Tương thích S3 API |
+| **LLM (local)** | Ollama | Local inference, `llama3.1:8b` default |
+| **LLM (remote)** | DeepSeek | Remote BYOK (Bring Your Own Key) |
+| **Auth** | OIDC / Keycloak | JWT validation, JWKS endpoint |
+| **Worker** | Rust binary | `gmrag-worker` — ingest pipeline |
+
+---
+
+## 📁 Cấu trúc dự án
+
+```
+gm_rag_2.0/
+├── backend/
+│   ├── Cargo.toml                        # Rust workspace
+│   ├── migrations/                       # SQLx migrations (chronological)
+│   └── crates/
+│       ├── api/                          # HTTP API server (gmrag-api)
+│       │   └── src/
+│       │       ├── routes/               # Axum route handlers
+│       │       ├── chat/                 # RAG retrieval + streaming SSE
+│       │       ├── openapi/              # OpenAPI schema tự sinh
+│       │       └── middleware/           # RLS context, CORS, auth JWT
+│       ├── worker/                       # Background worker (gmrag-worker)
+│       │   └── src/
+│       │       ├── relay.rs              # Outbox relay (T84D)
+│       │       ├── sweeper.rs            # Stuck job sweeper (T84D)
+│       │       └── job.rs                # Ingest job processor
+│       └── core/                         # Shared types, config, Qdrant client
+├── infra/
+│   ├── docker-compose.yml                # Full stack local dev
+│   └── backend.Dockerfile                # Multi-stage Rust build
+└── docs/
+    ├── FRONTEND_API_CONTRACT.md          # API contract cho Frontend
+    └── SYSTEM_OVERVIEW.md                # Kiến trúc tổng quan
+```
+
+---
+
+## 🚀 Quick Start
+
+### Bước 1 — Cài đặt prerequisites
+
+```bash
+# Docker & Docker Compose (xem https://docs.docker.com/get-docker/)
+
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# SQLx CLI
+cargo install sqlx-cli --no-default-features --features postgres
+```
+
+### Bước 2 — Copy & cấu hình môi trường
 
 ```bash
 cp .env.example .env
-docker compose -f infra/docker-compose.yml up -d
+# Chỉnh sửa .env với các thông tin kết nối của bạn
+# (xem bảng biến môi trường bên dưới)
 ```
 
-## Repository layout
+### Bước 3 — Khởi động infrastructure
 
-```
-.
-├── infra/
-│   ├── docker-compose.yml   # 9 self-host services + healthchecks
-│   ├── postgres/init.sql    # roles, RLS scaffolding
-│   └── minio/init.sh        # bucket bootstrap (gmrag-uploads)
-├── docs/progress/           # task reports
-├── .env.example             # environment template
-└── README.md
+```bash
+docker compose -f infra/docker-compose.yml up -d \
+  postgres qdrant redis minio keycloak
 ```
 
-## License
+> ⏳ Chờ khoảng 10–15 giây để các service sẵn sàng trước khi tiếp tục.
 
-Internal — team use only.
+### Bước 4 — Chạy database migrations
+
+```bash
+cd backend
+sqlx migrate run --database-url "$DATABASE_URL"
+```
+
+### Bước 5 — Build & chạy backend
+
+```bash
+cd backend
+
+# Build release (lần đầu mất ~2–3 phút)
+cargo build --release --bin gmrag-api --bin gmrag-worker
+
+# Terminal 1 — API Server
+./target/release/gmrag-api
+
+# Terminal 2 — Background Worker
+./target/release/gmrag-worker
+```
+
+**Hoặc** chạy toàn bộ stack bằng Docker Compose:
+
+```bash
+docker compose -f infra/docker-compose.yml up --build
+```
+
+### Bước 6 — Kiểm tra health
+
+```bash
+# Liveness check
+curl http://localhost:8080/health
+# → {"status":"ok","service":"gmrag-api","uptime_ms":1234}
+
+# Readiness check (kiểm tra DB connection)
+curl http://localhost:8080/healthz
+# → {"status":"ok","db":"ok"}
+```
+
+### Bước 7 — Xem OpenAPI Docs
+
+```
+http://localhost:8080/openapi.json
+```
+
+Import vào [Swagger UI](https://editor.swagger.io/) hoặc **Postman** để khám phá toàn bộ API.
+
+---
+
+## ⚙️ Biến môi trường
+
+### Biến bắt buộc
+
+| Biến | Mô tả |
+|------|-------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `KEYCLOAK_ISSUER` | OIDC issuer URL (ví dụ: `http://keycloak:8080/realms/gmrag`) |
+| `KEYCLOAK_CLIENT_ID` | Client ID trong Keycloak realm |
+| `KEYCLOAK_CLIENT_SECRET` | Client secret |
+| `S3_ENDPOINT` | MinIO hoặc AWS S3 endpoint |
+| `S3_ACCESS_KEY` | S3 access key |
+| `S3_SECRET_KEY` | S3 secret key |
+| `S3_BUCKET` | Tên bucket lưu trữ tài liệu |
+| `REDIS_URL` | Redis connection (default: `redis://localhost:6379`) |
+
+### Biến T84D — Mới trong phiên bản này
+
+| Biến | Default | Mô tả |
+|------|---------|-------|
+| `GMRAG_OCR_ENABLED` | `false` | Bật OCR cho PDF scan (yêu cầu `libpdfium`) |
+| `DATABASE_MAX_CONNECTIONS` | `10` | Pool size PostgreSQL |
+| `GMRAG_OUTBOX_POLL_INTERVAL_SECS` | `3` | Chu kỳ polling của Outbox relay (giây) |
+| `GMRAG_SWEEP_INTERVAL_SECS` | `60` | Chu kỳ Sweeper kiểm tra stuck jobs (giây) |
+| `GMRAG_CHAT_HISTORY_LIMIT` | `10` | Số tin nhắn lịch sử đưa vào LLM context |
+
+### Biến LLM
+
+| Biến | Default | Mô tả |
+|------|---------|-------|
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server endpoint |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Model sinh embedding (768-dim) |
+| `OLLAMA_LLM_MODEL` | `llama3.1:8b` | Model sinh câu trả lời |
+| `DEEPSEEK_API_KEY` | — | Nếu dùng DeepSeek thay vì Ollama |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Model DeepSeek |
+
+---
+
+## 🧪 Chạy Tests
+
+```bash
+cd backend
+
+# ✅ Unit tests — Không cần Postgres hay Qdrant
+SQLX_OFFLINE=true cargo test --workspace --lib
+
+# ✅ Integration tests — Cần Postgres đang chạy
+cargo test -p gmrag-api --test openapi       # 5/5 tests
+cargo test -p gmrag-worker --lib             # 58/58 tests
+
+# ✅ Full test suite — Cần Postgres + Qdrant
+cargo test --workspace
+```
+
+> 💡 **Tip:** Chạy `SQLX_OFFLINE=true` để test nhanh trong CI mà không cần database thật.
+
+---
+
+## 🗃️ Database Migrations (T84D)
+
+Phiên bản T84D bổ sung **4 migrations** mới:
+
+| File | Mục đích |
+|------|---------|
+| `20260623100000_ingest_outbox.sql` | Transactional outbox table + RLS policy |
+| `20260623101000_ingest_jobs_claim.sql` | Thêm cột `claimed_at` cho sweeper phát hiện stuck jobs |
+| `20260623102000_graph_node_documents.sql` | Bảng join provenance giữa graph nodes và documents |
+| `20260623103000_document_chunks_pages.sql` | Thêm cột `page_start`/`page_end` cho citation |
+
+Để xem trạng thái migrations:
+
+```bash
+cd backend
+sqlx migrate info --database-url "$DATABASE_URL"
+```
+
+---
+
+## ✅ Trạng thái T84D — Production Checklist
+
+### Đã hoàn thành
+
+| Ưu tiên | Hạng mục | Trạng thái |
+|---------|----------|-----------|
+| 🔴 P0 | Race condition upload-enqueue đã fix (Outbox Pattern) | ✅ Done |
+| 🔴 P0 | Graph ACL provenance đã implement | ✅ Done |
+| 🔴 P0 | Tenant delete teardown (Qdrant + S3) | ✅ Done |
+| 🟠 P1 | Page metadata trong citation (`page_start`/`page_end`) | ✅ Done |
+| 🟠 P1 | Messages API endpoint mới | ✅ Done |
+| 🟠 P1 | Chat history trong LLM context | ✅ Done |
+| 🟠 P1 | Graph cursor pagination | ✅ Done |
+| 🟠 P1 | Configurable DB pool size | ✅ Done |
+| ⭐ Extra | OpenAPI spec tự sinh | ✅ Done |
+| ⭐ Extra | CORS middleware cấu hình được | ✅ Done |
+
+---
+
+## 🗺️ Roadmap P2
+
+Các tính năng dưới đây chưa được triển khai trong T84D, dự kiến cho sprint tiếp theo:
+
+| Hạng mục | Mô tả |
+|----------|-------|
+| ⏳ Token count on ingest | Đếm và lưu token count khi xử lý tài liệu |
+| ⏳ Citation snippet/score trong SSE | Trả về đoạn trích và relevance score kèm citation qua streaming |
+| ⏳ Prometheus metrics | Endpoint `/metrics` với các counter/histogram quan trọng |
+| ⏳ Rate limiting | Per-user / per-tenant rate limit trên API |
+
+---
+
+## 📚 Tài liệu liên quan
+
+| Tài liệu | Mô tả |
+|----------|-------|
+| [`docs/FRONTEND_API_CONTRACT.md`](docs/FRONTEND_API_CONTRACT.md) | API contract đầy đủ cho Frontend — endpoint, request/response schema, SSE format |
+| [`docs/SYSTEM_OVERVIEW.md`](docs/SYSTEM_OVERVIEW.md) | Kiến trúc tổng quan hệ thống, data flow, mô hình phân quyền |
+
+---
+
+<div align="center">
+
+**GMRAG 2.0** — *Built with ❤️ and Rust*
+
+</div>

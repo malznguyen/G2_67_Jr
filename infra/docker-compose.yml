@@ -241,6 +241,12 @@ services:
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL}
       GMRAG_RUST_LOG: ${GMRAG_RUST_LOG}
       GMRAG_WORKER_CONCURRENCY: ${GMRAG_WORKER_CONCURRENCY}
+      # Keycloak OIDC — required by shared Config (worker validates JWT issuers
+      # when introspecting tenant LLM config / outbox events).
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      GMRAG_TENANT_HEADER: ${GMRAG_TENANT_HEADER}
       # T84D tuning: pool ceiling + outbox relay / sweeper / OCR flags.
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       GMRAG_OCR_ENABLED: ${GMRAG_OCR_ENABLED:-false}

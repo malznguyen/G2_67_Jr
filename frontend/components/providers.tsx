@@ -5,6 +5,7 @@ import { SessionProvider, useSession } from "next-auth/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { setClientToken } from "@/lib/api/auth-token.client";
+import { TenantBootstrapper } from "@/components/tenant-bootstrapper";
 
 function SessionTokenBridge() {
   const { data: session } = useSession();
@@ -28,6 +29,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <SessionProvider>
       <QueryClientProvider client={queryClient}>
         <SessionTokenBridge />
+        <TenantBootstrapper />
         {children}
       </QueryClientProvider>
     </SessionProvider>

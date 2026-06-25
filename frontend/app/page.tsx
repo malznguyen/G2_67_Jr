@@ -2,6 +2,7 @@
 
 import { useSession, signIn, signOut } from "next-auth/react";
 import { Button } from "@/components/ui/button";
+import { TenantSwitcher } from "@/components/TenantSwitcher";
 
 export default function HomePage() {
   const { data: session, status } = useSession();
@@ -35,6 +36,7 @@ export default function HomePage() {
       <p className="text-xs text-muted-foreground">
         access_token present: {session.access_token ? "yes" : "no"}
       </p>
+      <TenantSwitcher />
       <Button variant="outline" onClick={() => signOut()}>
         Sign out
       </Button>

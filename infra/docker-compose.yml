@@ -286,6 +286,9 @@ services:
       # NextAuth v5 (server-only)
       AUTH_SECRET: ${AUTH_SECRET}
       AUTH_TRUST_HOST: ${AUTH_TRUST_HOST}
+      # Canonical public URL — forces NextAuth to build callback/redirect URLs
+      # against the host-side origin instead of the container's 0.0.0.0 binding.
+      AUTH_URL: ${AUTH_URL:-http://localhost:3000}
       KEYCLOAK_FRONTEND_CLIENT_SECRET: ${KEYCLOAK_FRONTEND_CLIENT_SECRET}
       KEYCLOAK_FRONTEND_CLIENT_ID: ${KEYCLOAK_FRONTEND_CLIENT_ID}
       # OIDC issuer — server (container-internal) vs browser (host-side).

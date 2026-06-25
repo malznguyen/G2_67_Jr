@@ -1,0 +1,72 @@
+{
+  "common": {
+    "appName": "GMRAG2",
+    "loading": "Loading…",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close",
+    "back": "Back"
+  },
+  "auth": {
+    "signInTitle": "GMRAG2",
+    "signInPrompt": "Sign in to continue",
+    "signInWithKeycloak": "Sign in with Keycloak",
+    "signOut": "Sign out",
+    "signedInAs": "Signed in as {email}",
+    "unauthenticated": "You are not signed in."
+  },
+  "nav": {
+    "documents": "Documents",
+    "chat": "Chat",
+    "graph": "Knowledge graph",
+    "settings": "Settings",
+    "workspaces": "Workspaces"
+  },
+  "tenant": {
+    "switch": "Switch tenant",
+    "none": "No tenant"
+  },
+  "language": {
+    "label": "Language",
+    "vi": "Tiếng Việt",
+    "en": "English"
+  },
+  "workspace": {
+    "select": "Select workspace",
+    "none": "No workspace"
+  },
+  "documents": {
+    "title": "Documents",
+    "upload": "Upload",
+    "dropHere": "Drag and drop a PDF file here, or click to select",
+    "share": "Share",
+    "delete": "Delete",
+    "deleteConfirm": "Are you sure you want to delete this document?",
+    "empty": "No documents yet.",
+    "columns": {
+      "title": "Title",
+      "filename": "Filename",
+      "visibility": "Visibility",
+      "status": "Status",
+      "createdAt": "Created",
+      "actions": "Actions"
+    },
+    "visibility": {
+      "shared": "Shared",
+      "private": "Private"
+    },
+    "status": {
+      "uploaded": "Uploaded",
+      "processing": "Processing",
+      "indexed": "Indexed",
+      "failed": "Failed"
+    }
+  },
+  "errors": {
+    "loadFailed": "Failed to load data.",
+    "fileTooLarge": "File exceeds the 50 MiB limit.",
+    "fileType": "Only PDF files are supported.",
+    "uploadFailed": "Upload failed.",
+    "deleteFailed": "Delete failed."
+  }
+}

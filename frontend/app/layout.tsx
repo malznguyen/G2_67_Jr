@@ -1,22 +1,10 @@
-import type { Metadata } from "next";
-import "./globals.css";
-import { Providers } from "@/components/providers";
-
-export const metadata: Metadata = {
-  title: "GMRAG2",
-  description: "GMRAG2 — multi-tenant RAG platform (Sprint 9).",
-};
-
+// Root pass-through layout. The actual <html>/<<body> + providers live in
+// src/app/[locale]/layout.tsx (i18n locale segment). This file exists so Next
+// App Router has a stable root entry; it renders children only.
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  return (
-    <html lang="en">
-      <body>
-        <Providers>{children}</Providers>
-      </body>
-    </html>
-  );
+  return children;
 }

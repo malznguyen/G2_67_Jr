@@ -1,0 +1,72 @@
+{
+  "common": {
+    "appName": "GMRAG2",
+    "loading": "Đang tải…",
+    "cancel": "Huỷ",
+    "confirm": "Xác nhận",
+    "close": "Đóng",
+    "back": "Quay lại"
+  },
+  "auth": {
+    "signInTitle": "GMRAG2",
+    "signInPrompt": "Đăng nhập để tiếp tục",
+    "signInWithKeycloak": "Đăng nhập bằng Keycloak",
+    "signOut": "Đăng xuất",
+    "signedInAs": "Đã đăng nhập với tư cách {email}",
+    "unauthenticated": "Bạn chưa đăng nhập."
+  },
+  "nav": {
+    "documents": "Tài liệu",
+    "chat": "Trò chuyện",
+    "graph": "Đồ thị tri thức",
+    "settings": "Cài đặt",
+    "workspaces": "Không gian làm việc"
+  },
+  "tenant": {
+    "switch": "Chuyển tổ chức",
+    "none": "Chưa có tổ chức"
+  },
+  "language": {
+    "label": "Ngôn ngữ",
+    "vi": "Tiếng Việt",
+    "en": "English"
+  },
+  "workspace": {
+    "select": "Chọn không gian làm việc",
+    "none": "Chưa có không gian làm việc"
+  },
+  "documents": {
+    "title": "Tài liệu",
+    "upload": "Tải lên",
+    "dropHere": "Kéo thả tệp PDF vào đây hoặc bấm để chọn",
+    "share": "Chia sẻ",
+    "delete": "Xoá",
+    "deleteConfirm": "Bạn có chắc muốn xoá tài liệu này?",
+    "empty": "Chưa có tài liệu nào.",
+    "columns": {
+      "title": "Tiêu đề",
+      "filename": "Tên tệp",
+      "visibility": "Hiển thị",
+      "status": "Trạng thái",
+      "createdAt": "Ngày tạo",
+      "actions": "Thao tác"
+    },
+    "visibility": {
+      "shared": "Chung",
+      "private": "Riêng tư"
+    },
+    "status": {
+      "uploaded": "Đã tải lên",
+      "processing": "Đang xử lý",
+      "indexed": "Đã lập chỉ mục",
+      "failed": "Lỗi"
+    }
+  },
+  "errors": {
+    "loadFailed": "Tải dữ liệu thất bại.",
+    "fileTooLarge": "Tệp vượt quá giới hạn 50 MiB.",
+    "fileType": "Chỉ hỗ trợ tệp PDF.",
+    "uploadFailed": "Tải lên thất bại.",
+    "deleteFailed": "Xoá thất bại."
+  }
+}

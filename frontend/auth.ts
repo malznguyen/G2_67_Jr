@@ -31,8 +31,14 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       id: "keycloak",
       name: "Keycloak",
       type: "oidc",
-      // Server-side discovery (container-internal).
-      issuer: serverIssuer,
+      // `iss` claim in the ID token is emitted by Keycloak using the
+      // host-side origin (http://localhost:8080/realms/gmrag) because the
+      // browser performs the authorization request via localhost. NextAuth
+      // validates the `iss` response parameter against this value, so it must
+      // be the PUBLIC issuer — not the container-internal one.
+      issuer: publicIssuer,
+      // Discovery is fetched server-side from the container-internal origin
+      // (the Next.js server cannot resolve the host's `localhost`).
       wellKnown: `${serverIssuer}/.well-known/openid-configuration`,
       clientId: process.env.NEXT_PUBLIC_KEYCLOAK_CLIENT_ID,
       clientSecret: process.env.KEYCLOAK_FRONTEND_CLIENT_SECRET ?? "",
@@ -40,6 +46,10 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         // Browser-facing authorization endpoint (host-side origin).
         url: `${publicIssuer}/protocol/openid-connect/auth`,
         params: { scope: "openid email profile" },
+      },
+      // Server-side token exchange (container-internal).
+      token: {
+        url: `${serverIssuer}/protocol/openid-connect/token`,
       },
       idToken: true,
     },

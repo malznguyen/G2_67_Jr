@@ -286,6 +286,9 @@ services:
       AUTH_TRUST_HOST: ${AUTH_TRUST_HOST}
       KEYCLOAK_FRONTEND_CLIENT_SECRET: ${KEYCLOAK_FRONTEND_CLIENT_SECRET}
       KEYCLOAK_FRONTEND_CLIENT_ID: ${KEYCLOAK_FRONTEND_CLIENT_ID}
+      # OIDC issuer — server (container-internal) vs browser (host-side).
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER}
+      KEYCLOAK_ISSUER_PUBLIC: ${KEYCLOAK_ISSUER_PUBLIC}
     ports:
       - "3000:3000"
     healthcheck:

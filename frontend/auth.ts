@@ -9,7 +9,19 @@ declare module "next-auth" {
   }
 }
 
-const issuer = `${process.env.NEXT_PUBLIC_KEYCLOAK_URL}/realms/${process.env.NEXT_PUBLIC_KEYCLOAK_REALM}`;
+// Server-side issuer (container-internal hostname, e.g. http://keycloak:8080).
+// Used to fetch the OIDC discovery document, JWKS, and to exchange the
+// authorization code for tokens from the Next.js server (which runs inside the
+// container network and cannot resolve the host's `localhost`).
+const serverIssuer =
+  process.env.KEYCLOAK_ISSUER ??
+  `${process.env.NEXT_PUBLIC_KEYCLOAK_URL}/realms/${process.env.NEXT_PUBLIC_KEYCLOAK_REALM}`;
+
+// Public issuer (host-side URL, e.g. http://localhost:8080). The browser must
+// be redirected to this origin so the user can reach Keycloak from the host.
+const publicIssuer =
+  process.env.KEYCLOAK_ISSUER_PUBLIC ??
+  `${process.env.NEXT_PUBLIC_KEYCLOAK_URL}/realms/${process.env.NEXT_PUBLIC_KEYCLOAK_REALM}`;
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   trustHost: true,
@@ -19,11 +31,14 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       id: "keycloak",
       name: "Keycloak",
       type: "oidc",
-      issuer,
+      // Server-side discovery (container-internal).
+      issuer: serverIssuer,
+      wellKnown: `${serverIssuer}/.well-known/openid-configuration`,
       clientId: process.env.NEXT_PUBLIC_KEYCLOAK_CLIENT_ID,
       clientSecret: process.env.KEYCLOAK_FRONTEND_CLIENT_SECRET ?? "",
-      wellKnown: `${issuer}/.well-known/openid-configuration`,
       authorization: {
+        // Browser-facing authorization endpoint (host-side origin).
+        url: `${publicIssuer}/protocol/openid-connect/auth`,
         params: { scope: "openid email profile" },
       },
       idToken: true,

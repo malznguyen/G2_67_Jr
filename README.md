@@ -2,12 +2,12 @@
 
 <div align="center">
 
-![Build](https://img.shields.io/badge/build-passing-brightgreen?style=for-the-badge&logo=rust)
+![Build](https://img.shields.io/badge/build-unverified-lightgrey?style=for-the-badge&logo=rust)
 ![Version](https://img.shields.io/badge/version-2.0.0--T84D-blue?style=for-the-badge)
 ![Rust](https://img.shields.io/badge/Rust-1.78+-orange?style=for-the-badge&logo=rust)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
-![Status](https://img.shields.io/badge/status-production--ready-success?style=for-the-badge)
+![Status](https://img.shields.io/badge/status--in--development-yellow?style=for-the-badge)
 
 **Hệ thống Hỏi-Đáp Thông Minh đa người dùng thế hệ mới**
 
@@ -21,7 +21,9 @@
 
 ## 📖 Giới thiệu
 
-**GMRAG 2.0** là backend production-ready cho hệ thống RAG (Retrieval-Augmented Generation) thế hệ mới. Dự án tích hợp **đồ thị tri thức (Knowledge Graph)**, kiểm soát quyền truy cập cấp tài liệu theo mô hình **Zanzibar**, và trích xuất **citation chính xác tới từng trang PDF** — tất cả được xây dựng trên nền tảng Rust với hiệu năng cao và độ tin cậy production.
+**GMRAG 2.0** là backend cho hệ thống RAG (Retrieval-Augmented Generation) thế hệ mới. Dự án tích hợp **đồ thị tri thức (Knowledge Graph)**, kiểm soát quyền truy cập cấp tài liệu theo mô hình **Zanzibar**, và trích xuất **citation chính xác tới từng trang PDF** — tất cả được xây dựng trên nền tảng Rust với hiệu năng cao và độ tin cậy.
+
+> Trạng thái: đang phát triển (in-development). Badge build/status chưa được xác thực tự động trong môi trường hiện tại — xem `docs/progress/V2_PHASE_0.md` cho kết quả kiểm tra thực tế.
 
 Phiên bản **T84D** là cột mốc refactor toàn diện: giải quyết các race condition nghiêm trọng, hoàn thiện pipeline ingest với Transactional Outbox Pattern, và bổ sung đầy đủ page metadata cho citation.
 
@@ -32,7 +34,7 @@ Phiên bản **T84D** là cột mốc refactor toàn diện: giải quyết các
 | # | Tính năng | Mô tả |
 |---|-----------|-------|
 | 🕸️ | **GraphRAG** | Tích hợp đồ thị tri thức (graph nodes + edges) vào pipeline RAG, cải thiện chất lượng trả lời nhờ ngữ cảnh quan hệ giữa các thực thể |
-| 🔐 | **Phân quyền ReBAC** | Mô hình Zanzibar-style với relation tuples, kiểm soát quyền truy cập cấp tài liệu và workspace |
+| 🔐 | **Phân quyền ReBAC (OpenFGA)** | Mô hình Zanzibar-style qua OpenFGA (runtime engine duy nhất), relation tuples, kiểm soát quyền truy cập cấp tài liệu và workspace; fail-closed 503 |
 | 📬 | **Ingest Outbox chống mất job** | Transactional Outbox Pattern đảm bảo không mất job khi upload; relay + sweeper tự động recover stuck jobs |
 | 📄 | **Citation chính xác tới trang PDF** | Trích xuất `page_start`/`page_end` cho mỗi chunk; Frontend nhận citation kèm số trang để nhảy trang PDF viewer |
 | 🏢 | **Multi-tenant hoàn chỉnh** | Mỗi tenant có collection Qdrant riêng, RLS PostgreSQL cô lập dữ liệu tuyệt đối |
@@ -54,6 +56,7 @@ Phiên bản **T84D** là cột mốc refactor toàn diện: giải quyết các
 | **LLM (local)** | Ollama | Local inference, `llama3.1:8b` default |
 | **LLM (remote)** | DeepSeek | Remote BYOK (Bring Your Own Key) |
 | **Auth** | OIDC / Keycloak | JWT validation, JWKS endpoint |
+| **Authorization** | OpenFGA v1.18.1 | Zanzibar-style ReBAC, runtime engine duy nhất (Check/ListObjects), fail-closed 503 |
 | **Worker** | Rust binary | `gmrag-worker` — ingest pipeline |
 
 ---
@@ -118,6 +121,56 @@ docker compose -f infra/docker-compose.yml up -d \
 ```
 
 > ⏳ Chờ khoảng 10–15 giây để các service sẵn sàng trước khi tiếp tục.
+
+> ⚠️ **Lưu ý volume reuse:** `infra/postgres/init.sql` chỉ chạy ở lần đầu
+> khởi tạo volume `gmrag-pgdata`. Khi reuse volume, database `openfga` sẽ
+> KHÔNG tồn tại và `openfga-migrate` sẽ fail. Chạy idempotent script
+> `pwsh ./scripts/ensure-openfga-db.ps1` **trước** khi start openfga-migrate
+> (xem Bước 3b).
+
+### Bước 3b — Bootstrap OpenFGA (database + store/model)
+
+Thứ tự chính xác (quan trọng cho fresh clone HOẶC reused volume):
+
+```bash
+# 1. Đảm bảo database `openfga` tồn tại (idempotent — chạy mọi lúc được)
+pwsh ./scripts/ensure-openfga-db.ps1
+
+# 2. Chạy OpenFGA migrations + start OpenFGA
+docker compose -f infra/docker-compose.yml up -d openfga-migrate openfga ollama
+
+# 3. Bootstrap store + authorization model (in ra STORE_ID / MODEL_ID)
+pwsh ./scripts/openfga-bootstrap.ps1
+# → OPENFGA_STORE_ID=01...
+# → OPENFGA_AUTHORIZATION_MODEL_ID=01...
+# Paste 2 ID này vào .env, rồi restart API/worker để pick up.
+```
+
+### Bước 3c — Pull Ollama models (bắt buộc cho indexing + chat)
+
+Ollama ship *empty* — không có model nào được cài sẵn. Không pull thì worker
+embedding call và chat/graph LLM call sẽ 404. One-shot:
+
+```bash
+pwsh ./scripts/setup-ollama.ps1
+# Pull mặc định: nomic-embed-text (bắt buộc) + llama3.1:8b (nếu không có DeepSeek).
+# Nếu set DEEPSEEK_API_KEY trong .env, chat+graph dùng DeepSeek, chỉ cần embed model.
+```
+
+### Bước 3d — Bootstrap Keycloak realm + audience mapper
+
+```bash
+docker cp infra/keycloak/bootstrap.sh gmrag-keycloak:/tmp/bootstrap.sh
+docker exec -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=<pw> \
+  gmrag-keycloak bash /tmp/bootstrap.sh
+# (optional) seed 5 demo users:
+docker cp infra/keycloak/seed-users.sh gmrag-keycloak:/tmp/seed-users.sh
+docker exec -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=<pw> \
+  gmrag-keycloak bash /tmp/seed-users.sh
+```
+
+`bootstrap.sh` tự tạo `aud=gmrag-backend` audience mapper trên backend client
+— không có mapper này, service-account token sẽ bị reject với `InvalidAudience`.
 
 ### Bước 4 — Chạy database migrations
 
@@ -203,7 +256,21 @@ Import vào [Swagger UI](https://editor.swagger.io/) hoặc **Postman** để kh
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Model sinh embedding (768-dim) |
 | `OLLAMA_LLM_MODEL` | `llama3.1:8b` | Model sinh câu trả lời |
 | `DEEPSEEK_API_KEY` | — | Nếu dùng DeepSeek thay vì Ollama |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | Model DeepSeek |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | Model DeepSeek |
+
+### Biến OpenFGA (phân quyền runtime)
+
+| Biến | Default | Mô tả |
+|------|---------|-------|
+| `OPENFGA_API_URL` | — (bắt buộc) | OpenFGA HTTP endpoint (vd: `http://openfga:8080`) |
+| `OPENFGA_STORE_ID` | — (bắt buộc) | ID của OpenFGA store — output của `scripts/openfga-bootstrap.ps1` |
+| `OPENFGA_AUTHORIZATION_MODEL_ID` | — (bắt buộc) | ID của authorization model — output của bootstrap script |
+| `OPENFGA_API_TOKEN` | — | Bearer token cho OpenFGA (nếu bật preshared key) |
+| `OPENFGA_REQUEST_TIMEOUT_MS` | `1500` | Timeout mỗi lệnh Check/ListObjects (ms) |
+| `OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS` | `5` | Cửa sổ nhất quán cao (giây) |
+| `OPENFGA_DATASTORE_URI` | — | Postgres URI cho OpenFGA migrate container |
+| `OPENFGA_HTTP_PORT` | `8089` | Port HTTP của OpenFGA service |
+| `OPENFGA_STORE_NAME` | `gmrag-v2` | Tên store — dùng bởi bootstrap script |
 
 ---
 

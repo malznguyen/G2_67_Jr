@@ -51,8 +51,13 @@ else
 fi
 
 # --- Backend client (confidential, service) -------------------------------
-if "$KC" get "clients?clientId=${BACKEND_CLIENT}" -r "${REALM}" 2>/dev/null | grep -q "\"clientId\""; then
-  echo "[bootstrap] client ${BACKEND_CLIENT} already exists — skipping"
+# Resolves the backend client UUID (creates it if missing) so we can attach
+# protocol mappers regardless of whether the client pre-existed.
+backend_client_id=""
+existing_client=$( "$KC" get "clients?clientId=${BACKEND_CLIENT}" -r "${REALM}" 2>/dev/null || true )
+if echo "$existing_client" | grep -q "\"id\""; then
+  echo "[bootstrap] client ${BACKEND_CLIENT} already exists — skipping create"
+  backend_client_id="$( echo "$existing_client" | tr -d ' ' | grep -o '\"id\":\"[^\"]*\"' | head -1 | cut -d'"' -f4 )"
 else
   echo "[bootstrap] creating client ${BACKEND_CLIENT} (confidential)"
   "$KC" create clients -r "${REALM}" \
@@ -63,6 +68,36 @@ else
     -s "directAccessGrantsEnabled=false" \
     -s "serviceAccountsEnabled=true" \
     -s "secret=${KEYCLOAK_CLIENT_SECRET:-}"
+  backend_client_id="$( "$KC" get "clients?clientId=${BACKEND_CLIENT}" -r "${REALM}" | tr -d ' ' | grep -o '\"id\":\"[^\"]*\"' | head -1 | cut -d'"' -f4 )"
+fi
+
+# --- Audience mapper for gmrag-backend ------------------------------------
+# Without an `aud` claim, service-account tokens issued for ${BACKEND_CLIENT}
+# carry only the client id in `azp` and the API rejects them with
+# InvalidAudience. This mapper forces `aud=gmrag-backend` (configurable
+# via BACKEND_AUDIENCE) so the backend JWT validator accepts the token.
+# Idempotent: re-running finds the existing mapper by name and skips.
+BACKEND_AUDIENCE="${BACKEND_AUDIENCE:-${BACKEND_CLIENT}}"
+mapper_name="aud-gmrag-backend"
+mapper_exists=false
+if [ -n "$backend_client_id" ] && [ "$backend_client_id" != "null" ]; then
+  if "$KC" get "clients/${backend_client_id}/protocol-mappers/models" -r "${REALM}" 2>/dev/null \
+      | grep -q "\"name\":\"${mapper_name}\""; then
+    mapper_exists=true
+  fi
+fi
+if $mapper_exists; then
+  echo "[bootstrap] audience mapper '${mapper_name}' already exists — skipping"
+else
+  echo "[bootstrap] adding audience mapper (aud=${BACKEND_AUDIENCE}) to ${BACKEND_CLIENT}"
+  "$KC" create "clients/${backend_client_id}/protocol-mappers/models" -r "${REALM}" \
+    -s "name=${mapper_name}" \
+    -s "protocol=openid-connect" \
+    -s "protocolMapper=oidc-audience-mapper" \
+    -s 'config."included.client.audience"='"\"${BACKEND_AUDIENCE}\"" \
+    -s 'config."id.token.claim"="false"' \
+    -s 'config."access.token.claim"="true"' \
+    -s 'config."userinfo.token.claim"="false"'
 fi
 
 echo "[bootstrap] done — realm ${REALM} ready"

@@ -143,13 +143,70 @@ impl JwtValidator {
         let entry = self.get_key(&kid).await?;
 
         let mut validation = Validation::new(entry.algorithm);
-        validation.set_issuer(&[&self.issuer_verify]);
-        validation.set_audience(&self.accepted_audiences);
+        validation.set_issuer(&[&self.issuer_verify, &self.issuer]);
+        validation.validate_aud = false;
 
         let token_data: TokenData<JwtClaims> = decode(token, &entry.key, &validation)
             .map_err(|e| AuthError::InvalidToken(format!("validation failed: {e}")))?;
 
+        if !self.audience_or_authorized_party_allowed(&token_data.claims) {
+            return Err(AuthError::InvalidToken(
+                "validation failed: InvalidAudience".to_string(),
+            ));
+        }
+
         Ok(token_data.claims)
+    }
+
+    fn audience_or_authorized_party_allowed(&self, claims: &JwtClaims) -> bool {
+        let mut has_non_default_audience = false;
+
+        if let Some(aud) = &claims.aud {
+            match aud {
+                serde_json::Value::String(aud) => {
+                    if self
+                        .accepted_audiences
+                        .iter()
+                        .any(|accepted| accepted == aud)
+                    {
+                        return true;
+                    }
+                    has_non_default_audience = aud != "account";
+                }
+                serde_json::Value::Array(items) => {
+                    if items.iter().any(|item| {
+                        item.as_str()
+                            .map(|aud| {
+                                self.accepted_audiences
+                                    .iter()
+                                    .any(|accepted| accepted == aud)
+                            })
+                            .unwrap_or(false)
+                    }) {
+                        return true;
+                    }
+                    has_non_default_audience = items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .any(|aud| aud != "account");
+                }
+                _ => {}
+            }
+        }
+
+        if has_non_default_audience {
+            return false;
+        }
+
+        claims
+            .azp
+            .as_deref()
+            .map(|azp| {
+                self.accepted_audiences
+                    .iter()
+                    .any(|accepted| accepted == azp)
+            })
+            .unwrap_or(false)
     }
 
     /// Get a decoding key for the given `kid`, fetching JWKS if needed.

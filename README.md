@@ -103,6 +103,9 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # SQLx CLI
 cargo install sqlx-cli --no-default-features --features postgres
+
+# OpenFGA CLI, required by scripts/openfga-bootstrap.ps1
+# Download/install from: https://github.com/openfga/cli/releases
 ```
 
 ### Bước 2 — Copy & cấu hình môi trường
@@ -117,7 +120,7 @@ cp .env.example .env
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d \
-  postgres qdrant redis minio keycloak
+  postgres16 qdrant redis minio keycloak
 ```
 
 > ⏳ Chờ khoảng 10–15 giây để các service sẵn sàng trước khi tiếp tục.
@@ -262,13 +265,15 @@ Import vào [Swagger UI](https://editor.swagger.io/) hoặc **Postman** để kh
 
 | Biến | Default | Mô tả |
 |------|---------|-------|
-| `OPENFGA_API_URL` | — (bắt buộc) | OpenFGA HTTP endpoint (vd: `http://openfga:8080`) |
+| `OPENFGA_API_URL` | — (bắt buộc) | Host-side OpenFGA HTTP endpoint for bootstrap scripts (vd: `http://localhost:8089`) |
+| `OPENFGA_INTERNAL_API_URL` | `http://openfga:8080` | Docker-internal OpenFGA HTTP endpoint injected into backend/worker |
 | `OPENFGA_STORE_ID` | — (bắt buộc) | ID của OpenFGA store — output của `scripts/openfga-bootstrap.ps1` |
 | `OPENFGA_AUTHORIZATION_MODEL_ID` | — (bắt buộc) | ID của authorization model — output của bootstrap script |
 | `OPENFGA_API_TOKEN` | — | Bearer token cho OpenFGA (nếu bật preshared key) |
 | `OPENFGA_REQUEST_TIMEOUT_MS` | `1500` | Timeout mỗi lệnh Check/ListObjects (ms) |
 | `OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS` | `5` | Cửa sổ nhất quán cao (giây) |
 | `OPENFGA_DATASTORE_URI` | — | Postgres URI cho OpenFGA migrate container |
+| `OPENFGA_DATASTORE_ENGINE` | `postgres` | OpenFGA datastore engine |
 | `OPENFGA_HTTP_PORT` | `8089` | Port HTTP của OpenFGA service |
 | `OPENFGA_STORE_NAME` | `gmrag-v2` | Tên store — dùng bởi bootstrap script |
 

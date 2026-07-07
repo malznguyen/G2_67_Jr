@@ -7,6 +7,30 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Load-DotEnv {
+    param([string]$Path = ".env")
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
+            return
+        }
+
+        $idx = $line.IndexOf("=")
+        $key = $line.Substring(0, $idx).Trim()
+        $value = $line.Substring($idx + 1).Trim().Trim('"').Trim("'")
+        if ($key -and -not [Environment]::GetEnvironmentVariable($key, "Process")) {
+            [Environment]::SetEnvironmentVariable($key, $value, "Process")
+        }
+    }
+}
+
+Load-DotEnv
+
 if (-not $ApiUrl) {
     $ApiUrl = $env:OPENFGA_API_URL
 }

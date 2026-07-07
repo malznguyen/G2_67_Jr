@@ -21,6 +21,7 @@ next-env.d.ts
 # ---------- Env & secrets ----------
 .env
 .env.local
+frontend/.env.local
 .env.*.local
 .env.development
 .env.production

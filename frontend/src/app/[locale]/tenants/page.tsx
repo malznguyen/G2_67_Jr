@@ -271,6 +271,7 @@ export default function TenantsPage() {
             <ErrorState
               kind={errorKind}
               onRetry={() => void refetch()}
+              onSignIn={() => void signOut({ callbackUrl: "/login" })}
               isFetching={isFetching}
             />
           ) : isEmpty ? (
@@ -336,10 +337,12 @@ const ERROR_META: Record<
 function ErrorState({
   kind,
   onRetry,
+  onSignIn,
   isFetching,
 }: {
   kind: FetchErrorKind;
   onRetry: () => void;
+  onSignIn: () => void;
   isFetching: boolean;
 }) {
   const t = useTranslations("tenants.errors");
@@ -373,7 +376,7 @@ function ErrorState({
         {meta.action === "signIn" ? (
           <button
             type="button"
-            onClick={() => onRetry()}
+            onClick={onSignIn}
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[hsl(178,60%,45%)] px-4 text-sm font-semibold text-[hsl(222,40%,8%)] transition hover:bg-[hsl(178,64%,50%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5fdcd0] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
           >
             <ArrowLeft className="h-4 w-4" aria-hidden="true" />

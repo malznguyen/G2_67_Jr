@@ -33,8 +33,15 @@ else
 fi
 
 # --- Frontend client (public PKCE, browser) -------------------------------
-if "$KC" get "clients?clientId=${FRONTEND_CLIENT}" -r "${REALM}" 2>/dev/null | grep -q "\"clientId\""; then
+frontend_client_id=""
+existing_frontend_client=$( "$KC" get "clients?clientId=${FRONTEND_CLIENT}" -r "${REALM}" 2>/dev/null || true )
+if echo "$existing_frontend_client" | grep -q "\"clientId\""; then
   echo "[bootstrap] client ${FRONTEND_CLIENT} already exists — skipping"
+  frontend_client_id="$( echo "$existing_frontend_client" | tr -d ' ' | grep -o '\"id\":\"[^\"]*\"' | head -1 | cut -d'"' -f4 )"
+  "$KC" update "clients/${frontend_client_id}" -r "${REALM}" \
+    -s "publicClient=true" \
+    -s "directAccessGrantsEnabled=false" \
+    -s "serviceAccountsEnabled=false"
 else
   echo "[bootstrap] creating client ${FRONTEND_CLIENT} (public PKCE)"
   "$KC" create clients -r "${REALM}" \
@@ -48,6 +55,33 @@ else
     -s "redirectUris=[\"http://localhost:3000/api/auth/callback/keycloak\",\"http://localhost:3000\",\"http://0.0.0.0:3000/api/auth/callback/keycloak\",\"http://127.0.0.1:3000/api/auth/callback/keycloak\"]" \
     -s "webOrigins=[\"http://localhost:3000\",\"http://0.0.0.0:3000\",\"http://127.0.0.1:3000\"]" \
     -s "attributes={\"post.logout.redirect.uris\":\"http://localhost:3000*\",\"pkce.code.challenge.method\":\"S256\"}"
+  frontend_client_id="$( "$KC" get "clients?clientId=${FRONTEND_CLIENT}" -r "${REALM}" | tr -d ' ' | grep -o '\"id\":\"[^\"]*\"' | head -1 | cut -d'"' -f4 )"
+fi
+
+# --- Audience mapper for gmrag-frontend -----------------------------------
+# Browser login access tokens otherwise carry `aud=account` and only put the
+# frontend client in `azp`. The API validates `aud`, so force
+# `aud=gmrag-frontend` onto tokens minted for the public frontend client.
+frontend_mapper_name="aud-gmrag-frontend"
+frontend_mapper_exists=false
+if [ -n "$frontend_client_id" ] && [ "$frontend_client_id" != "null" ]; then
+  if "$KC" get "clients/${frontend_client_id}/protocol-mappers/models" -r "${REALM}" 2>/dev/null \
+      | tr -d ' ' | grep -q "\"name\":\"${frontend_mapper_name}\""; then
+    frontend_mapper_exists=true
+  fi
+fi
+if $frontend_mapper_exists; then
+  echo "[bootstrap] audience mapper '${frontend_mapper_name}' already exists — skipping"
+else
+  echo "[bootstrap] adding audience mapper (aud=${FRONTEND_CLIENT}) to ${FRONTEND_CLIENT}"
+  "$KC" create "clients/${frontend_client_id}/protocol-mappers/models" -r "${REALM}" \
+    -s "name=${frontend_mapper_name}" \
+    -s "protocol=openid-connect" \
+    -s "protocolMapper=oidc-audience-mapper" \
+    -s 'config."included.client.audience"='"\"${FRONTEND_CLIENT}\"" \
+    -s 'config."id.token.claim"="false"' \
+    -s 'config."access.token.claim"="true"' \
+    -s 'config."userinfo.token.claim"="false"'
 fi
 
 # --- Backend client (confidential, service) -------------------------------
@@ -82,7 +116,7 @@ mapper_name="aud-gmrag-backend"
 mapper_exists=false
 if [ -n "$backend_client_id" ] && [ "$backend_client_id" != "null" ]; then
   if "$KC" get "clients/${backend_client_id}/protocol-mappers/models" -r "${REALM}" 2>/dev/null \
-      | grep -q "\"name\":\"${mapper_name}\""; then
+      | tr -d ' ' | grep -q "\"name\":\"${mapper_name}\""; then
     mapper_exists=true
   fi
 fi

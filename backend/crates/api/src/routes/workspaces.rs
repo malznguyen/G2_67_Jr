@@ -11,6 +11,8 @@
 //! - `PATCH /tenants/{tid}/workspaces/{wid}` — rename a workspace.
 //! - `DELETE /tenants/{tid}/workspaces/{wid}` — delete a workspace (cascade).
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -20,9 +22,17 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::{
+    delete_object_or_unavailable, list_objects_or_unavailable, parsed_uuid_set, workspace_obj,
+    workspace_role_tuple, workspace_tenant_tuple, write_or_unavailable, AuthzService, Consistency,
+    RelationshipTuple, REL_ACCESSOR, TYPE_WORKSPACE,
+};
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::routes::tenants::ensure_path_matches_context;
+use crate::routes::workspace_auth::require_workspace_manager;
+use crate::storage::ObjectStore;
+use crate::vector::VectorCleaner;
 
 #[derive(Serialize, sqlx::FromRow)]
 struct WorkspaceRow {
@@ -52,29 +62,50 @@ pub struct UpdateWorkspaceBody {
     tag = "Workspaces",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Workspace list", body = crate::openapi::schemas::WorkspacesResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn list_workspaces(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
+
+    let objects = list_objects_or_unavailable(
+        &authz,
+        &crate::authz::user_obj(auth_user.user_id),
+        REL_ACCESSOR,
+        TYPE_WORKSPACE,
+        Consistency::MinimizeLatency,
+    )
+    .await?;
+    let (workspace_ids, malformed) = parsed_uuid_set(objects, TYPE_WORKSPACE);
+    if malformed > 0 {
+        tracing::warn!(malformed, "openfga returned malformed workspace object ids");
+    }
+    if workspace_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "workspaces": [] })));
+    }
 
     let mut guard = conn.lock().await;
     let rows = sqlx::query_as::<_, WorkspaceRow>(
         "SELECT id, name, slug, created_by, created_at
          FROM workspaces
+         WHERE id = ANY($1)
          ORDER BY created_at",
     )
+    .bind(&workspace_ids)
     .fetch_all(&mut *guard)
     .await
     .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
@@ -90,7 +121,7 @@ pub async fn list_workspaces(
     tag = "Workspaces",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::CreateWorkspaceRequest,
@@ -98,6 +129,7 @@ pub async fn list_workspaces(
         (status = 201, description = "Workspace created", body = crate::openapi::schemas::CreateWorkspaceResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -106,6 +138,7 @@ pub async fn create_workspace(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<CreateWorkspaceBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
@@ -113,17 +146,32 @@ pub async fn create_workspace(
     let name = body.name.trim();
     let slug = body.slug.trim();
     if name.is_empty() {
-        return Err(ApiError::BadRequest("workspace name must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "workspace name must not be empty".into(),
+        ));
     }
     if slug.is_empty() {
-        return Err(ApiError::BadRequest("workspace slug must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "workspace slug must not be empty".into(),
+        ));
     }
 
     let mut guard = conn.lock().await;
     let row = sqlx::query_as::<_, WorkspaceRow>(
-        "INSERT INTO workspaces (tenant_id, name, slug, created_by)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, slug, created_by, created_at",
+        "WITH inserted_workspace AS (
+             INSERT INTO workspaces (tenant_id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, name, slug, created_by, created_at
+         ),
+         inserted_member AS (
+             INSERT INTO workspace_members (workspace_id, tenant_id, user_id, role)
+             SELECT id, $1, $4, 'owner'
+             FROM inserted_workspace
+             RETURNING workspace_id
+         )
+         SELECT iw.id, iw.name, iw.slug, iw.created_by, iw.created_at
+         FROM inserted_workspace iw
+         JOIN inserted_member im ON im.workspace_id = iw.id",
     )
     .bind(tid)
     .bind(name)
@@ -132,12 +180,25 @@ pub async fn create_workspace(
     .fetch_one(&mut *guard)
     .await
     .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
+    let workspace_id = row.id;
+    let writes = vec![
+        workspace_tenant_tuple(tid, workspace_id),
+        workspace_role_tuple(auth_user.user_id, "owner", workspace_id),
+    ];
+    if let Err(e) = write_or_unavailable(&authz, writes, Vec::new()).await {
+        let _ = sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .execute(&mut *guard)
+            .await;
+        drop(guard);
+        return Err(e);
+    }
     drop(guard);
 
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "id": row.id,
+            "id": workspace_id,
             "name": row.name,
             "slug": row.slug,
             "created_by": row.created_by,
@@ -154,7 +215,7 @@ pub async fn create_workspace(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("wid" = Uuid, Path, description = "Workspace ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::UpdateWorkspaceRequest,
@@ -162,14 +223,18 @@ pub async fn create_workspace(
         (status = 200, description = "Workspace updated", body = crate::openapi::schemas::UpdateWorkspaceResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — workspace manager only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn update_workspace(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<UpdateWorkspaceBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
@@ -177,11 +242,17 @@ pub async fn update_workspace(
     let name = body.name.trim();
     let slug = body.slug.trim();
     if name.is_empty() {
-        return Err(ApiError::BadRequest("workspace name must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "workspace name must not be empty".into(),
+        ));
     }
     if slug.is_empty() {
-        return Err(ApiError::BadRequest("workspace slug must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "workspace slug must not be empty".into(),
+        ));
     }
+
+    require_workspace_manager(&conn, &authz, wid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let updated = sqlx::query("UPDATE workspaces SET name = $1, slug = $2 WHERE id = $3")
@@ -212,23 +283,88 @@ pub async fn update_workspace(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("wid" = Uuid, Path, description = "Workspace ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
         (status = 204, description = "Workspace deleted"),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — workspace manager only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn delete_workspace(
     Path((tid, wid)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
+    Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
+    Extension(cleaner): Extension<Arc<dyn VectorCleaner>>,
+    Extension(object_store): Extension<Arc<dyn ObjectStore>>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
+    require_workspace_manager(&conn, &authz, wid, auth_user.user_id).await?;
+
+    let (document_ids, chat_ids): (Vec<Uuid>, Vec<Uuid>) = {
+        let mut guard = conn.lock().await;
+        let document_ids =
+            sqlx::query_as::<_, (Uuid,)>("SELECT id FROM documents WHERE workspace_id = $1")
+                .bind(wid)
+                .fetch_all(&mut *guard)
+                .await
+                .map_err(|e| ApiError::Internal(format!("load workspace documents: {e}")))?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect();
+        let chat_ids =
+            sqlx::query_as::<_, (Uuid,)>("SELECT id FROM chat_sessions WHERE workspace_id = $1")
+                .bind(wid)
+                .fetch_all(&mut *guard)
+                .await
+                .map_err(|e| ApiError::Internal(format!("load workspace chat sessions: {e}")))?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect();
+        (document_ids, chat_ids)
+    };
+
+    let mut deletes: Vec<RelationshipTuple> = chat_ids
+        .into_iter()
+        .map(|sid| crate::authz::chat_workspace_tuple(wid, sid))
+        .collect();
+    if !deletes.is_empty() {
+        write_or_unavailable(&authz, Vec::new(), std::mem::take(&mut deletes)).await?;
+    }
+    delete_object_or_unavailable(&authz, &workspace_obj(wid)).await?;
+    for document_id in document_ids {
+        delete_object_or_unavailable(&authz, &crate::authz::document_obj(document_id)).await?;
+    }
+
+    // Phase 0 TASK-P0-04: best-effort external cleanup BEFORE the Postgres
+    // cascade delete — Qdrant chunk points for this workspace (filtered by
+    // `workspace_id` payload) and the S3 prefix `{tid}/{wid}/`. Failures are
+    // warn-logged and never block the cascade delete: leaving orphan vectors
+    // because cleanup succeeded is fine; leaving a workspace alive because
+    // cleanup failed is worse. Repeated attempts are harmless (idempotent).
+    if let Err(e) = cleaner.delete_workspace_chunks(tid, wid).await {
+        tracing::warn!(
+            error = %e,
+            tenant_id = %tid,
+            workspace_id = %wid,
+            "qdrant workspace chunk cleanup failed during workspace delete",
+        );
+    }
+    let prefix = format!("{tid}/{wid}/");
+    if let Err(e) = object_store.delete_prefix(&prefix).await {
+        tracing::warn!(
+            error = %e,
+            prefix = %prefix,
+            "s3 prefix delete failed during workspace delete",
+        );
+    }
 
     let mut guard = conn.lock().await;
     let deleted = sqlx::query("DELETE FROM workspaces WHERE id = $1")

@@ -24,9 +24,7 @@ use uuid::Uuid;
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 /// Seed a tenant/workspace/user/document and return their IDs.
-async fn seed_tenant_doc(
-    pool: &PgPool,
-) -> (Uuid, Uuid, Uuid, Uuid) {
+async fn seed_tenant_doc(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
     let tenant = Uuid::new_v4();
     sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
         .bind(tenant)
@@ -71,12 +69,7 @@ async fn seed_tenant_doc(
 
 /// Seed a stuck `ingest_jobs` row: `status='processing'`, `claimed_at` far
 /// in the past (older than the lease), `attempts = initial_attempts`.
-async fn seed_stuck_job(
-    pool: &PgPool,
-    tenant: Uuid,
-    doc: Uuid,
-    initial_attempts: i32,
-) -> Uuid {
+async fn seed_stuck_job(pool: &PgPool, tenant: Uuid, doc: Uuid, initial_attempts: i32) -> Uuid {
     let job_id = Uuid::new_v4();
     // claimed_at set 1 hour ago — well past any reasonable lease.
     sqlx::query(
@@ -93,14 +86,20 @@ async fn seed_stuck_job(
     job_id
 }
 
-async fn job_row(pool: &PgPool, job_id: Uuid) -> (String, i32, Option<String>, Option<chrono::DateTime<chrono::Utc>>) {
-    sqlx::query_as(
-        "SELECT status, attempts, last_error, claimed_at FROM ingest_jobs WHERE id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+async fn job_row(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> (
+    String,
+    i32,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query_as("SELECT status, attempts, last_error, claimed_at FROM ingest_jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 // ─── Test 1: duplicate-requeue (the core Phase 2 bug) ────────────────────
@@ -183,7 +182,10 @@ async fn sweeper_lpush_failure_leaves_row_claimed_for_next_tick(pool: PgPool) {
         claimed_at.is_some(),
         "option (a): claimed_at must be set so the row is not immediately re-eligible"
     );
-    assert_eq!(attempts, 1, "attempts was incremented in the committed claim");
+    assert_eq!(
+        attempts, 1,
+        "attempts was incremented in the committed claim"
+    );
 }
 
 // ─── Test 3: cap-at-sweep — one below cap requeues normally ──────────────
@@ -203,7 +205,10 @@ async fn sweeper_requeues_job_one_below_cap(pool: PgPool) {
     let pushed = q.pushed();
     assert_eq!(pushed.len(), 1, "exactly one LPUSH");
     let payload: IngestJob = serde_json::from_slice(&pushed[0]).expect("deserialize");
-    assert_eq!(payload.attempts, MAX_ATTEMPTS, "payload attempts = row+1 = MAX_ATTEMPTS");
+    assert_eq!(
+        payload.attempts, MAX_ATTEMPTS,
+        "payload attempts = row+1 = MAX_ATTEMPTS"
+    );
 
     let (status, attempts, _err, _claimed) = job_row(&pool, job_id).await;
     assert_eq!(status, "pending");
@@ -229,7 +234,10 @@ async fn sweeper_marks_failed_at_cap_without_pushing(pool: PgPool) {
     assert!(pushed.is_empty(), "zero LPUSH calls for an exhausted job");
 
     let (status, attempts, last_error, claimed_at) = job_row(&pool, job_id).await;
-    assert_eq!(status, "failed", "exhausted job must be marked failed by sweeper");
+    assert_eq!(
+        status, "failed",
+        "exhausted job must be marked failed by sweeper"
+    );
     assert_eq!(
         attempts, MAX_ATTEMPTS as i32,
         "attempts must not be incremented past MAX_ATTEMPTS at sweep-fail"
@@ -240,10 +248,7 @@ async fn sweeper_marks_failed_at_cap_without_pushing(pool: PgPool) {
             .is_some_and(|e| e.contains("exhausted")),
         "last_error must mention exhaustion, got {last_error:?}"
     );
-    assert!(
-        claimed_at.is_none(),
-        "failed job must clear claimed_at"
-    );
+    assert!(claimed_at.is_none(), "failed job must clear claimed_at");
 
     // Document must be marked failed too (no orphan 'processing' doc).
     let doc_st: String = sqlx::query_scalar("SELECT status FROM documents WHERE id = $1")

@@ -4,8 +4,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gmrag_api::openapi::{swagger_router, ApiDoc};
 use tower::ServiceExt;
-use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, SecurityScheme};
+use utoipa::OpenApi;
 
 fn docs_app() -> axum::Router {
     swagger_router()
@@ -92,6 +92,38 @@ async fn paths_populated() {
     );
 }
 
+/// Phase 0 (TASK-P0-05): the OpenAPI document must expose exactly the 35
+/// mounted business/health operations across exactly 25 unique paths, and
+/// every path must carry at least one operation (no empty path items, no
+/// mounted handler missing from the spec).
+#[tokio::test]
+async fn openapi_operation_and_path_counts_exact() {
+    let doc = ApiDoc::openapi();
+    let op_count = count_operations(&doc);
+    assert_eq!(
+        op_count, 35,
+        "expected exactly 35 mounted operations, got {op_count}"
+    );
+
+    let unique_paths = doc.paths.paths.len();
+    assert_eq!(
+        unique_paths, 25,
+        "expected exactly 25 unique API paths, got {unique_paths}"
+    );
+
+    // No path item may be empty (every registered path has at least one
+    // operation) — guards against a mounted handler missing its utoipa
+    // annotation or vice versa.
+    for (path, item) in &doc.paths.paths {
+        let has_op = item.get.is_some()
+            || item.post.is_some()
+            || item.put.is_some()
+            || item.patch.is_some()
+            || item.delete.is_some();
+        assert!(has_op, "OpenAPI path {path} has no operation");
+    }
+}
+
 #[tokio::test]
 async fn tags_present() {
     let doc = ApiDoc::openapi();
@@ -109,9 +141,6 @@ async fn tags_present() {
         "ACL",
         "Metering",
     ] {
-        assert!(
-            tag_names.contains(&expected),
-            "missing tag {expected}"
-        );
+        assert!(tag_names.contains(&expected), "missing tag {expected}");
     }
 }

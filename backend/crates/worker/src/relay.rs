@@ -10,10 +10,11 @@
 //! workers LPUSH the same row).
 
 use anyhow::Context as _;
+use gmrag_core::status::ingest_outbox as outbox_status;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::queue::{INGEST_JOBS_KEY, JobQueue};
+use crate::queue::{JobQueue, INGEST_JOBS_KEY};
 
 /// Default batch size per relay pass.
 pub const DEFAULT_BATCH_SIZE: i64 = 100;
@@ -25,11 +26,8 @@ pub const DEFAULT_BATCH_SIZE: i64 = 100;
 /// is the sanctioned relay exception — see `lib.rs`), then for each row:
 ///   1. `queue.lpush(INGEST_JOBS_KEY, payload)`
 ///   2. `UPDATE ingest_outbox SET status='dispatched', dispatched_at=now()`
-/// `COMMIT`. Returns the number of rows dispatched.
-pub async fn relay_outbox_once(
-    pool: &PgPool,
-    queue: &mut dyn JobQueue,
-) -> anyhow::Result<usize> {
+///   3. `COMMIT`. Returns the number of rows dispatched.
+pub async fn relay_outbox_once(pool: &PgPool, queue: &mut dyn JobQueue) -> anyhow::Result<usize> {
     relay_outbox_once_with_limit(pool, queue, DEFAULT_BATCH_SIZE).await
 }
 
@@ -43,12 +41,13 @@ pub async fn relay_outbox_once_with_limit(
         r#"
         SELECT id, payload
         FROM ingest_outbox
-        WHERE status = 'pending'
+        WHERE status = $1
         ORDER BY created_at
-        LIMIT $1
+        LIMIT $2
         FOR UPDATE SKIP LOCKED
         "#,
     )
+    .bind(outbox_status::PENDING)
     .bind(limit)
     .fetch_all(&mut *tx)
     .await
@@ -64,10 +63,11 @@ pub async fn relay_outbox_once_with_limit(
         sqlx::query(
             r#"
             UPDATE ingest_outbox
-            SET status = 'dispatched', dispatched_at = now()
-            WHERE id = $1
+            SET status = $1, dispatched_at = now()
+            WHERE id = $2
             "#,
         )
+        .bind(outbox_status::DISPATCHED)
         .bind(id)
         .execute(&mut *tx)
         .await

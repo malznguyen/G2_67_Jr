@@ -10,6 +10,10 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "vector"; -- pgvector; installed if image supports it; no-op otherwise
 
+-- OpenFGA uses a separate logical database in the same local Postgres service.
+SELECT 'CREATE DATABASE openfga OWNER gmrag'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'openfga')\gexec
+
 -- Application role (least privilege for runtime)
 DO $$
 BEGIN

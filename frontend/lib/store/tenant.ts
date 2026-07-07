@@ -5,12 +5,9 @@ import { persist } from "zustand/middleware";
 
 import { client } from "@/lib/api/client";
 import { setActiveTenantResolver } from "@/lib/api/tenant-resolver";
+import type { components } from "@/lib/api/schema";
 
-export interface TenantMembership {
-  id: string;
-  name: string;
-  role: "owner" | "member";
-}
+export type TenantMembership = components["schemas"]["UserTenantMembership"];
 
 interface TenantState {
   tenants: TenantMembership[];

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::AuthzService;
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::routes::tenants::{ensure_path_matches_context, require_owner};
@@ -64,7 +65,7 @@ struct AuditLogRow {
     tag = "Metering",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -72,6 +73,7 @@ struct AuditLogRow {
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -80,9 +82,10 @@ pub async fn get_usage(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let rows = sqlx::query_as::<_, UsageMetricRow>(
@@ -110,7 +113,7 @@ pub async fn get_usage(
     tag = "Metering",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -118,6 +121,7 @@ pub async fn get_usage(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -126,9 +130,10 @@ pub async fn get_quotas(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let row = sqlx::query_as::<_, QuotaRow>(
@@ -173,7 +178,7 @@ pub async fn get_quotas(
     tag = "Metering",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -181,6 +186,7 @@ pub async fn get_quotas(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -189,9 +195,10 @@ pub async fn get_audit_logs(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let rows = sqlx::query_as::<_, AuditLogRow>(

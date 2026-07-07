@@ -16,6 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 gmrag-core = { path = "../core" }
+# Phase 3: the drift reconciler reuses the OpenFGA `AuthorizationService`
+# trait + `OpenFgaAuthorizationService` + the shared tuple-derivation logic,
+# all of which live in gmrag-api. acyclic (api→core only), maximizes reuse
+# of openfga_backfill's tuple derivation instead of duplicating it.
+gmrag-api = { path = "../api" }
 
 tokio.workspace = true
 sqlx.workspace = true
@@ -26,9 +31,12 @@ anyhow.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
+prometheus.workspace = true
 
 dotenvy.workspace = true
 uuid.workspace = true
+chrono.workspace = true
+axum.workspace = true
 
 # T42: build PointStruct/Payload for dual-write upserts.
 qdrant-client.workspace = true

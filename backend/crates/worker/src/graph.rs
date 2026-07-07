@@ -64,7 +64,8 @@ pub enum GraphExtractError {
     Decrypt(String),
 }
 
-type ExFuture<'a> = Pin<Box<dyn Future<Output = Result<GraphExtraction, GraphExtractError>> + Send + 'a>>;
+type ExFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GraphExtraction, GraphExtractError>> + Send + 'a>>;
 
 /// Trait abstracting graph extractors so the worker can swap LLM backends.
 pub trait GraphExtractor: Send + Sync {
@@ -128,8 +129,14 @@ impl DeepSeekGraphExtractor {
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
-                ChatMessage { role: "system", content: SYSTEM_PROMPT },
-                ChatMessage { role: "user", content: user_text },
+                ChatMessage {
+                    role: "system",
+                    content: SYSTEM_PROMPT,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: user_text,
+                },
             ],
             stream: false,
             response_format: ResponseFormat { fmt: "json_object" },
@@ -215,8 +222,8 @@ pub fn parse_graph_json(raw: &str) -> Result<GraphExtraction, GraphExtractError>
     let candidate = extract_json_object(trimmed)
         .ok_or_else(|| GraphExtractError::Parse("no JSON object found in completion".into()))?;
 
-    let parsed: RawExtraction = serde_json::from_str(candidate)
-        .map_err(|e| GraphExtractError::Parse(format!("{e}")))?;
+    let parsed: RawExtraction =
+        serde_json::from_str(candidate).map_err(|e| GraphExtractError::Parse(format!("{e}")))?;
 
     Ok(GraphExtraction {
         nodes: parsed.nodes,
@@ -365,9 +372,12 @@ fn resolve_graph_api_key(
 ) -> Result<Option<String>, GraphExtractError> {
     match (ciphertext, nonce) {
         (Some(ct), Some(n)) => {
-            let key = enc_key.ok_or_else(|| GraphExtractError::Decrypt(
-                "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured".into(),
-            ))?;
+            let key = enc_key.ok_or_else(|| {
+                GraphExtractError::Decrypt(
+                    "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured"
+                        .into(),
+                )
+            })?;
             let decrypted = gmrag_core::crypto::decrypt_with_aad(ct, n, key, tenant_id.as_bytes())
                 .map_err(|e| GraphExtractError::Decrypt(e.to_string()))?;
             Ok(Some(decrypted))
@@ -375,7 +385,9 @@ fn resolve_graph_api_key(
         (None, None) => Ok(plaintext_key
             .filter(|v| !v.trim().is_empty())
             .map(|s| s.to_string())),
-        _ => Err(GraphExtractError::Decrypt("encrypted key pair is incomplete (one field NULL)".into())),
+        _ => Err(GraphExtractError::Decrypt(
+            "encrypted key pair is incomplete (one field NULL)".into(),
+        )),
     }
 }
 
@@ -462,7 +474,10 @@ mod tests {
             .await;
 
         let ext = extractor_at(&server);
-        let out = ext.extract("Alice works at Acme.").await.expect("extract ok");
+        let out = ext
+            .extract("Alice works at Acme.")
+            .await
+            .expect("extract ok");
         assert_eq!(out.nodes.len(), 2);
         assert_eq!(out.nodes[0].label, "Alice");
         assert_eq!(out.nodes[0].kind, "Person");
@@ -484,7 +499,10 @@ mod tests {
             .await;
 
         let ext = extractor_at(&server);
-        let out = ext.extract("Rust is a language.").await.expect("extract ok");
+        let out = ext
+            .extract("Rust is a language.")
+            .await
+            .expect("extract ok");
         assert_eq!(out.nodes.len(), 1);
         assert_eq!(out.nodes[0].label, "Rust");
         assert!(out.edges.is_empty());
@@ -512,9 +530,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(completion_body(
-                r#"{"nodes":[],"edges":[]}"#,
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(completion_body(r#"{"nodes":[],"edges":[]}"#)),
+            )
             .mount(&server)
             .await;
 

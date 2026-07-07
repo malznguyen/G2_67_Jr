@@ -156,19 +156,18 @@ pub async fn dual_write_ingestion(
             "page_end":   if text.page_end   > 0 { Some(text.page_end)   } else { None },
         }))
         .map_err(|e| IngestError::Qdrant(e.to_string()))?;
-        chunk_points.push(PointStruct::new(point_id.to_string(), vector.clone(), payload));
+        chunk_points.push(PointStruct::new(
+            point_id.to_string(),
+            vector.clone(),
+            payload,
+        ));
     }
 
     // 2. Upsert graph_nodes (idempotent on (tenant_id, workspace_id, label, kind)).
     let mut node_ids = Vec::with_capacity(input.extraction.nodes.len());
     let mut label_to_id: HashMap<String, Uuid> = HashMap::new();
     let mut node_points = Vec::with_capacity(input.extraction.nodes.len());
-    for (node, vector) in input
-        .extraction
-        .nodes
-        .iter()
-        .zip(input.node_vectors.iter())
-    {
+    for (node, vector) in input.extraction.nodes.iter().zip(input.node_vectors.iter()) {
         let row_id: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO graph_nodes (tenant_id, workspace_id, kind, label, properties)
@@ -187,9 +186,7 @@ pub async fn dual_write_ingestion(
         .await?;
         let node_id = row_id.0;
         node_ids.push(node_id);
-        label_to_id
-            .entry(node.label.clone())
-            .or_insert(node_id);
+        label_to_id.entry(node.label.clone()).or_insert(node_id);
 
         // T84D Phase 2.1 — record graph provenance: a node is shared across
         // documents, so this node↔document link is what lets the retrieval
@@ -213,7 +210,11 @@ pub async fn dual_write_ingestion(
             "entity_name": node.label,
         }))
         .map_err(|e| IngestError::Qdrant(e.to_string()))?;
-        node_points.push(PointStruct::new(node_id.to_string(), vector.clone(), payload));
+        node_points.push(PointStruct::new(
+            node_id.to_string(),
+            vector.clone(),
+            payload,
+        ));
     }
 
     // 3. Sync Qdrant BEFORE committing Postgres — on failure, rollback.

@@ -4,9 +4,9 @@ import { useQuery } from "@tanstack/react-query";
 
 import { client } from "@/lib/api/client";
 import { useTenantStore } from "@/lib/store/tenant";
-import type { components_schemas } from "@/lib/api/schema";
+import type { components } from "@/lib/api/schema";
 
-type DocumentsResponse = components_schemas["DocumentsResponse"];
+type DocumentsResponse = components["schemas"]["DocumentsResponse"];
 export type DocumentItem = DocumentsResponse["documents"][number];
 
 export const documentsKeys = {
@@ -34,7 +34,11 @@ export function useDocuments(tid: string | undefined, wid: string | undefined) {
     async queryFn(): Promise<DocumentsResponse> {
       if (!resolvedTid || !wid) throw new Error("missing tenant or workspace id");
       const { data, error } = await client.GET("/tenants/{tid}/documents", {
-        params: { path: { tid: resolvedTid }, query: { workspace_id: wid } },
+        params: {
+          path: { tid: resolvedTid },
+          query: { workspace_id: wid },
+          header: { "X-Tenant-ID": resolvedTid },
+        },
       });
       if (error || !data) {
         throw error ?? new Error("fetch documents: no data");

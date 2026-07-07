@@ -11,9 +11,10 @@ const intlMiddleware = createIntlMiddleware({
   localeDetection: true,
 });
 
-// Routes that require an authenticated session. Tenant/workspace app shell.
+// Routes that require an authenticated session. The tenant picker (`/tenants`)
+// and the tenant/workspace app shell (`/t/...`) are both auth-gated.
 const PROTECTED_PATTERN =
-  /^\/(?:[a-z]{2}\/)?t\/(?:[^/]+)(?:\/w\/(?:[^/]+))?(?:\/.*)?$/;
+  /^\/(?:[a-z]{2}\/)?(?:tenants(?:\/.*)?|t\/(?:[^/]+)(?:\/w\/(?:[^/]+))?(?:\/.*)?)$/;
 
 function localeOf(pathname: string): string {
   const seg = pathname.split("/")[1];

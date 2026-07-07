@@ -67,7 +67,11 @@ async fn ingest_jobs_has_status_and_attempts_defaults(pool: PgPool) {
     .await
     .unwrap();
     assert!(
-        status_default.0.as_deref().unwrap_or("").contains("pending"),
+        status_default
+            .0
+            .as_deref()
+            .unwrap_or("")
+            .contains("pending"),
         "ingest_jobs.status must default to 'pending'"
     );
 

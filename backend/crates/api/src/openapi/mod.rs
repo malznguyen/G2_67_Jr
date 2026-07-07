@@ -39,7 +39,7 @@ impl Modify for SecurityAddon {
         title = "GMRAG API",
         version = "0.1.0",
         description = "GMRAG 2.0 HTTP API. Authenticated routes require `Authorization: Bearer <JWT>`. \
-            Tenant-scoped routes under `/tenants/{tid}/...` also require header `X-Tenant-Id` \
+            Tenant-scoped routes under `/tenants/{tid}/...` also require header `X-Tenant-ID` \
             matching the path `{tid}`. List endpoints return full result sets (no pagination) \
             unless noted."
     ),
@@ -96,6 +96,7 @@ impl Modify for SecurityAddon {
         UpdateTenantResponse,
         TenantMemberItem,
         TenantMembersResponse,
+        TenantMemberRole,
         InviteMemberRequest,
         InviteMemberResponse,
         WorkspaceItem,
@@ -106,6 +107,7 @@ impl Modify for SecurityAddon {
         UpdateWorkspaceResponse,
         WorkspaceMemberItem,
         WorkspaceMembersResponse,
+        WorkspaceMemberRole,
         AddWorkspaceMemberRequest,
         AddWorkspaceMemberResponse,
         DocumentVisibility,
@@ -151,7 +153,7 @@ impl Modify for SecurityAddon {
         (name = "Workspaces", description = "Workspace CRUD within a tenant"),
         (name = "WorkspaceMembers", description = "Workspace membership"),
         (name = "Documents", description = "Document upload, list, preview, delete"),
-        (name = "ACL", description = "ReBAC resource sharing grants"),
+        (name = "ACL", description = "OpenFGA-backed resource sharing grants"),
         (name = "Chat", description = "Chat sessions and RAG SSE streaming"),
         (name = "Graph", description = "Workspace knowledge graph"),
         (name = "Settings", description = "Tenant LLM / BYOK configuration"),
@@ -197,8 +199,8 @@ mod tests {
             })
             .sum();
         assert!(
-            op_count >= 34,
-            "expected at least 34 operations, got {op_count}"
+            op_count == 35,
+            "expected exactly 35 mounted operations, got {op_count}"
         );
     }
 

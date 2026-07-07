@@ -18,9 +18,19 @@ async fn documents_table_exists_with_expected_columns(pool: PgPool) {
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
     for required in [
-        "id", "tenant_id", "workspace_id", "owner_id", "title", "status",
-        "visibility", "share_token", "mime_type", "byte_size", "s3_key",
-        "created_at", "updated_at",
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "owner_id",
+        "title",
+        "status",
+        "visibility",
+        "share_token",
+        "mime_type",
+        "byte_size",
+        "s3_key",
+        "created_at",
+        "updated_at",
     ] {
         assert!(
             names.contains(&required.to_string()),
@@ -50,8 +60,14 @@ async fn document_chunks_table_has_qdrant_point_id(pool: PgPool) {
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
     for required in [
-        "id", "tenant_id", "document_id", "chunk_index", "content",
-        "qdrant_point_id", "token_count", "created_at",
+        "id",
+        "tenant_id",
+        "document_id",
+        "chunk_index",
+        "content",
+        "qdrant_point_id",
+        "token_count",
+        "created_at",
     ] {
         assert!(
             names.contains(&required.to_string()),

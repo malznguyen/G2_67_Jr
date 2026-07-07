@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper around [`gmrag_worker::run`]; only sets up tracing.
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -5,7 +5,8 @@
     "cancel": "Huỷ",
     "confirm": "Xác nhận",
     "close": "Đóng",
-    "back": "Quay lại"
+    "back": "Quay lại",
+    "retry": "Thử lại"
   },
   "auth": {
     "signInTitle": "GMRAG2",
@@ -13,7 +14,24 @@
     "signInWithKeycloak": "Đăng nhập bằng Keycloak",
     "signOut": "Đăng xuất",
     "signedInAs": "Đã đăng nhập với tư cách {email}",
-    "unauthenticated": "Bạn chưa đăng nhập."
+    "unauthenticated": "Bạn chưa đăng nhập.",
+    "redirecting": "Đang chuyển hướng…",
+    "secureNote": "Đăng nhập qua Single Sign-On của tổ chức. Phiên làm việc được mã hoá end-to-end.",
+    "welcomeBack": "Đăng nhập hệ tri thức đồ thị",
+    "welcomeBody": "Nền tảng GraphRAG đa tổ chức — phân quyền theo tổ chức, đồ thị tri thức cho doanh nghiệp.",
+    "errors": {
+      "Configuration": "Lỗi cấu hình ở máy chủ xác thực. Vui lòng liên hệ quản trị viên.",
+      "AccessDenied": "Bạn không có quyền truy cập. Liên hệ quản trị viên tổ chức nếu cần.",
+      "Verification": "Liên kết đăng nhập đã hết hạn. Vui lòng thử lại.",
+      "OAuthSignin": "Không thể kết nối tới máy chủ xác thực. Thử lại sau ít phút.",
+      "OAuthCallback": "Đăng nhập thất bại khi nhận phản hồi từ máy chủ xác thực. Thử lại.",
+      "OAuthCreateAccount": "Không thể tạo tài khoản từ máy chủ xác thực.",
+      "EmailCreateAccount": "Không thể tạo tài khoản với email này.",
+      "Callback": "Đường dẫn đăng nhập không hợp lệ hoặc đã hết hạn. Thử lại.",
+      "AccountNotFound": "Tài khoản chưa được cấp phép trên hệ thống này.",
+      "Default": "Đăng nhập không thành công. Vui lòng thử lại.",
+      "default": "Đăng nhập không thành công. Vui lòng thử lại."
+    }
   },
   "nav": {
     "documents": "Tài liệu",
@@ -25,6 +43,58 @@
   "tenant": {
     "switch": "Chuyển tổ chức",
     "none": "Chưa có tổ chức"
+  },
+  "tenants": {
+    "kicker": "Chọn tổ chức",
+    "title": "Tổ chức của bạn",
+    "subtitle": "Chọn một tổ chức để làm việc. Quyền hạn của bạn trong từng tổ chức được hiển thị bên dưới.",
+    "loading": "Đang tải danh sách tổ chức…",
+    "skeleton": "Đang lấy dữ liệu phân quyền",
+    "listHeader": "Tổ chức",
+    "listHeaderRole": "Vai trò",
+    "select": "Truy cập",
+    "selecting": "Đang mở…",
+    "selected": "Đang hoạt động",
+    "signedInAs": "Đăng nhập bằng {email}",
+    "signOut": "Đăng xuất",
+    "roles": {
+      "owner": "Chủ sở hữu",
+      "admin": "Quản trị viên",
+      "member": "Thành viên"
+    },
+    "roleHint": {
+      "owner": "Quyền cao nhất — xoá tổ chức, mời thành viên.",
+      "admin": "Quản trị viên — phân quyền thành viên.",
+      "member": "Thành viên — truy cập Tài liệu, Trò chuyện, Đồ thị tri thức."
+    },
+    "create": {
+      "cta": "Tạo tổ chức mới",
+      "heading": "Chưa có tổ chức nào",
+      "description": "Tài khoản của bạn chưa thuộc tổ chức nào. Hãy tạo tổ chức đầu tiên để bắt đầu tải tài liệu và xây dựng đồ thị tri thức.",
+      "action": "Tạo tổ chức đầu tiên",
+      "openForm": "Tạo tổ chức khác",
+      "label": "Tên tổ chức",
+      "placeholder": "VD: Phòng pháp chế — Crawl nội bộ",
+      "submit": "Tạo tổ chức",
+      "submitting": "Đang tạo…",
+      "cancel": "Huỷ",
+      "errorNameRequired": "Vui lòng nhập tên tổ chức.",
+      "errorTaken": "Tên tổ chức đã tồn tại.",
+      "errorGeneric": "Không thể tạo tổ chức. Vui lòng thử lại."
+    },
+    "errors": {
+      "networkTitle": "Mất kết nối tới máy chủ",
+      "networkBody": "Không thể kết nối tới GMRAG2. Kiểm tra mạng rồi thử lại.",
+      "unauthorizedTitle": "Phiên đăng nhập hết hạn",
+      "unauthorizedBody": "Phiên của bạn đã hết hạn hoặc không hợp lệ. Đăng nhập lại để tiếp tục.",
+      "unauthorizedAction": "Đăng nhập lại",
+      "forbiddenTitle": "Không có quyền truy cập",
+      "forbiddenBody": "Tài khoản chưa được cấp quyền truy cập. Liên hệ quản trị viên tổ chức.",
+      "serverTitle": "Máy chủ đang gặp sự cố",
+      "serverBody": "GMRAG2 tạm thời không khả dụng. Thử lại sau ít phút.",
+      "unknownTitle": "Không thể tải danh sách tổ chức",
+      "unknownBody": "Đã có lỗi xảy ra khi tải dữ liệu. Thử lại hoặc đăng nhập lại."
+    }
   },
   "language": {
     "label": "Ngôn ngữ",

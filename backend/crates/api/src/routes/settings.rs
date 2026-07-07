@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::AuthzService;
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::routes::chat::LlmRuntime;
@@ -69,7 +70,7 @@ struct TenantLlmConfigRow {
     tag = "Settings",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -77,6 +78,7 @@ struct TenantLlmConfigRow {
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -85,10 +87,11 @@ pub async fn get_llm_settings(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Extension(llm_runtime): Extension<LlmRuntime>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let row = sqlx::query_as::<_, TenantLlmConfigRow>(
@@ -144,7 +147,7 @@ pub async fn get_llm_settings(
     tag = "Settings",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::PutLlmSettingsRequest,
@@ -153,6 +156,7 @@ pub async fn get_llm_settings(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -161,11 +165,12 @@ pub async fn put_llm_settings(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Extension(llm_runtime): Extension<LlmRuntime>,
     Json(body): Json<PutLlmSettingsBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let provider = body.provider.trim();
     if provider != PROVIDER_OLLAMA && provider != PROVIDER_OPENAI {
@@ -227,9 +232,8 @@ pub async fn put_llm_settings(
                             .into(),
                     )
                 })?;
-            let (ct, n) = encrypt_with_aad(key, enc_key, tid.as_bytes()).map_err(|_| {
-                ApiError::Internal("failed to encrypt tenant API key".into())
-            })?;
+            let (ct, n) = encrypt_with_aad(key, enc_key, tid.as_bytes())
+                .map_err(|_| ApiError::Internal("failed to encrypt tenant API key".into()))?;
             (Some(ct), Some(n))
         }
         None => (None, None),
@@ -276,6 +280,7 @@ pub async fn put_llm_settings(
         Extension(ctx),
         Extension(auth_user),
         Extension(conn),
+        Extension(authz),
         Extension(llm_runtime),
     )
     .await
@@ -319,7 +324,14 @@ fn mask_api_key(key: &str) -> String {
     if trimmed.len() <= 4 {
         return "***".to_string();
     }
-    let suffix: String = trimmed.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let suffix: String = trimmed
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     if trimmed.starts_with("sk-") {
         format!("sk-***{suffix}")
     } else {

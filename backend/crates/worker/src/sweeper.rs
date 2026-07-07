@@ -42,7 +42,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::job::MAX_ATTEMPTS;
-use crate::queue::{INGEST_JOBS_KEY, JobQueue};
+use crate::queue::{JobQueue, INGEST_JOBS_KEY};
 
 /// Default lease: a job whose `claimed_at` is older than 15 minutes is
 /// considered stuck (its owning worker is presumed dead).
@@ -107,10 +107,7 @@ pub async fn requeue_stuck_jobs_with_limit(
     // already locked by another tx.
     let mut tx = pool.begin().await.context("begin sweep tx")?;
 
-    let rows: Vec<StuckRow> = sqlx::query_as::<
-        _,
-        (Uuid, Uuid, Uuid, i32),
-    >(
+    let rows: Vec<StuckRow> = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i32)>(
         r#"
         SELECT id, document_id, tenant_id, attempts
         FROM ingest_jobs
@@ -188,28 +185,28 @@ pub async fn requeue_stuck_jobs_with_limit(
         // Re-fetch the document row scoped by tenant_id (RLS-enforced if the
         // admin role ever drops, but admin_pool bypasses RLS here by design —
         // the WHERE clause scopes manually).
-        let doc: Option<DocRow> = sqlx::query_as::<
-            _,
-            (Option<String>, Uuid, Uuid, String, String),
-        >(
-            r#"
+        let doc: Option<DocRow> =
+            sqlx::query_as::<_, (Option<String>, Uuid, Uuid, String, String)>(
+                r#"
             SELECT s3_key, workspace_id, owner_id, visibility, title
             FROM documents
             WHERE id = $1 AND tenant_id = $2
             "#,
-        )
-        .bind(row.document_id)
-        .bind(row.tenant_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("fetch document for sweeper")?
-        .map(|(s3_key, workspace_id, owner_id, visibility, title)| DocRow {
-            s3_key: s3_key.unwrap_or_default(),
-            workspace_id,
-            owner_id,
-            visibility,
-            title,
-        });
+            )
+            .bind(row.document_id)
+            .bind(row.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("fetch document for sweeper")?
+            .map(
+                |(s3_key, workspace_id, owner_id, visibility, title)| DocRow {
+                    s3_key: s3_key.unwrap_or_default(),
+                    workspace_id,
+                    owner_id,
+                    visibility,
+                    title,
+                },
+            );
 
         let Some(doc) = doc else {
             // Document deleted before the sweeper noticed — drop the job.

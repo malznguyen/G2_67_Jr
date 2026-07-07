@@ -29,9 +29,7 @@ pub trait OcrClient: Send + Sync {
     fn ocr_image<'a>(
         &'a self,
         image_bytes: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>>;
 }
 
 /// Errors emitted by OCR clients.
@@ -121,11 +119,9 @@ impl OllamaVisionOcr {
 
         let mut last_error: Option<OcrError> = None;
         for attempt in 0..=self.retries {
-            let result = tokio::time::timeout(
-                self.timeout,
-                self.client.post(&self.url).json(&body).send(),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(self.timeout, self.client.post(&self.url).json(&body).send())
+                    .await;
 
             let outcome: Result<String, OcrError> = match result {
                 Ok(Ok(resp)) => match resp.error_for_status() {
@@ -166,9 +162,8 @@ impl OcrClient for OllamaVisionOcr {
     fn ocr_image<'a>(
         &'a self,
         image_bytes: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>>
+    {
         Box::pin(async move { self.ocr_with_retry(image_bytes).await })
     }
 }
@@ -198,9 +193,8 @@ impl OcrClient for MockOcr {
     fn ocr_image<'a>(
         &'a self,
         _image_bytes: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>>
+    {
         let text = self.text.clone();
         Box::pin(async move { Ok(text) })
     }
@@ -214,9 +208,8 @@ impl OcrClient for NoOcr {
     fn ocr_image<'a>(
         &'a self,
         _image_bytes: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, OcrError>> + Send + 'a>>
+    {
         Box::pin(async {
             panic!("NoOcr::ocr_image called — OCR should not have been invoked for this page")
         })
@@ -226,9 +219,9 @@ impl OcrClient for NoOcr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use serde_json::json;
 
     fn ocr_at(server: &MockServer) -> OllamaVisionOcr {
         OllamaVisionOcr::new_with_url(&server.uri(), "moondream:1.8b")
@@ -242,15 +235,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "moondream:1.8b",
-                    "message": {
-                        "role": "assistant",
-                        "content": "This is extracted OCR text."
-                    }
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "moondream:1.8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "This is extracted OCR text."
+                }
+            })))
             .mount(&server)
             .await;
 
@@ -267,18 +258,15 @@ mod tests {
         let server = MockServer::start().await;
         // Match that the request body contains an "images" array with
         // a base64 string (the encoded fake-png-bytes).
-        let expected_b64 =
-            base64::engine::general_purpose::STANDARD.encode(b"fake-png-bytes");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"fake-png-bytes");
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_partial_json(json!({
                 "messages": [{"images": [expected_b64]}]
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "message": {"role": "assistant", "content": "ok"}
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "ok"}
+            })))
             .mount(&server)
             .await;
 
@@ -301,19 +289,14 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "message": {"role": "assistant", "content": "recovered"}
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "recovered"}
+            })))
             .mount(&server)
             .await;
 
         let ocr = ocr_at(&server);
-        let text = ocr
-            .ocr_image(b"img")
-            .await
-            .expect("retry must succeed");
+        let text = ocr.ocr_image(b"img").await.expect("retry must succeed");
         assert_eq!(text, "recovered");
     }
 
@@ -333,10 +316,7 @@ mod tests {
             .await;
 
         let ocr = ocr_at(&server).with_retries(0).with_timeout_secs(1);
-        let err = ocr
-            .ocr_image(b"img")
-            .await
-            .expect_err("must time out");
+        let err = ocr.ocr_image(b"img").await.expect_err("must time out");
         assert!(matches!(err, OcrError::Timeout(_)), "got {err:?}");
     }
 
@@ -345,11 +325,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "message": {"content": ""}
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": ""}
+            })))
             .mount(&server)
             .await;
 

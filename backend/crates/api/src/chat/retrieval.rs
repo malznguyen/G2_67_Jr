@@ -9,6 +9,10 @@ use sqlx::PgConnection;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::authz::{
+    check_or_unavailable, list_objects_or_unavailable, parsed_uuid_set, user_obj, workspace_obj,
+    AuthzService, CheckRequest, Consistency, REL_ACCESSOR, REL_VIEWER, TYPE_DOCUMENT,
+};
 use crate::llm::byok::{resolve_llm_config, ByokError};
 use crate::llm::provider::{DeepSeekProvider, LlmError, LlmProvider};
 
@@ -97,6 +101,8 @@ pub enum RetrievalError {
     InvalidPointId,
     #[error("metering error: {0}")]
     Metering(String),
+    #[error("authorization unavailable: {0}")]
+    Authorization(String),
 }
 
 impl From<sqlx::Error> for RetrievalError {
@@ -111,80 +117,98 @@ impl From<gmrag_core::Error> for RetrievalError {
     }
 }
 
-/// Document ids the user may read within a workspace (ReBAC viewer relation).
+/// Document ids the user may read within a workspace (OpenFGA `viewer` relation).
 ///
-/// This is the set-compiled form of [`crate::rbac::check::check_relation`]`
-/// `(document, viewer, user)` so the filter stays a single indexed query
-/// instead of an N+1 per-document Check. A document is accessible iff the
-/// caller holds the `viewer` relation on it (T83/C1/C5):
-/// - `visibility = 'shared'` (publicly readable in the tenant), or
-/// - the caller is the owner (`owner_id`), or
-/// - the caller is a member of the document's workspace (inheritance), or
-/// - the caller is the recipient of a `resource_acl` grant — directly or via
-///   a workspace-group share — with `permission IN ('owner','editor','viewer')`.
+/// Calls OpenFGA's `ListObjects(user, viewer, document)` to get the set of
+/// document ids the caller may view (see `infra/openfga/model.fga`): the
+/// `viewer` relation is true when `visibility = 'shared'` (tenant-wide
+/// share), the caller is the owner, the caller is a member of the document's
+/// workspace (inheritance), or the caller holds a direct or workspace-userset
+/// `viewer`/`editor` grant. The returned ids are then intersected with a
+/// tenant/workspace-scoped SQL query so OpenFGA results that are stale,
+/// malformed, or reference a document outside the current workspace/tenant
+/// are discarded rather than trusted directly (defense in depth on top of
+/// PostgreSQL RLS).
 pub async fn accessible_document_ids(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     workspace_id: Uuid,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>, RetrievalError> {
+    let objects = list_objects_or_unavailable(
+        authz,
+        &user_obj(user_id),
+        REL_VIEWER,
+        TYPE_DOCUMENT,
+        Consistency::MinimizeLatency,
+    )
+    .await
+    .map_err(|e| RetrievalError::Authorization(e.to_string()))?;
+    let (document_ids, malformed) = parsed_uuid_set(objects, TYPE_DOCUMENT);
+    if malformed > 0 {
+        tracing::warn!(
+            malformed,
+            workspace_id = %workspace_id,
+            user_id = %user_id,
+            "openfga returned malformed document ids for retrieval"
+        );
+    }
+    if document_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         r#"
-        SELECT DISTINCT d.id
-        FROM documents d
-        WHERE d.workspace_id = $1
-          AND (
-            d.visibility = 'shared'
-            OR d.owner_id = $2
-            OR EXISTS (
-              SELECT 1 FROM workspace_members wm
-              WHERE wm.workspace_id = d.workspace_id
-                AND wm.user_id = $2
-            )
-            OR EXISTS (
-              SELECT 1 FROM resource_acl ra
-              WHERE ra.resource_type = 'document'
-                AND ra.resource_id = d.id
-                AND ra.permission IN ('owner', 'editor', 'viewer')
-                AND (
-                  (ra.principal_type = 'user' AND ra.principal_id = $2)
-                  OR (ra.principal_type = 'workspace' AND EXISTS (
-                        SELECT 1 FROM workspace_members wmg
-                        WHERE wmg.workspace_id = ra.principal_id
-                          AND wmg.user_id = $2))
-                )
-            )
-          )
+        SELECT id
+        FROM documents
+        WHERE workspace_id = $1
+          AND id = ANY($2)
         "#,
     )
     .bind(workspace_id)
-    .bind(user_id)
+    .bind(&document_ids)
     .fetch_all(conn)
     .await?;
+
+    let visible: HashSet<Uuid> = rows.iter().map(|(id,)| *id).collect();
+    let rejected = document_ids
+        .iter()
+        .filter(|id| !visible.contains(id))
+        .count();
+    if rejected > 0 {
+        tracing::debug!(
+            rejected,
+            workspace_id = %workspace_id,
+            "openfga document ids rejected by postgres tenant/workspace intersection"
+        );
+    }
 
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
 async fn ensure_workspace_member(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     workspace_id: Uuid,
     user_id: Uuid,
 ) -> Result<(), RetrievalError> {
-    let member: Option<(bool,)> = sqlx::query_as(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM workspace_members
-            WHERE workspace_id = $1 AND user_id = $2
-        )
-        "#,
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if exists.is_none() {
+        return Err(RetrievalError::NotWorkspaceMember);
+    }
+    let allowed = check_or_unavailable(
+        authz,
+        CheckRequest::new(user_obj(user_id), REL_ACCESSOR, workspace_obj(workspace_id)),
     )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_optional(conn)
-    .await?;
-
-    match member.map(|r| r.0) {
-        Some(true) => Ok(()),
-        _ => Err(RetrievalError::NotWorkspaceMember),
+    .await
+    .map_err(|e| RetrievalError::Authorization(e.to_string()))?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(RetrievalError::NotWorkspaceMember)
     }
 }
 
@@ -229,13 +253,18 @@ fn payload_str(point: &ScoredPoint, key: &str) -> Option<String> {
 /// kNN chunk search using a pre-computed query vector (T46 core).
 pub async fn retrieve_chunks_with_vector(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     qdrant: &QdrantStore,
     query_vector: &[f32],
     params: &RetrievalParams,
 ) -> Result<Vec<ChunkHit>, RetrievalError> {
-    ensure_workspace_member(conn, params.workspace_id, params.user_id).await?;
+    /// Row shape for the chunk-metadata join used to enrich Qdrant hits.
+    type ChunkMetaRow = (String, i32, Option<String>, Option<i32>, Option<i32>);
 
-    let accessible = accessible_document_ids(conn, params.workspace_id, params.user_id).await?;
+    ensure_workspace_member(conn, authz, params.workspace_id, params.user_id).await?;
+
+    let accessible =
+        accessible_document_ids(conn, authz, params.workspace_id, params.user_id).await?;
     if accessible.is_empty() {
         return Ok(Vec::new());
     }
@@ -258,10 +287,15 @@ pub async fn retrieve_chunks_with_vector(
             .ok_or(RetrievalError::InvalidPointId)?;
 
         if !allowed.contains(&document_id) {
+            tracing::debug!(
+                document_id = %document_id,
+                point_id = %point_id,
+                "discarded qdrant chunk candidate rejected by authorization"
+            );
             continue;
         }
 
-        let row: Option<(String, i32, Option<String>, Option<i32>, Option<i32>)> = sqlx::query_as(
+        let row: Option<ChunkMetaRow> = sqlx::query_as(
             r#"
             SELECT dc.content, dc.chunk_index, d.title, dc.page_start, dc.page_end
             FROM document_chunks dc
@@ -300,12 +334,13 @@ pub async fn retrieve_chunks_with_vector(
 /// Embed the query then search accessible chunks (T46).
 pub async fn retrieve_chunks(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     qdrant: &QdrantStore,
     llm: &dyn LlmProvider,
     params: &RetrievalParams,
 ) -> Result<Vec<ChunkHit>, RetrievalError> {
     let query_vector = llm.embed_query(&params.query).await?;
-    retrieve_chunks_with_vector(conn, qdrant, &query_vector, params).await
+    retrieve_chunks_with_vector(conn, authz, qdrant, &query_vector, params).await
 }
 
 async fn hydrate_graph_node(
@@ -414,13 +449,15 @@ async fn load_graph_edges(
 
     Ok(rows
         .into_iter()
-        .map(|(src_node_id, dst_node_id, kind, src_label, dst_label)| GraphEdgeHit {
-            src_node_id,
-            dst_node_id,
-            src_label,
-            dst_label,
-            kind,
-        })
+        .map(
+            |(src_node_id, dst_node_id, kind, src_label, dst_label)| GraphEdgeHit {
+                src_node_id,
+                dst_node_id,
+                src_label,
+                dst_label,
+                kind,
+            },
+        )
         .collect())
 }
 
@@ -433,6 +470,7 @@ async fn load_graph_edges(
 /// gnd.node_id = node AND gnd.document_id = ANY($accessible))`.
 /// The ILIKE fallback path applies the same filter. Edges whose src or
 /// dst was filtered out are dropped.
+#[allow(clippy::too_many_arguments)]
 pub async fn retrieve_graph_context(
     conn: &mut PgConnection,
     qdrant: &QdrantStore,
@@ -472,14 +510,8 @@ pub async fn retrieve_graph_context(
     }
 
     if needs_fallback && nodes.len() < top_k as usize {
-        let fallback = ilike_graph_fallback(
-            conn,
-            workspace_id,
-            query_text,
-            top_k as i64,
-            &seen,
-        )
-        .await?;
+        let fallback =
+            ilike_graph_fallback(conn, workspace_id, query_text, top_k as i64, &seen).await?;
         for hit in fallback {
             if node_visible_via_provenance(conn, hit.node_id, accessible_document_ids).await? {
                 seen.insert(hit.node_id);
@@ -536,19 +568,20 @@ pub(crate) async fn node_visible_via_provenance(
 /// Single embed + chunk/graph retrieval (orchestrator for T49).
 pub async fn retrieve_all_with_provider(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     qdrant: &QdrantStore,
     llm: &dyn LlmProvider,
     params: &RetrievalParams,
 ) -> Result<(Vec<ChunkHit>, GraphContext), RetrievalError> {
     let query_vector = llm.embed_query(&params.query).await?;
-    let chunks =
-        retrieve_chunks_with_vector(conn, qdrant, &query_vector, params).await?;
+    let chunks = retrieve_chunks_with_vector(conn, authz, qdrant, &query_vector, params).await?;
     // T84D Phase 2.1: compute the accessible set once before the graph
     // call (the chunk path already produces it inside
     // `retrieve_chunks_with_vector`, but that one is private to its
     // scope — compute it again here so the graph ACL matches the chunk
     // ACL exactly).
-    let accessible = accessible_document_ids(conn, params.workspace_id, params.user_id).await?;
+    let accessible =
+        accessible_document_ids(conn, authz, params.workspace_id, params.user_id).await?;
     let graph = retrieve_graph_context(
         conn,
         qdrant,
@@ -566,23 +599,19 @@ pub async fn retrieve_all_with_provider(
 /// Like [`retrieve_all_with_provider`] but records `embedding_tokens` after embed.
 pub async fn retrieve_all_with_metering(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     qdrant: &QdrantStore,
     llm: &dyn LlmProvider,
     params: &RetrievalParams,
 ) -> Result<(Vec<ChunkHit>, GraphContext), RetrievalError> {
     let query_vector = llm.embed_query(&params.query).await?;
-    crate::metering::record_embedding_usage(
-        conn,
-        params.tenant_id,
-        &params.query,
-        llm.provider(),
-    )
-    .await
-    .map_err(|e| RetrievalError::Metering(e.to_string()))?;
+    crate::metering::record_embedding_usage(conn, params.tenant_id, &params.query, llm.provider())
+        .await
+        .map_err(|e| RetrievalError::Metering(e.to_string()))?;
 
-    let chunks =
-        retrieve_chunks_with_vector(conn, qdrant, &query_vector, params).await?;
-    let accessible = accessible_document_ids(conn, params.workspace_id, params.user_id).await?;
+    let chunks = retrieve_chunks_with_vector(conn, authz, qdrant, &query_vector, params).await?;
+    let accessible =
+        accessible_document_ids(conn, authz, params.workspace_id, params.user_id).await?;
     let graph = retrieve_graph_context(
         conn,
         qdrant,
@@ -600,37 +629,32 @@ pub async fn retrieve_all_with_metering(
 /// Resolve tenant LLM config, embed once, then retrieve chunks + graph.
 pub async fn retrieve_all(
     conn: &mut PgConnection,
+    authz: &AuthzService,
     qdrant: &QdrantStore,
     deepseek: &DeepSeekConfig,
     ollama: &OllamaConfig,
     tenant_key: Option<&[u8; 32]>,
     params: &RetrievalParams,
 ) -> Result<(Vec<ChunkHit>, GraphContext), RetrievalError> {
-    let resolved = resolve_llm_config(
-        conn,
-        params.tenant_id,
-        deepseek,
-        ollama,
-        tenant_key,
-    )
-    .await?;
+    let resolved = resolve_llm_config(conn, params.tenant_id, deepseek, ollama, tenant_key).await?;
     let provider = DeepSeekProvider::new(resolved.provider);
-    retrieve_all_with_provider(conn, qdrant, &provider, params).await
+    retrieve_all_with_provider(conn, authz, qdrant, &provider, params).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use gmrag_core::config::QdrantConfig;
     use qdrant_client::qdrant::PointStruct;
     use qdrant_client::Payload;
     use sqlx::PgPool;
 
+    use crate::authz::{document_obj, tuple, workspace_member_userset, PgTestAuthorizationService};
     use crate::llm::provider::{
-        ChatMessage, ChatStream, ChatStreamFuture, GraphExtraction, LlmProvider,
-        ProviderFuture,
+        ChatMessage, ChatStream, ChatStreamFuture, GraphExtraction, LlmProvider, ProviderFuture,
     };
 
     struct MockEmbedProvider {
@@ -688,7 +712,14 @@ mod tests {
         }
     }
 
-    async fn rls_conn(pool: &PgPool, tenant_id: Uuid) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    fn test_authz(pool: &PgPool) -> AuthzService {
+        Arc::new(PgTestAuthorizationService::new(pool.clone()))
+    }
+
+    async fn rls_conn(
+        pool: &PgPool,
+        tenant_id: Uuid,
+    ) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
         let mut conn = pool.acquire().await.unwrap();
         sqlx::Executor::execute(&mut *conn, "BEGIN").await.unwrap();
         sqlx::Executor::execute(&mut *conn, "SET LOCAL ROLE gmrag_app")
@@ -749,8 +780,14 @@ mod tests {
         .unwrap();
     }
 
+    // NOTE: seed helpers write through `pool` (auto-committing), not through
+    // the RLS-scoped `conn` transaction used for the actual retrieval calls
+    // under test. `PgTestAuthorizationService` reads via its own pool-checked-out
+    // connection, so data left uncommitted on `conn` would be invisible to it
+    // (standard Postgres READ COMMITTED cross-connection isolation), causing
+    // every authorization check to silently see "no such document".
     async fn insert_doc(
-        conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+        pool: &PgPool,
         id: Uuid,
         tenant: Uuid,
         ws: Uuid,
@@ -760,7 +797,7 @@ mod tests {
     ) {
         sqlx::query(
             r#"INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-               VALUES ($1, $2, $3, $4, $5, 'ready', $6, 'k')"#,
+               VALUES ($1, $2, $3, $4, $5, 'indexed', $6, 'k')"#,
         )
         .bind(id)
         .bind(tenant)
@@ -768,31 +805,30 @@ mod tests {
         .bind(owner)
         .bind(title)
         .bind(visibility)
-        .execute(&mut **conn)
+        .execute(pool)
         .await
         .unwrap();
     }
 
     async fn insert_doc_grant(
-        pool: &PgPool,
-        tenant: Uuid,
+        authz: &AuthzService,
         doc_id: Uuid,
         principal_type: &str,
         principal_id: Uuid,
         permission: &str,
     ) {
-        sqlx::query(
-            "INSERT INTO resource_acl (tenant_id, resource_type, resource_id, principal_type, principal_id, permission)
-             VALUES ($1, 'document', $2, $3, $4, $5)",
-        )
-        .bind(tenant)
-        .bind(doc_id)
-        .bind(principal_type)
-        .bind(principal_id)
-        .bind(permission)
-        .execute(pool)
-        .await
-        .unwrap();
+        let user = match principal_type {
+            "user" => user_obj(principal_id),
+            "workspace" => workspace_member_userset(principal_id),
+            other => panic!("unsupported test principal_type {other}"),
+        };
+        authz
+            .write_relationships(
+                vec![tuple(user, permission, document_obj(doc_id))],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
     }
 
     /// C1 regression: a non-member (no workspace membership, no grant) can see
@@ -808,18 +844,38 @@ mod tests {
         add_workspace_member(&pool, ws, tenant, other).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let owned_doc = Uuid::new_v4();
-        insert_doc(&mut conn, owned_doc, tenant, ws, caller, "mine", "private").await;
+        insert_doc(&pool, owned_doc, tenant, ws, caller, "mine", "private").await;
 
         let shared_doc = Uuid::new_v4();
-        insert_doc(&mut conn, shared_doc, tenant, ws, other, "theirs-shared", "shared").await;
+        insert_doc(
+            &pool,
+            shared_doc,
+            tenant,
+            ws,
+            other,
+            "theirs-shared",
+            "shared",
+        )
+        .await;
 
         let foreign_private = Uuid::new_v4();
-        insert_doc(&mut conn, foreign_private, tenant, ws, other, "theirs-private", "private")
-            .await;
+        insert_doc(
+            &pool,
+            foreign_private,
+            tenant,
+            ws,
+            other,
+            "theirs-private",
+            "private",
+        )
+        .await;
 
-        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        let ids = accessible_document_ids(&mut conn, &authz, ws, caller)
+            .await
+            .unwrap();
         assert!(ids.contains(&owned_doc), "caller sees own private doc");
         assert!(
             ids.contains(&shared_doc),
@@ -832,7 +888,7 @@ mod tests {
     }
 
     /// C1/C5 regression: a workspace member sees ALL documents in the workspace
-    /// (ReBAC `tuple_to_userset(workspace → member)` inheritance), including
+    /// (OpenFGA `document#viewer` includes `member from workspace`), including
     /// foreign private documents.
     #[sqlx::test(migrations = "../../migrations")]
     async fn accessible_docs_workspace_member_sees_all(pool: PgPool) {
@@ -844,15 +900,26 @@ mod tests {
         add_workspace_member(&pool, ws, tenant, caller).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let owned_doc = Uuid::new_v4();
-        insert_doc(&mut conn, owned_doc, tenant, ws, caller, "mine", "private").await;
+        insert_doc(&pool, owned_doc, tenant, ws, caller, "mine", "private").await;
 
         let foreign_private = Uuid::new_v4();
-        insert_doc(&mut conn, foreign_private, tenant, ws, other, "theirs-private", "private")
-            .await;
+        insert_doc(
+            &pool,
+            foreign_private,
+            tenant,
+            ws,
+            other,
+            "theirs-private",
+            "private",
+        )
+        .await;
 
-        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        let ids = accessible_document_ids(&mut conn, &authz, ws, caller)
+            .await
+            .unwrap();
         assert!(ids.contains(&owned_doc), "member sees own doc");
         assert!(
             ids.contains(&foreign_private),
@@ -860,9 +927,9 @@ mod tests {
         );
     }
 
-    /// C1/C5 regression: a non-member with a `resource_acl` grant
-    /// `permission='viewer'` can see a private document (production-realistic
-    /// ReBAC data per T64 CHECK + T67 grant flow).
+    /// C1/C5 regression: a non-member with a direct OpenFGA `viewer` tuple
+    /// grant can see a private document (production-realistic ACL grant
+    /// flow per T64/T67, now backed by OpenFGA instead of `resource_acl`).
     #[sqlx::test(migrations = "../../migrations")]
     async fn accessible_docs_grant_sees_private_doc(pool: PgPool) {
         let tenant = seed_tenant(&pool, "acl-grant").await;
@@ -872,16 +939,28 @@ mod tests {
         add_workspace_member(&pool, ws, tenant, other).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let granted_doc = Uuid::new_v4();
-        insert_doc(&mut conn, granted_doc, tenant, ws, other, "granted", "private").await;
+        insert_doc(&pool, granted_doc, tenant, ws, other, "granted", "private").await;
 
         let ungranted_doc = Uuid::new_v4();
-        insert_doc(&mut conn, ungranted_doc, tenant, ws, other, "ungranted", "private").await;
+        insert_doc(
+            &pool,
+            ungranted_doc,
+            tenant,
+            ws,
+            other,
+            "ungranted",
+            "private",
+        )
+        .await;
 
-        insert_doc_grant(&pool, tenant, granted_doc, "user", caller, "viewer").await;
+        insert_doc_grant(&authz, granted_doc, "user", caller, "viewer").await;
 
-        let ids = accessible_document_ids(&mut conn, ws, caller).await.unwrap();
+        let ids = accessible_document_ids(&mut conn, &authz, ws, caller)
+            .await
+            .unwrap();
         assert!(
             ids.contains(&granted_doc),
             "non-member with viewer grant sees private doc"
@@ -900,9 +979,10 @@ mod tests {
         add_workspace_member(&pool, ws, tenant, owner).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let doc = Uuid::new_v4();
-        insert_doc(&mut conn, doc, tenant, ws, owner, "no-chunks", "private").await;
+        insert_doc(&pool, doc, tenant, ws, owner, "no-chunks", "private").await;
 
         let qdrant = match QdrantStore::new(&local_qdrant()).await {
             Ok(s) => s,
@@ -911,7 +991,7 @@ mod tests {
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
         let params = RetrievalParams::new(tenant, ws, owner, "test query");
-        let hits = retrieve_chunks_with_vector(&mut conn, &qdrant, &unit_vec(0), &params)
+        let hits = retrieve_chunks_with_vector(&mut conn, &authz, &qdrant, &unit_vec(0), &params)
             .await
             .unwrap();
         assert!(hits.is_empty(), "no Qdrant points → no hits");
@@ -937,13 +1017,31 @@ mod tests {
         add_workspace_member(&pool, other_ws, tenant, other).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let allowed_doc = Uuid::new_v4();
-        insert_doc(&mut conn, allowed_doc, tenant, ws, owner, "allowed.pdf", "private").await;
+        insert_doc(
+            &pool,
+            allowed_doc,
+            tenant,
+            ws,
+            owner,
+            "allowed.pdf",
+            "private",
+        )
+        .await;
 
         let blocked_doc = Uuid::new_v4();
-        insert_doc(&mut conn, blocked_doc, tenant, other_ws, other, "blocked.pdf", "private")
-            .await;
+        insert_doc(
+            &pool,
+            blocked_doc,
+            tenant,
+            other_ws,
+            other,
+            "blocked.pdf",
+            "private",
+        )
+        .await;
 
         let allowed_point = Uuid::new_v4();
         sqlx::query(
@@ -953,7 +1051,7 @@ mod tests {
         .bind(tenant)
         .bind(allowed_doc)
         .bind(allowed_point)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -965,41 +1063,48 @@ mod tests {
         .bind(tenant)
         .bind(blocked_doc)
         .bind(blocked_point)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
 
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
-        let make_point = |point_id: Uuid, ws_id: Uuid, doc_id: Uuid, text: &str, vec: Vec<f32>| -> PointStruct {
-            PointStruct::new(
-                point_id.to_string(),
-                vec,
-                Payload::try_from(serde_json::json!({
-                    "workspace_id": ws_id.to_string(),
-                    "document_id": doc_id.to_string(),
-                    "chunk_index": 0_i64,
-                    "filename": text,
-                    "owner_id": owner.to_string(),
-                    "visibility": "private",
-                }))
-                .unwrap(),
-            )
-        };
+        let make_point =
+            |point_id: Uuid, ws_id: Uuid, doc_id: Uuid, text: &str, vec: Vec<f32>| -> PointStruct {
+                PointStruct::new(
+                    point_id.to_string(),
+                    vec,
+                    Payload::try_from(serde_json::json!({
+                        "workspace_id": ws_id.to_string(),
+                        "document_id": doc_id.to_string(),
+                        "chunk_index": 0_i64,
+                        "filename": text,
+                        "owner_id": owner.to_string(),
+                        "visibility": "private",
+                    }))
+                    .unwrap(),
+                )
+            };
 
         qdrant
             .upsert_chunks(
                 tenant,
                 vec![
                     make_point(allowed_point, ws, allowed_doc, "allowed.pdf", unit_vec(0)),
-                    make_point(blocked_point, other_ws, blocked_doc, "blocked.pdf", unit_vec(0)),
+                    make_point(
+                        blocked_point,
+                        other_ws,
+                        blocked_doc,
+                        "blocked.pdf",
+                        unit_vec(0),
+                    ),
                 ],
             )
             .await
             .unwrap();
 
         let params = RetrievalParams::new(tenant, ws, owner, "query");
-        let hits = retrieve_chunks_with_vector(&mut conn, &qdrant, &unit_vec(0), &params)
+        let hits = retrieve_chunks_with_vector(&mut conn, &authz, &qdrant, &unit_vec(0), &params)
             .await
             .unwrap();
 
@@ -1018,12 +1123,13 @@ mod tests {
         let ws = seed_workspace(&pool, tenant, owner).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         // T84D Phase 2.1: the node is extracted only from a document the
         // caller owns, so it must be returned. Without the provenance
         // link the new ACL post-filter would (correctly) drop the node.
         let doc = Uuid::new_v4();
-        insert_doc(&mut conn, doc, tenant, ws, owner, "keycloak-pdf", "private").await;
+        insert_doc(&pool, doc, tenant, ws, owner, "keycloak-pdf", "private").await;
 
         let node_id = Uuid::new_v4();
         sqlx::query(
@@ -1033,7 +1139,7 @@ mod tests {
         .bind(node_id)
         .bind(tenant)
         .bind(ws)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
@@ -1043,7 +1149,7 @@ mod tests {
         .bind(node_id)
         .bind(doc)
         .bind(tenant)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -1053,7 +1159,9 @@ mod tests {
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
         let zero = vec![0.0f32; 768];
-        let accessible = accessible_document_ids(&mut conn, ws, owner).await.unwrap();
+        let accessible = accessible_document_ids(&mut conn, &authz, ws, owner)
+            .await
+            .unwrap();
         let ctx = retrieve_graph_context(
             &mut conn,
             &qdrant,
@@ -1108,7 +1216,9 @@ mod tests {
         .await
         .unwrap();
 
-        let edges = load_graph_edges(&mut conn, tenant, &[n1, n2]).await.unwrap();
+        let edges = load_graph_edges(&mut conn, tenant, &[n1, n2])
+            .await
+            .unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].kind, "works_at");
         assert_eq!(edges[0].src_label, "Alice");
@@ -1142,9 +1252,19 @@ mod tests {
         add_workspace_member(&pool, ws, tenant, owner).await;
 
         let mut conn = rls_conn(&pool, tenant).await;
+        let authz = test_authz(&pool);
 
         let private_doc = Uuid::new_v4();
-        insert_doc(&mut conn, private_doc, tenant, ws, owner, "secret.pdf", "private").await;
+        insert_doc(
+            &pool,
+            private_doc,
+            tenant,
+            ws,
+            owner,
+            "secret.pdf",
+            "private",
+        )
+        .await;
 
         let node_id = Uuid::new_v4();
         sqlx::query(
@@ -1154,7 +1274,7 @@ mod tests {
         .bind(node_id)
         .bind(tenant)
         .bind(ws)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
@@ -1164,7 +1284,7 @@ mod tests {
         .bind(node_id)
         .bind(private_doc)
         .bind(tenant)
-        .execute(&mut *conn)
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -1177,7 +1297,9 @@ mod tests {
         };
         qdrant.setup_tenant_collections(tenant).await.unwrap();
 
-        let accessible_stranger = accessible_document_ids(&mut conn, ws, stranger).await.unwrap();
+        let accessible_stranger = accessible_document_ids(&mut conn, &authz, ws, stranger)
+            .await
+            .unwrap();
         assert!(
             accessible_stranger.is_empty(),
             "stranger sees no documents in this workspace"
@@ -1200,8 +1322,10 @@ mod tests {
         );
 
         // Viewer grant on the private document → node returned.
-        insert_doc_grant(&pool, tenant, private_doc, "user", viewer, "viewer").await;
-        let accessible_viewer = accessible_document_ids(&mut conn, ws, viewer).await.unwrap();
+        insert_doc_grant(&authz, private_doc, "user", viewer, "viewer").await;
+        let accessible_viewer = accessible_document_ids(&mut conn, &authz, ws, viewer)
+            .await
+            .unwrap();
         assert!(
             accessible_viewer.contains(&private_doc),
             "viewer grant makes the private doc accessible"

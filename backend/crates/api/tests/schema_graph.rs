@@ -12,7 +12,14 @@ async fn graph_nodes_table_exists_with_expected_columns(pool: PgPool) {
     .await
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
-    for required in ["id", "tenant_id", "kind", "label", "properties", "created_at"] {
+    for required in [
+        "id",
+        "tenant_id",
+        "kind",
+        "label",
+        "properties",
+        "created_at",
+    ] {
         assert!(
             names.contains(&required.to_string()),
             "graph_nodes missing column '{required}'"
@@ -41,8 +48,14 @@ async fn graph_edges_table_exists_with_expected_columns(pool: PgPool) {
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
     for required in [
-        "id", "tenant_id", "src_node_id", "dst_node_id", "kind", "weight",
-        "properties", "created_at",
+        "id",
+        "tenant_id",
+        "src_node_id",
+        "dst_node_id",
+        "kind",
+        "weight",
+        "properties",
+        "created_at",
     ] {
         assert!(
             names.contains(&required.to_string()),

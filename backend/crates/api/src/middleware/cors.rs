@@ -6,16 +6,22 @@ use tracing::warn;
 
 const DEFAULT_ORIGINS: &str = "http://localhost:3000";
 const DEFAULT_METHODS: &str = "GET,POST,PUT,PATCH,DELETE,OPTIONS";
-const DEFAULT_HEADERS: &str = "Authorization,Content-Type,X-Tenant-ID,X-Request-ID";
 
 /// Build a [`CorsLayer`] from process environment.
 ///
 /// Reads `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_METHODS`, `CORS_ALLOWED_HEADERS`,
 /// and `CORS_ALLOW_CREDENTIALS`. Invalid entries are skipped with a warning.
-pub fn layer_from_env() -> CorsLayer {
-    let origins_raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| DEFAULT_ORIGINS.into());
-    let methods_raw = std::env::var("CORS_ALLOWED_METHODS").unwrap_or_else(|_| DEFAULT_METHODS.into());
-    let headers_raw = std::env::var("CORS_ALLOWED_HEADERS").unwrap_or_else(|_| DEFAULT_HEADERS.into());
+pub fn layer_from_env(tenant_header: &HeaderName) -> CorsLayer {
+    let origins_raw =
+        std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| DEFAULT_ORIGINS.into());
+    let methods_raw =
+        std::env::var("CORS_ALLOWED_METHODS").unwrap_or_else(|_| DEFAULT_METHODS.into());
+    let headers_raw = std::env::var("CORS_ALLOWED_HEADERS").unwrap_or_else(|_| {
+        format!(
+            "Authorization,Content-Type,{},X-Request-ID",
+            tenant_header.as_str()
+        )
+    });
     let allow_credentials = std::env::var("CORS_ALLOW_CREDENTIALS")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
@@ -28,7 +34,10 @@ pub fn layer_from_env() -> CorsLayer {
                 return None;
             }
             trimmed.parse().ok().or_else(|| {
-                warn!(origin = trimmed, "skipping invalid CORS_ALLOWED_ORIGINS entry");
+                warn!(
+                    origin = trimmed,
+                    "skipping invalid CORS_ALLOWED_ORIGINS entry"
+                );
                 None
             })
         })
@@ -42,7 +51,10 @@ pub fn layer_from_env() -> CorsLayer {
                 return None;
             }
             trimmed.parse().ok().or_else(|| {
-                warn!(method = trimmed, "skipping invalid CORS_ALLOWED_METHODS entry");
+                warn!(
+                    method = trimmed,
+                    "skipping invalid CORS_ALLOWED_METHODS entry"
+                );
                 None
             })
         })
@@ -56,7 +68,10 @@ pub fn layer_from_env() -> CorsLayer {
                 return None;
             }
             trimmed.parse().ok().or_else(|| {
-                warn!(header = trimmed, "skipping invalid CORS_ALLOWED_HEADERS entry");
+                warn!(
+                    header = trimmed,
+                    "skipping invalid CORS_ALLOWED_HEADERS entry"
+                );
                 None
             })
         })

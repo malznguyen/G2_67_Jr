@@ -6,7 +6,7 @@
 //! [`crate::middleware::rls::rls_middleware`] (which consumes
 //! `Extension<TenantContext>`).
 //!
-//! It reads the `X-Tenant-Id` header, parses it as a UUID, and verifies that
+//! It reads the configured tenant header, parses it as a UUID, and verifies that
 //! the authenticated user is a member of that tenant by querying
 //! `tenant_members` via the [`AdminPool`] (platform-level, bypasses RLS —
 //! this lookup must succeed *before* the RLS tenant context is established,
@@ -23,24 +23,42 @@
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
+use crate::authz::{
+    check_or_unavailable, tenant_obj, user_obj, AuthzService, CheckRequest, REL_MEMBER,
+};
 use crate::pool::AdminPool;
 
 /// The resolved tenant for the current request.
 ///
-/// Carries the tenant UUID validated against the `tenant_members` table.
+/// Carries the tenant UUID validated against OpenFGA tenant membership.
 /// Populated by [`tenant_middleware`] and consumed by
 /// [`crate::middleware::rls::rls_middleware`] and tenant-scoped handlers.
 #[derive(Debug, Clone)]
 pub struct TenantContext(pub Uuid);
 
-const TENANT_HEADER: &str = "x-tenant-id";
+/// Configured tenant header name.
+///
+/// Parsed from `GMRAG_TENANT_HEADER` at startup and injected as an extension
+/// so tenant resolution cannot drift from config.
+#[derive(Debug, Clone)]
+pub struct TenantHeaderName(pub HeaderName);
+
+impl TenantHeaderName {
+    pub fn from_config(value: &str) -> Result<Self, axum::http::header::InvalidHeaderName> {
+        HeaderName::from_bytes(value.as_bytes()).map(Self)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 /// Middleware that resolves [`TenantContext`] and stores it in extensions.
 ///
@@ -59,14 +77,25 @@ pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Respon
         }
     };
 
-    // 2. Read X-Tenant-Id header.
-    let header_value = match request.headers().get(TENANT_HEADER) {
+    // 2. Read configured tenant header.
+    let tenant_header = match request.extensions().get::<TenantHeaderName>().cloned() {
+        Some(header) => header,
+        None => {
+            return tenant_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tenant-missing-header-config",
+                "tenant_middleware requires TenantHeaderName in extensions",
+            )
+        }
+    };
+
+    let header_value = match request.headers().get(&tenant_header.0) {
         Some(v) => v,
         None => {
             return tenant_error_response(
                 StatusCode::BAD_REQUEST,
                 "bad-request",
-                "missing X-Tenant-Id header",
+                &format!("missing {} header", tenant_header.as_str()),
             )
         }
     };
@@ -77,7 +106,7 @@ pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Respon
             return tenant_error_response(
                 StatusCode::BAD_REQUEST,
                 "bad-request",
-                "X-Tenant-Id contains invalid characters",
+                &format!("{} contains invalid characters", tenant_header.as_str()),
             )
         }
     };
@@ -88,12 +117,12 @@ pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Respon
             return tenant_error_response(
                 StatusCode::BAD_REQUEST,
                 "bad-request",
-                "X-Tenant-Id is not a valid UUID",
+                &format!("{} is not a valid UUID", tenant_header.as_str()),
             )
         }
     };
 
-    // 3. AdminPool for the membership check (platform-level, bypasses RLS).
+    // 3. AdminPool for the tenant existence check (platform-level, bypasses RLS).
     let AdminPool(pool) = match request.extensions().get::<AdminPool>().cloned() {
         Some(p) => p,
         None => {
@@ -105,23 +134,55 @@ pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Respon
         }
     };
 
-    // 4. Verify membership.
-    let is_member: bool = match sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM tenant_members WHERE tenant_id = $1 AND user_id = $2)",
+    // 4. Confirm the tenant row exists before authorizing it.
+    let tenant_exists: bool =
+        match sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE id = $1)")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return tenant_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal-error",
+                    &format!("tenant existence check failed: {e}"),
+                )
+            }
+        };
+
+    if !tenant_exists {
+        return tenant_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &format!("tenant {tenant_id} is not available to this user"),
+        );
+    }
+
+    let authz = match request.extensions().get::<AuthzService>().cloned() {
+        Some(authz) => authz,
+        None => {
+            return tenant_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tenant-missing-authz",
+                "tenant_middleware requires AuthorizationService in extensions",
+            )
+        }
+    };
+
+    // 5. Verify membership through OpenFGA.
+    let is_member = match check_or_unavailable(
+        &authz,
+        CheckRequest::new(
+            user_obj(auth_user.user_id),
+            REL_MEMBER,
+            tenant_obj(tenant_id),
+        ),
     )
-    .bind(tenant_id)
-    .bind(auth_user.user_id)
-    .fetch_one(&pool)
     .await
     {
         Ok(v) => v,
-        Err(e) => {
-            return tenant_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal-error",
-                &format!("membership check failed: {e}"),
-            )
-        }
+        Err(e) => return e.into_response(),
     };
 
     if !is_member {
@@ -135,7 +196,7 @@ pub async fn tenant_middleware(mut request: Request<Body>, next: Next) -> Respon
         );
     }
 
-    // 5. Store TenantContext in extensions for rls_middleware + handlers.
+    // 6. Store TenantContext in extensions for rls_middleware + handlers.
     request.extensions_mut().insert(TenantContext(tenant_id));
 
     next.run(request).await
@@ -157,7 +218,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Extension, Router};
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -187,7 +248,12 @@ mod tests {
     fn make_token(claims: &JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap()
     }
 
     #[allow(dead_code)]
@@ -233,6 +299,10 @@ mod tests {
 
     use axum::Json;
 
+    fn default_tenant_header() -> TenantHeaderName {
+        TenantHeaderName::from_config("X-Tenant-ID").unwrap()
+    }
+
     /// Build a test app that wires tenant_middleware and pre-seeds
     /// Extension<AuthUser> + Extension<AdminPool> (skipping auth_middleware).
     fn build_app(auth_user: AuthUser, pool: AdminPool) -> Router {
@@ -241,6 +311,7 @@ mod tests {
             .layer(axum::middleware::from_fn(tenant_middleware))
             .layer(Extension(auth_user))
             .layer(Extension(pool))
+            .layer(Extension(default_tenant_header()))
     }
 
     #[tokio::test]
@@ -261,7 +332,7 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], "bad-request");
         let msg = body["error"]["message"].as_str().unwrap().to_string();
-        assert!(msg.contains("X-Tenant-Id"), "unexpected message: {msg}");
+        assert!(msg.contains("x-tenant-id"), "unexpected message: {msg}");
     }
 
     #[tokio::test]
@@ -310,7 +381,8 @@ mod tests {
         let app = Router::new()
             .route("/protected", get(protected_route))
             .layer(axum::middleware::from_fn(tenant_middleware))
-            .layer(Extension(stub_admin_pool()));
+            .layer(Extension(stub_admin_pool()))
+            .layer(Extension(default_tenant_header()));
 
         let resp = app
             .oneshot(
@@ -333,7 +405,8 @@ mod tests {
         let app = Router::new()
             .route("/protected", get(protected_route))
             .layer(axum::middleware::from_fn(tenant_middleware))
-            .layer(Extension(make_auth_user()));
+            .layer(Extension(make_auth_user()))
+            .layer(Extension(default_tenant_header()));
 
         let resp = app
             .oneshot(

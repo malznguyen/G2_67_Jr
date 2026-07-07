@@ -31,6 +31,13 @@ const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_DEEPSEEK_TIMEOUT_S: u64 = 60;
+const DEFAULT_OPENFGA_REQUEST_TIMEOUT_MS: u64 = 1500;
+const DEFAULT_OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS: u64 = 5;
+/// Default number of concurrent job processors the worker runs. Bounded so
+/// the worker can process multiple BRPOP'd jobs at once without unbounded
+/// spawn. See `GMRAG_WORKER_CONCURRENCY`.
+const DEFAULT_WORKER_CONCURRENCY: usize = 4;
+const DEFAULT_WORKER_METRICS_BIND: &str = "0.0.0.0:9091";
 
 /// OIDC / Keycloak configuration.
 #[derive(Debug, Clone)]
@@ -94,6 +101,29 @@ pub struct DeepSeekConfig {
     pub timeout_s: u64,
 }
 
+/// OpenFGA authorization service configuration.
+#[derive(Debug, Clone)]
+pub struct OpenFgaConfig {
+    pub api_url: String,
+    pub store_id: String,
+    pub authorization_model_id: String,
+    pub api_token: Option<String>,
+    pub request_timeout_ms: u64,
+    pub higher_consistency_window_secs: u64,
+}
+
+/// Request-intake rate limiting configuration.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub auth_per_min: u32,
+    pub job_create_per_min: u32,
+    pub chat_create_per_min: u32,
+    pub chat_concurrent_per_tenant: u32,
+    pub general_per_min: u32,
+    pub window_secs: u64,
+}
+
 /// Application configuration resolved at startup.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -111,6 +141,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub ollama: OllamaConfig,
     pub deepseek: DeepSeekConfig,
+    pub openfga: OpenFgaConfig,
     pub tenant_key_encryption_key: Option<[u8; 32]>,
 
     /// T84D Phase 1.3: feature-flag for the OCR fallback path. Off by
@@ -130,6 +161,42 @@ pub struct Config {
     /// T84D Phase 3.3: number of past chat messages threaded into the LLM
     /// context per turn.
     pub chat_history_limit: usize,
+
+    /// Phase 0 TASK-P0-04: bounded retention loop interval (seconds). The
+    /// worker spawns one retention loop that deletes dispatched outbox /
+    /// usage / audit rows older than their configured retention windows in
+    /// bounded batches. Default 86400 (once per day).
+    pub retention_interval_secs: u64,
+    /// Retention window for dispatched `ingest_outbox` rows (days).
+    pub outbox_retention_days: u32,
+    /// Retention window for `usage_events` rows (days).
+    pub usage_retention_days: u32,
+    /// Retention window for `audit_log` rows (days).
+    pub audit_retention_days: u32,
+    /// Maximum rows deleted per retention pass per table (bounded batches).
+    pub retention_batch_size: u64,
+
+    /// Phase 1: number of concurrent ingest-job processors the worker runs.
+    /// Parsed from `GMRAG_WORKER_CONCURRENCY`; bad/zero/empty values fall back
+    /// to `DEFAULT_WORKER_CONCURRENCY` (4) with a warning instead of panicking.
+    pub worker_concurrency: usize,
+
+    /// Phase 3: how often the worker runs the cross-system drift reconciler
+    /// (Postgres ↔ OpenFGA ↔ Qdrant), in seconds. Default 3600 (hourly).
+    /// Clamped to >= 1 so a misconfigured `0` can never disable the loop.
+    pub reconcile_interval_secs: u64,
+    /// Phase 3: when `true`, the reconciler repairs drift (writes missing
+    /// OpenFGA tuples, deletes orphaned tuples / Qdrant points). **Defaults to
+    /// `false` — dry-run / report-only.** Auto-fix is opt-in via
+    /// `GMRAG_RECONCILE_AUTO_FIX`. A default-ON violation is treated as a
+    /// critical bug in this phase, not a minor detail.
+    pub reconcile_auto_fix: bool,
+
+    /// Phase 4: request-intake rate limiting.
+    pub rate_limit: RateLimitConfig,
+
+    /// Phase 4: separate metrics listener for the worker process.
+    pub worker_metrics_bind: SocketAddr,
 }
 
 impl Config {
@@ -145,9 +212,9 @@ impl Config {
         // Core
         let database_url = require_env("DATABASE_URL")?;
         let http_bind_raw = optional_env("GMRAG_HTTP_BIND", DEFAULT_HTTP_BIND);
-        let http_bind: SocketAddr = http_bind_raw
-            .parse()
-            .map_err(|e| Error::Config(format!("invalid GMRAG_HTTP_BIND '{http_bind_raw}': {e}")))?;
+        let http_bind: SocketAddr = http_bind_raw.parse().map_err(|e| {
+            Error::Config(format!("invalid GMRAG_HTTP_BIND '{http_bind_raw}': {e}"))
+        })?;
         let log_filter = optional_env("GMRAG_RUST_LOG", DEFAULT_LOG_FILTER);
         let tenant_header = optional_env("GMRAG_TENANT_HEADER", DEFAULT_TENANT_HEADER);
         let service_name = optional_env("GMRAG_SERVICE_NAME", "gmrag-api");
@@ -168,7 +235,9 @@ impl Config {
         // Qdrant
         let qdrant = QdrantConfig {
             url: optional_env("QDRANT_URL", DEFAULT_QDRANT_URL),
-            api_key: env::var("QDRANT_API_KEY").ok().filter(|v| !v.trim().is_empty()),
+            api_key: env::var("QDRANT_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             collection_default: optional_env("QDRANT_COLLECTION_DEFAULT", "gmrag_chunks"),
         };
 
@@ -201,7 +270,9 @@ impl Config {
 
         // DeepSeek (optional remote LLM)
         let deepseek = DeepSeekConfig {
-            api_key: env::var("DEEPSEEK_API_KEY").ok().filter(|v| !v.trim().is_empty()),
+            api_key: env::var("DEEPSEEK_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             base_url: optional_env("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
             model: optional_env("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
             timeout_s: env::var("DEEPSEEK_TIMEOUT_S")
@@ -210,16 +281,80 @@ impl Config {
                 .unwrap_or(DEFAULT_DEEPSEEK_TIMEOUT_S),
         };
 
+        let openfga = OpenFgaConfig {
+            api_url: require_env("OPENFGA_API_URL")?,
+            store_id: require_env("OPENFGA_STORE_ID")?,
+            authorization_model_id: require_env("OPENFGA_AUTHORIZATION_MODEL_ID")?,
+            api_token: env::var("OPENFGA_API_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            request_timeout_ms: parse_usize_env(
+                "OPENFGA_REQUEST_TIMEOUT_MS",
+                DEFAULT_OPENFGA_REQUEST_TIMEOUT_MS as usize,
+            )
+            .max(1) as u64,
+            higher_consistency_window_secs: parse_usize_env(
+                "OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS",
+                DEFAULT_OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS as usize,
+            )
+            .max(1) as u64,
+        };
+
         let tenant_key_encryption_key = optional_base64_32_env("GMRAG_TENANT_KEY_ENCRYPTION_KEY")?;
 
         // T84D Phase 1.3 / 1.1 / 1.2 / 3.3 / 4.1: numeric + flag env vars.
         let ocr_enabled = parse_bool_env("GMRAG_OCR_ENABLED", false);
         let outbox_poll_interval_secs =
             parse_usize_env("GMRAG_OUTBOX_POLL_INTERVAL_SECS", 3).max(1) as u64;
-        let sweep_interval_secs =
-            parse_usize_env("GMRAG_SWEEP_INTERVAL_SECS", 60).max(1) as u64;
+        let sweep_interval_secs = parse_usize_env("GMRAG_SWEEP_INTERVAL_SECS", 60).max(1) as u64;
         let database_max_connections = parse_usize_env("DATABASE_MAX_CONNECTIONS", 10) as u32;
         let chat_history_limit = parse_usize_env("GMRAG_CHAT_HISTORY_LIMIT", 10);
+
+        // Phase 0 TASK-P0-04: retention loop configuration. Zero/negative /
+        // out-of-range values are clamped to safe defaults so a misconfigured
+        // env cannot disable retention or issue an unbounded DELETE.
+        let retention_interval_secs =
+            parse_usize_env("GMRAG_RETENTION_INTERVAL_SECS", 86400).max(1) as u64;
+        let outbox_retention_days = parse_retention_days("GMRAG_OUTBOX_RETENTION_DAYS", 30);
+        let usage_retention_days = parse_retention_days("GMRAG_USAGE_RETENTION_DAYS", 90);
+        let audit_retention_days = parse_retention_days("GMRAG_AUDIT_RETENTION_DAYS", 365);
+        let retention_batch_size =
+            parse_usize_env("GMRAG_RETENTION_BATCH_SIZE", 1000).clamp(1, 100_000) as u64;
+
+        // Phase 1: worker concurrency. Parsed leniently — bad/zero/empty
+        // values warn and fall back to DEFAULT_WORKER_CONCURRENCY rather than
+        // panicking the worker at boot.
+        let worker_concurrency = parse_worker_concurrency();
+
+        // Phase 3: cross-system drift reconciler (Postgres ↔ OpenFGA ↔
+        // Qdrant). Auto-fix MUST default to OFF — dry-run/report-only unless
+        // explicitly enabled via GMRAG_RECONCILE_AUTO_FIX. A default-ON
+        // violation is a critical bug in this phase.
+        let reconcile_interval_secs =
+            parse_usize_env("GMRAG_RECONCILE_INTERVAL_SECS", 3600).max(1) as u64;
+        let reconcile_auto_fix = parse_bool_env("GMRAG_RECONCILE_AUTO_FIX", false);
+        let rate_limit = RateLimitConfig {
+            enabled: parse_bool_env("GMRAG_RATELIMIT_ENABLED", true),
+            auth_per_min: parse_usize_env("GMRAG_RATELIMIT_AUTH_PER_MIN", 10).max(1) as u32,
+            job_create_per_min: parse_usize_env("GMRAG_RATELIMIT_JOB_CREATE_PER_MIN", 20).max(1)
+                as u32,
+            chat_create_per_min: parse_usize_env("GMRAG_RATELIMIT_CHAT_CREATE_PER_MIN", 30).max(1)
+                as u32,
+            chat_concurrent_per_tenant: parse_usize_env(
+                "GMRAG_RATELIMIT_CHAT_CONCURRENT_PER_TENANT",
+                50,
+            )
+            .max(1) as u32,
+            general_per_min: parse_usize_env("GMRAG_RATELIMIT_GENERAL_PER_MIN", 300).max(1) as u32,
+            window_secs: 60,
+        };
+        let worker_metrics_bind_raw =
+            optional_env("GMRAG_WORKER_METRICS_BIND", DEFAULT_WORKER_METRICS_BIND);
+        let worker_metrics_bind: SocketAddr = worker_metrics_bind_raw.parse().map_err(|e| {
+            Error::Config(format!(
+                "invalid GMRAG_WORKER_METRICS_BIND '{worker_metrics_bind_raw}': {e}"
+            ))
+        })?;
 
         Ok(Self {
             database_url,
@@ -233,12 +368,23 @@ impl Config {
             redis,
             ollama,
             deepseek,
+            openfga,
             tenant_key_encryption_key,
             ocr_enabled,
             outbox_poll_interval_secs,
             sweep_interval_secs,
             database_max_connections,
             chat_history_limit,
+            retention_interval_secs,
+            outbox_retention_days,
+            usage_retention_days,
+            audit_retention_days,
+            retention_batch_size,
+            worker_concurrency,
+            reconcile_interval_secs,
+            reconcile_auto_fix,
+            rate_limit,
+            worker_metrics_bind,
         })
     }
 
@@ -250,13 +396,20 @@ impl Config {
 fn require_env(key: &'static str) -> Result<String, Error> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Ok(v),
-        Ok(_) => Err(Error::Config(format!("environment variable {key} is empty"))),
-        Err(_) => Err(Error::Config(format!("environment variable {key} is required"))),
+        Ok(_) => Err(Error::Config(format!(
+            "environment variable {key} is empty"
+        ))),
+        Err(_) => Err(Error::Config(format!(
+            "environment variable {key} is required"
+        ))),
     }
 }
 
 fn optional_env(key: &str, default: &str) -> String {
-    env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Parse a boolean env var: "true"/"1" (case-insensitive) → true, else default.
@@ -274,6 +427,58 @@ fn parse_usize_env(key: &str, default: usize) -> usize {
         .filter(|v| !v.trim().is_empty())
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse `GMRAG_WORKER_CONCURRENCY` leniently. The worker must NOT crash at
+/// boot over a misconfigured env var, so any bad input (non-numeric, empty,
+/// zero, negative, overflow) warns and falls back to the default instead of
+/// panicking. Resulting pool size is always >= 1.
+fn parse_worker_concurrency() -> usize {
+    let key = "GMRAG_WORKER_CONCURRENCY";
+    let Some(raw) = env::var(key).ok().filter(|v| !v.trim().is_empty()) else {
+        return DEFAULT_WORKER_CONCURRENCY;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        Ok(0) => {
+            tracing::warn!(
+                var = key,
+                value = %raw,
+                default = DEFAULT_WORKER_CONCURRENCY,
+                "GMRAG_WORKER_CONCURRENCY=0 would produce a 0-sized pool; using default"
+            );
+            DEFAULT_WORKER_CONCURRENCY
+        }
+        Ok(_) => {
+            // Negative/overflow already rejected by parse::<usize>; this branch
+            // is unreachable but kept for completeness.
+            tracing::warn!(var = key, value = %raw, "invalid GMRAG_WORKER_CONCURRENCY; using default");
+            DEFAULT_WORKER_CONCURRENCY
+        }
+        Err(_) => {
+            tracing::warn!(
+                var = key,
+                value = %raw,
+                default = DEFAULT_WORKER_CONCURRENCY,
+                "GMRAG_WORKER_CONCURRENCY is not a valid positive integer; using default"
+            );
+            DEFAULT_WORKER_CONCURRENCY
+        }
+    }
+}
+
+/// Parse a retention window in days, clamped to [1, 36500] (≈ 100 years).
+/// Zero / negative / out-of-range / unparseable values fall back to
+/// `default` so retention can never be silently disabled or made unbounded.
+fn parse_retention_days(key: &str, default: u32) -> u32 {
+    match env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(d) if (1..=36_500).contains(&d) => d,
+        _ => default,
+    }
 }
 
 fn optional_base64_32_env(key: &'static str) -> Result<Option<[u8; 32]>, Error> {
@@ -309,6 +514,7 @@ mod tests {
             "GMRAG_RUST_LOG",
             "GMRAG_TENANT_HEADER",
             "GMRAG_SERVICE_NAME",
+            "GMRAG_WORKER_CONCURRENCY",
             "KEYCLOAK_ISSUER",
             "KEYCLOAK_CLIENT_ID",
             "KEYCLOAK_CLIENT_SECRET",
@@ -332,12 +538,32 @@ mod tests {
             "DEEPSEEK_BASE_URL",
             "DEEPSEEK_MODEL",
             "DEEPSEEK_TIMEOUT_S",
+            "OPENFGA_API_URL",
+            "OPENFGA_STORE_ID",
+            "OPENFGA_AUTHORIZATION_MODEL_ID",
+            "OPENFGA_API_TOKEN",
+            "OPENFGA_REQUEST_TIMEOUT_MS",
+            "OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS",
             "GMRAG_TENANT_KEY_ENCRYPTION_KEY",
             "GMRAG_OCR_ENABLED",
             "GMRAG_OUTBOX_POLL_INTERVAL_SECS",
             "GMRAG_SWEEP_INTERVAL_SECS",
             "DATABASE_MAX_CONNECTIONS",
             "GMRAG_CHAT_HISTORY_LIMIT",
+            "GMRAG_RETENTION_INTERVAL_SECS",
+            "GMRAG_OUTBOX_RETENTION_DAYS",
+            "GMRAG_USAGE_RETENTION_DAYS",
+            "GMRAG_AUDIT_RETENTION_DAYS",
+            "GMRAG_RETENTION_BATCH_SIZE",
+            "GMRAG_RECONCILE_INTERVAL_SECS",
+            "GMRAG_RECONCILE_AUTO_FIX",
+            "GMRAG_RATELIMIT_ENABLED",
+            "GMRAG_RATELIMIT_AUTH_PER_MIN",
+            "GMRAG_RATELIMIT_JOB_CREATE_PER_MIN",
+            "GMRAG_RATELIMIT_CHAT_CREATE_PER_MIN",
+            "GMRAG_RATELIMIT_CHAT_CONCURRENT_PER_TENANT",
+            "GMRAG_RATELIMIT_GENERAL_PER_MIN",
+            "GMRAG_WORKER_METRICS_BIND",
         ];
         for k in keys {
             env::remove_var(k);
@@ -354,6 +580,9 @@ mod tests {
         env::set_var("S3_ACCESS_KEY", "ak");
         env::set_var("S3_SECRET_KEY", "sk");
         env::set_var("S3_BUCKET", "bucket");
+        env::set_var("OPENFGA_API_URL", "http://openfga:8080");
+        env::set_var("OPENFGA_STORE_ID", "store-test");
+        env::set_var("OPENFGA_AUTHORIZATION_MODEL_ID", "model-test");
     }
 
     #[test]
@@ -521,14 +750,180 @@ mod tests {
         assert!(cfg.deepseek.api_key.is_none());
         assert_eq!(cfg.deepseek.model, DEFAULT_DEEPSEEK_MODEL);
         assert_eq!(cfg.deepseek.timeout_s, 60);
+        assert_eq!(cfg.openfga.api_url, "http://openfga:8080");
+        assert_eq!(cfg.openfga.store_id, "store-test");
+        assert_eq!(cfg.openfga.authorization_model_id, "model-test");
+        assert_eq!(
+            cfg.openfga.request_timeout_ms,
+            DEFAULT_OPENFGA_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            cfg.openfga.higher_consistency_window_secs,
+            DEFAULT_OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS
+        );
 
         env::set_var("DEEPSEEK_API_KEY", "sk-test");
         env::set_var("DEEPSEEK_MODEL", "deepseek-v3");
         env::set_var("DEEPSEEK_TIMEOUT_S", "120");
+        env::set_var("OPENFGA_API_TOKEN", "fga-token");
+        env::set_var("OPENFGA_REQUEST_TIMEOUT_MS", "2500");
+        env::set_var("OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS", "9");
         let cfg = Config::from_process_env().unwrap();
         assert_eq!(cfg.deepseek.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cfg.deepseek.model, "deepseek-v3");
         assert_eq!(cfg.deepseek.timeout_s, 120);
+        assert_eq!(cfg.openfga.api_token.as_deref(), Some("fga-token"));
+        assert_eq!(cfg.openfga.request_timeout_ms, 2500);
+        assert_eq!(cfg.openfga.higher_consistency_window_secs, 9);
+
+        clear_config_env();
+    }
+
+    #[test]
+    fn config_retention_defaults_and_clamping() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_config_env();
+        set_minimal_env();
+
+        // Defaults.
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.retention_interval_secs, 86400);
+        assert_eq!(cfg.outbox_retention_days, 30);
+        assert_eq!(cfg.usage_retention_days, 90);
+        assert_eq!(cfg.audit_retention_days, 365);
+        assert_eq!(cfg.retention_batch_size, 1000);
+
+        // Overrides honoured.
+        env::set_var("GMRAG_RETENTION_INTERVAL_SECS", "3600");
+        env::set_var("GMRAG_OUTBOX_RETENTION_DAYS", "7");
+        env::set_var("GMRAG_USAGE_RETENTION_DAYS", "14");
+        env::set_var("GMRAG_AUDIT_RETENTION_DAYS", "30");
+        env::set_var("GMRAG_RETENTION_BATCH_SIZE", "500");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.retention_interval_secs, 3600);
+        assert_eq!(cfg.outbox_retention_days, 7);
+        assert_eq!(cfg.usage_retention_days, 14);
+        assert_eq!(cfg.audit_retention_days, 30);
+        assert_eq!(cfg.retention_batch_size, 500);
+
+        // Zero / negative / out-of-range fall back to defaults (retention
+        // can never be disabled or made unbounded).
+        env::set_var("GMRAG_RETENTION_INTERVAL_SECS", "0");
+        env::set_var("GMRAG_OUTBOX_RETENTION_DAYS", "0");
+        env::set_var("GMRAG_USAGE_RETENTION_DAYS", "-5");
+        env::set_var("GMRAG_AUDIT_RETENTION_DAYS", "999999");
+        env::set_var("GMRAG_RETENTION_BATCH_SIZE", "0");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.retention_interval_secs, 1, "interval clamped to >=1");
+        assert_eq!(cfg.outbox_retention_days, 30, "zero days → default");
+        assert_eq!(cfg.usage_retention_days, 90, "negative days → default");
+        assert_eq!(cfg.audit_retention_days, 365, "out-of-range days → default");
+        assert_eq!(cfg.retention_batch_size, 1, "zero batch → clamped to 1");
+
+        clear_config_env();
+    }
+
+    #[test]
+    fn config_worker_concurrency_default_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_config_env();
+        set_minimal_env();
+
+        // Default when unset: 4 (sane default for a worker pool).
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(
+            cfg.worker_concurrency, 4,
+            "missing GMRAG_WORKER_CONCURRENCY must fall back to default 4"
+        );
+
+        // Valid override honoured.
+        env::set_var("GMRAG_WORKER_CONCURRENCY", "8");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.worker_concurrency, 8);
+
+        // Bad value: must NOT panic — fall back to default with a warning.
+        env::set_var("GMRAG_WORKER_CONCURRENCY", "not-a-number");
+        let cfg = Config::from_process_env().expect("bad value must not fail Config parse");
+        assert_eq!(
+            cfg.worker_concurrency, 4,
+            "unparseable value must fall back to default 4, not panic"
+        );
+
+        // Zero/negative: clamp to at least 1 (a pool of 0 workers can't run
+        // any job; treat as misconfigured and fall back to default).
+        env::set_var("GMRAG_WORKER_CONCURRENCY", "0");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(
+            cfg.worker_concurrency, 4,
+            "zero must fall back to default 4, not produce a 0-sized pool"
+        );
+
+        // Empty: fall back to default.
+        env::set_var("GMRAG_WORKER_CONCURRENCY", "   ");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.worker_concurrency, 4);
+
+        clear_config_env();
+    }
+
+    #[test]
+    fn config_reconcile_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_config_env();
+        set_minimal_env();
+
+        // Default: interval 3600 (hourly), auto-fix OFF (dry-run/report-only).
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.reconcile_interval_secs, 3600);
+        assert!(
+            !cfg.reconcile_auto_fix,
+            "GMRAG_RECONCILE_AUTO_FIX must default to false (dry-run/report-only)"
+        );
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.auth_per_min, 10);
+        assert_eq!(cfg.rate_limit.job_create_per_min, 20);
+        assert_eq!(cfg.rate_limit.chat_create_per_min, 30);
+        assert_eq!(cfg.rate_limit.chat_concurrent_per_tenant, 50);
+        assert_eq!(cfg.rate_limit.general_per_min, 300);
+        assert_eq!(cfg.rate_limit.window_secs, 60);
+        assert_eq!(
+            cfg.worker_metrics_bind.to_string(),
+            DEFAULT_WORKER_METRICS_BIND
+        );
+
+        // Overrides honoured.
+        env::set_var("GMRAG_RECONCILE_INTERVAL_SECS", "120");
+        env::set_var("GMRAG_RECONCILE_AUTO_FIX", "true");
+        env::set_var("GMRAG_RATELIMIT_ENABLED", "false");
+        env::set_var("GMRAG_RATELIMIT_AUTH_PER_MIN", "11");
+        env::set_var("GMRAG_RATELIMIT_JOB_CREATE_PER_MIN", "21");
+        env::set_var("GMRAG_RATELIMIT_CHAT_CREATE_PER_MIN", "31");
+        env::set_var("GMRAG_RATELIMIT_CHAT_CONCURRENT_PER_TENANT", "51");
+        env::set_var("GMRAG_RATELIMIT_GENERAL_PER_MIN", "301");
+        env::set_var("GMRAG_WORKER_METRICS_BIND", "127.0.0.1:19091");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(cfg.reconcile_interval_secs, 120);
+        assert!(cfg.reconcile_auto_fix);
+        assert!(!cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.auth_per_min, 11);
+        assert_eq!(cfg.rate_limit.job_create_per_min, 21);
+        assert_eq!(cfg.rate_limit.chat_create_per_min, 31);
+        assert_eq!(cfg.rate_limit.chat_concurrent_per_tenant, 51);
+        assert_eq!(cfg.rate_limit.general_per_min, 301);
+        assert_eq!(cfg.worker_metrics_bind.to_string(), "127.0.0.1:19091");
+
+        // Interval clamped to >= 1; auto-fix only true on "true"/"1".
+        env::set_var("GMRAG_RECONCILE_INTERVAL_SECS", "0");
+        env::set_var("GMRAG_RECONCILE_AUTO_FIX", "no");
+        let cfg = Config::from_process_env().unwrap();
+        assert_eq!(
+            cfg.reconcile_interval_secs, 1,
+            "zero interval clamped to >=1"
+        );
+        assert!(
+            !cfg.reconcile_auto_fix,
+            "non-true value must not enable auto-fix"
+        );
 
         clear_config_env();
     }
@@ -554,6 +949,14 @@ mod tests {
         assert!(
             matches!(res, Err(Error::Config(ref msg)) if msg.contains("S3_ACCESS_KEY")),
             "missing S3_ACCESS_KEY must fail, got {res:?}"
+        );
+
+        set_minimal_env();
+        env::remove_var("OPENFGA_STORE_ID");
+        let res = Config::from_process_env();
+        assert!(
+            matches!(res, Err(Error::Config(ref msg)) if msg.contains("OPENFGA_STORE_ID")),
+            "missing OPENFGA_STORE_ID must fail, got {res:?}"
         );
 
         clear_config_env();

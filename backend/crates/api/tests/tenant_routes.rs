@@ -8,29 +8,35 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::Json;
-use serde_json::Value;
+use axum::Router;
+use serde_json::{json, Value};
 use sqlx::PgPool;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
-use gmrag_api::auth::tenant::TenantContext;
+use gmrag_api::auth::tenant::{tenant_middleware, TenantContext, TenantHeaderName};
 use gmrag_api::error::ApiError;
-use gmrag_api::middleware::rls::SharedConnection;
-use gmrag_api::pool::AdminPool;
-use gmrag_api::routes::tenant_members::{
-    invite_member, list_members, remove_member, InviteBody,
-};
+use gmrag_api::middleware::rls::{rls_middleware, SharedConnection};
+use gmrag_api::pool::{AdminPool, AppPool};
+use gmrag_api::routes::tenant_members::{invite_member, list_members, remove_member, InviteBody};
 use gmrag_api::routes::tenants::{
     create_tenant, delete_tenant, list_tenants, update_tenant, CreateTenantBody, UpdateTenantBody,
 };
 use gmrag_api::storage::ObjectStore;
 use gmrag_core::config::QdrantConfig;
 use gmrag_core::QdrantStore;
+
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
 
 /// T84D Phase 2.2: a no-op ObjectStore so delete_tenant tests don't need
 /// live MinIO. The handler best-effort-logs `delete_prefix` failures and
@@ -142,6 +148,75 @@ async fn parts(result: Result<impl IntoResponse, ApiError>) -> (StatusCode, Valu
     (status, body)
 }
 
+async fn tenant_echo(Extension(tenant): Extension<TenantContext>) -> impl IntoResponse {
+    Json(json!({ "tenant_id": tenant.0.to_string() }))
+}
+
+fn tenant_middleware_app(pool: PgPool, user_id: Uuid, tenant_header: &str) -> Router {
+    Router::new()
+        .route("/protected", get(tenant_echo))
+        .layer(axum::middleware::from_fn(rls_middleware))
+        .layer(axum::middleware::from_fn(tenant_middleware))
+        .layer(Extension(auth_user(user_id)))
+        .layer(Extension(AdminPool(pool.clone())))
+        .layer(Extension(AppPool(pool.clone())))
+        .layer(Extension(test_authz(&pool)))
+        .layer(Extension(
+            TenantHeaderName::from_config(tenant_header).expect("test tenant header"),
+        ))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tenant_middleware_honors_configured_header_and_ignores_default(pool: PgPool) {
+    let user = create_user(&pool, "header@phase5.com").await;
+    let tenant = insert_tenant(&pool, "Header Config").await;
+    add_member(&pool, tenant, user, "owner").await;
+    let app = tenant_middleware_app(pool.clone(), user, "x-gmrag-tenant");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/protected")
+                .header("x-gmrag-tenant", tenant.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["tenant_id"].as_str().unwrap(), tenant.to_string());
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/protected")
+                .header("x-tenant-id", tenant.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "bad-request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("x-gmrag-tenant"),
+        "unexpected message: {body}"
+    );
+}
+
+async fn body_json(resp: axum::response::Response) -> Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 // ─── T52: GET/POST /tenants ──────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -152,6 +227,7 @@ async fn create_tenant_makes_owner_and_lists(pool: PgPool) {
         create_tenant(
             Extension(auth_user(user)),
             Extension(AdminPool(pool.clone())),
+            Extension(test_authz(&pool)),
             Json(CreateTenantBody {
                 name: "Acme".into(),
             }),
@@ -165,19 +241,23 @@ async fn create_tenant_makes_owner_and_lists(pool: PgPool) {
     let tenant_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
 
     // Membership row created with owner role.
-    let role: String = sqlx::query_scalar(
-        "SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
-    )
-    .bind(tenant_id)
-    .bind(user)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let role: String =
+        sqlx::query_scalar("SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2")
+            .bind(tenant_id)
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(role, "owner");
 
     // GET /tenants lists it.
     let (status, body) = parts(
-        list_tenants(Extension(auth_user(user)), Extension(AdminPool(pool.clone()))).await,
+        list_tenants(
+            Extension(auth_user(user)),
+            Extension(AdminPool(pool.clone())),
+            Extension(test_authz(&pool)),
+        )
+        .await,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -193,6 +273,7 @@ async fn create_tenant_rejects_empty_name(pool: PgPool) {
     let result = create_tenant(
         Extension(auth_user(user)),
         Extension(AdminPool(pool.clone())),
+        Extension(test_authz(&pool)),
         Json(CreateTenantBody { name: "   ".into() }),
     )
     .await;
@@ -208,9 +289,15 @@ async fn list_tenants_only_returns_membership(pool: PgPool) {
     add_member(&pool, t_mine, user, "owner").await;
     add_member(&pool, t_other, other, "owner").await;
 
-    let (status, body) =
-        parts(list_tenants(Extension(auth_user(user)), Extension(AdminPool(pool.clone()))).await)
-            .await;
+    let (status, body) = parts(
+        list_tenants(
+            Extension(auth_user(user)),
+            Extension(AdminPool(pool.clone())),
+            Extension(test_authz(&pool)),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let tenants = body["tenants"].as_array().unwrap();
     assert_eq!(tenants.len(), 1);
@@ -232,6 +319,7 @@ async fn owner_can_rename_tenant(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
             Json(UpdateTenantBody { name: "New".into() }),
         )
         .await,
@@ -262,7 +350,10 @@ async fn non_owner_cannot_rename_tenant(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(conn),
-        Json(UpdateTenantBody { name: "Nope".into() }),
+        Extension(test_authz(&pool)),
+        Json(UpdateTenantBody {
+            name: "Nope".into(),
+        }),
     )
     .await;
     assert!(matches!(result, Err(ApiError::Forbidden(_))));
@@ -280,6 +371,7 @@ async fn rename_with_mismatched_path_is_bad_request(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(owner)),
         Extension(conn),
+        Extension(test_authz(&pool)),
         Json(UpdateTenantBody { name: "New".into() }),
     )
     .await;
@@ -306,6 +398,7 @@ async fn owner_can_delete_tenant_with_cascade(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
             Extension(qdrant),
             Extension(object_store),
         )
@@ -317,7 +410,9 @@ async fn owner_can_delete_tenant_with_cascade(pool: PgPool) {
     // Commit so the deletion is observable via the superuser pool.
     {
         let mut guard = conn.lock().await;
-        sqlx::Executor::execute(&mut *guard, "COMMIT").await.unwrap();
+        sqlx::Executor::execute(&mut *guard, "COMMIT")
+            .await
+            .unwrap();
     }
 
     let tenant_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants WHERE id = $1")
@@ -356,6 +451,7 @@ async fn non_owner_cannot_delete_tenant(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(conn),
+        Extension(test_authz(&pool)),
         Extension(qdrant),
         Extension(object_store),
     )
@@ -403,6 +499,7 @@ async fn owner_can_invite_member(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
             Json(InviteBody {
                 email: "invitee@t54i.com".into(),
                 role: Some("admin".into()),
@@ -440,6 +537,7 @@ async fn non_owner_cannot_invite(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(conn),
+        Extension(test_authz(&pool)),
         Json(InviteBody {
             email: "x@t54i.com".into(),
             role: None,
@@ -464,6 +562,7 @@ async fn owner_can_remove_member(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -491,6 +590,7 @@ async fn cannot_remove_last_owner(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(owner)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(result, Err(ApiError::BadRequest(_))));

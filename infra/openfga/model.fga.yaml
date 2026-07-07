@@ -1,0 +1,223 @@
+name: "GMRAG v2 OpenFGA authorization model"
+model_file: ./model.fga
+
+tuples:
+  - user: user:00000000-0000-0000-0000-000000000001
+    relation: owner
+    object: tenant:10000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000002
+    relation: admin
+    object: tenant:10000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000003
+    relation: member
+    object: tenant:10000000-0000-0000-0000-000000000001
+  - user: tenant:10000000-0000-0000-0000-000000000001
+    relation: tenant
+    object: workspace:20000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000004
+    relation: owner
+    object: workspace:20000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000005
+    relation: admin
+    object: workspace:20000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000006
+    relation: member
+    object: workspace:20000000-0000-0000-0000-000000000001
+  - user: tenant:10000000-0000-0000-0000-000000000001
+    relation: tenant
+    object: document:30000000-0000-0000-0000-000000000001
+  - user: workspace:20000000-0000-0000-0000-000000000001
+    relation: workspace
+    object: document:30000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000004
+    relation: owner
+    object: document:30000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000007
+    relation: editor
+    object: document:30000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000008
+    relation: viewer
+    object: document:30000000-0000-0000-0000-000000000001
+  - user: workspace:20000000-0000-0000-0000-000000000001#member
+    relation: viewer
+    object: document:30000000-0000-0000-0000-000000000002
+  - user: tenant:10000000-0000-0000-0000-000000000001#member
+    relation: viewer
+    object: document:30000000-0000-0000-0000-000000000003
+  - user: tenant:10000000-0000-0000-0000-000000000001
+    relation: tenant
+    object: chat_session:40000000-0000-0000-0000-000000000001
+  - user: workspace:20000000-0000-0000-0000-000000000001
+    relation: workspace
+    object: chat_session:40000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000004
+    relation: owner
+    object: chat_session:40000000-0000-0000-0000-000000000001
+  - user: user:00000000-0000-0000-0000-000000000007
+    relation: viewer
+    object: chat_session:40000000-0000-0000-0000-000000000001
+
+  # Second tenant, used to prove cross-tenant isolation.
+  - user: user:00000000-0000-0000-0000-000000000011
+    relation: owner
+    object: tenant:10000000-0000-0000-0000-000000000002
+  - user: tenant:10000000-0000-0000-0000-000000000002
+    relation: tenant
+    object: document:30000000-0000-0000-0000-000000000005
+
+  # Chat session with no workspace tuple, used to prove there is no
+  # implicit workspace inheritance when the relation is simply absent.
+  - user: user:00000000-0000-0000-0000-000000000004
+    relation: owner
+    object: chat_session:40000000-0000-0000-0000-000000000002
+  - user: tenant:10000000-0000-0000-0000-000000000001
+    relation: tenant
+    object: chat_session:40000000-0000-0000-0000-000000000002
+
+tests:
+  - name: "tenant roles"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000001
+        object: tenant:10000000-0000-0000-0000-000000000001
+        assertions:
+          owner: true
+          member: true
+      - user: user:00000000-0000-0000-0000-000000000002
+        object: tenant:10000000-0000-0000-0000-000000000001
+        assertions:
+          admin: true
+          member: true
+          owner: false
+      - user: user:00000000-0000-0000-0000-000000000009
+        object: tenant:10000000-0000-0000-0000-000000000001
+        assertions:
+          member: false
+
+  - name: "workspace roles and tenant-owner override"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000004
+        object: workspace:20000000-0000-0000-0000-000000000001
+        assertions:
+          owner: true
+          member: true
+          manager: true
+          accessor: true
+      - user: user:00000000-0000-0000-0000-000000000005
+        object: workspace:20000000-0000-0000-0000-000000000001
+        assertions:
+          member: true
+          manager: true
+          accessor: true
+      - user: user:00000000-0000-0000-0000-000000000006
+        object: workspace:20000000-0000-0000-0000-000000000001
+        assertions:
+          manager: false
+          accessor: true
+      - user: user:00000000-0000-0000-0000-000000000001
+        object: workspace:20000000-0000-0000-0000-000000000001
+        assertions:
+          manager: true
+          accessor: true
+      - user: user:00000000-0000-0000-0000-000000000002
+        object: workspace:20000000-0000-0000-0000-000000000001
+        assertions:
+          manager: false
+          accessor: false
+
+  - name: "document ownership, grants, workspace inheritance, and tenant share"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000004
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          owner: true
+          editor: true
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000007
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          editor: true
+          viewer: true
+          owner: false
+      - user: user:00000000-0000-0000-0000-000000000008
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: true
+          editor: false
+      - user: user:00000000-0000-0000-0000-000000000006
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000006
+        object: document:30000000-0000-0000-0000-000000000002
+        assertions:
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000003
+        object: document:30000000-0000-0000-0000-000000000003
+        assertions:
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000009
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: false
+      - user: user:00000000-0000-0000-0000-000000000003
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: false
+
+  - name: "cross-tenant access is denied in both directions"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000003
+        object: document:30000000-0000-0000-0000-000000000005
+        assertions:
+          viewer: false
+      - user: user:00000000-0000-0000-0000-000000000011
+        object: document:30000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: false
+
+  - name: "chat session ownership, grants, and workspace inheritance"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000004
+        object: chat_session:40000000-0000-0000-0000-000000000001
+        assertions:
+          owner: true
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000007
+        object: chat_session:40000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: true
+          editor: false
+      - user: user:00000000-0000-0000-0000-000000000006
+        object: chat_session:40000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000009
+        object: chat_session:40000000-0000-0000-0000-000000000001
+        assertions:
+          viewer: false
+
+  - name: "null-workspace chat session has no workspace inheritance"
+    check:
+      - user: user:00000000-0000-0000-0000-000000000004
+        object: chat_session:40000000-0000-0000-0000-000000000002
+        assertions:
+          owner: true
+          viewer: true
+      - user: user:00000000-0000-0000-0000-000000000006
+        object: chat_session:40000000-0000-0000-0000-000000000002
+        assertions:
+          viewer: false
+
+  - name: "list objects follows the model"
+    list_objects:
+      - user: user:00000000-0000-0000-0000-000000000006
+        type: document
+        assertions:
+          viewer:
+            - document:30000000-0000-0000-0000-000000000001
+            - document:30000000-0000-0000-0000-000000000002
+      - user: user:00000000-0000-0000-0000-000000000003
+        type: document
+        assertions:
+          viewer:
+            - document:30000000-0000-0000-0000-000000000003

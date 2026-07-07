@@ -10,9 +10,14 @@ use uuid::Uuid;
 use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
+use gmrag_api::authz::{document_obj, tuple, user_obj, AuthzService, REL_VIEWER};
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::routes::graph::{get_workspace_graph, GraphQueryParams};
+
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
 
 fn claims_for(user_id: Uuid) -> JwtClaims {
     JwtClaims {
@@ -104,7 +109,7 @@ async fn insert_document(
 ) {
     sqlx::query(
         "INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, visibility, s3_key)
-         VALUES ($1, $2, $3, $4, $5, 'ready', $6, 'k')",
+         VALUES ($1, $2, $3, $4, $5, 'indexed', $6, 'k')",
     )
     .bind(id)
     .bind(tenant_id)
@@ -117,12 +122,7 @@ async fn insert_document(
     .unwrap();
 }
 
-async fn link_node_document(
-    pool: &PgPool,
-    node_id: Uuid,
-    document_id: Uuid,
-    tenant_id: Uuid,
-) {
+async fn link_node_document(pool: &PgPool, node_id: Uuid, document_id: Uuid, tenant_id: Uuid) {
     sqlx::query(
         "INSERT INTO graph_node_documents (node_id, document_id, tenant_id)
          VALUES ($1, $2, $3)",
@@ -136,25 +136,24 @@ async fn link_node_document(
 }
 
 async fn insert_doc_grant(
-    pool: &PgPool,
-    tenant_id: Uuid,
+    authz: &AuthzService,
     doc_id: Uuid,
     principal_type: &str,
     principal_id: Uuid,
     permission: &str,
 ) {
-    sqlx::query(
-        "INSERT INTO resource_acl (tenant_id, resource_type, resource_id, principal_type, principal_id, permission)
-         VALUES ($1, 'document', $2, $3, $4, $5)",
-    )
-    .bind(tenant_id)
-    .bind(doc_id)
-    .bind(principal_type)
-    .bind(principal_id)
-    .bind(permission)
-    .execute(pool)
-    .await
-    .unwrap();
+    assert_eq!(principal_type, "user");
+    authz
+        .write_relationships(
+            vec![tuple(
+                user_obj(principal_id),
+                permission,
+                document_obj(doc_id),
+            )],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
 }
 
 async fn rls_conn(pool: &PgPool, tenant_id: Uuid) -> SharedConnection {
@@ -175,6 +174,7 @@ async fn call_graph(
     ws: Uuid,
     user: Uuid,
     conn: SharedConnection,
+    authz: AuthzService,
     params: GraphQueryParams,
 ) -> Value {
     let resp = get_workspace_graph(
@@ -183,6 +183,7 @@ async fn call_graph(
         Extension(TenantContext(tenant)),
         Extension(auth_user(user)),
         Extension(conn),
+        Extension(authz),
     )
     .await
     .unwrap()
@@ -239,10 +240,17 @@ async fn get_graph_returns_nodes_and_edges(pool: PgPool) {
     .unwrap();
 
     let conn = rls_conn(&pool, tenant).await;
-    let body = call_graph(tenant, ws, user, conn, GraphQueryParams {
-        cursor: None,
-        limit: None,
-    })
+    let body = call_graph(
+        tenant,
+        ws,
+        user,
+        conn,
+        test_authz(&pool),
+        GraphQueryParams {
+            cursor: None,
+            limit: None,
+        },
+    )
     .await;
 
     assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
@@ -283,6 +291,7 @@ async fn get_graph_paginates_with_cursor(pool: PgPool) {
         ws,
         user,
         conn,
+        test_authz(&pool),
         GraphQueryParams {
             cursor: None,
             limit: Some(2),
@@ -302,6 +311,7 @@ async fn get_graph_paginates_with_cursor(pool: PgPool) {
         ws,
         user,
         conn,
+        test_authz(&pool),
         GraphQueryParams {
             cursor: Some(cursor),
             limit: Some(2),
@@ -345,23 +355,42 @@ async fn get_graph_acl_hides_private_node(pool: PgPool) {
     .unwrap();
     link_node_document(&pool, node_id, private_doc, tenant).await;
 
+    // Non-members cannot access the graph endpoint at all (404).
     let conn = rls_conn(&pool, tenant).await;
-    let body = call_graph(tenant, ws, stranger, conn, GraphQueryParams {
-        cursor: None,
-        limit: None,
-    })
+    let err = get_workspace_graph(
+        Path((tenant, ws)),
+        default_query(),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(stranger)),
+        Extension(conn),
+        Extension(test_authz(&pool)),
+    )
     .await;
-    assert_eq!(body["nodes"].as_array().unwrap().len(), 0);
+    assert!(matches!(err, Err(ApiError::NotFound)));
 
-    insert_doc_grant(&pool, tenant, private_doc, "user", viewer, "viewer").await;
+    // Viewer with an explicit document grant must be a workspace member to
+    // call the graph route; once granted they can see the private node.
+    add_workspace_member(&pool, ws, tenant, viewer).await;
+    let authz = test_authz(&pool);
+    insert_doc_grant(&authz, private_doc, "user", viewer, REL_VIEWER).await;
     let conn = rls_conn(&pool, tenant).await;
-    let body = call_graph(tenant, ws, viewer, conn, GraphQueryParams {
-        cursor: None,
-        limit: None,
-    })
+    let body = call_graph(
+        tenant,
+        ws,
+        viewer,
+        conn,
+        authz,
+        GraphQueryParams {
+            cursor: None,
+            limit: None,
+        },
+    )
     .await;
     assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
-    assert_eq!(body["nodes"][0]["id"].as_str().unwrap(), node_id.to_string());
+    assert_eq!(
+        body["nodes"][0]["id"].as_str().unwrap(),
+        node_id.to_string()
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -379,6 +408,7 @@ async fn get_graph_denied_for_non_member(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(stranger)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(err, Err(ApiError::NotFound)));
@@ -399,6 +429,7 @@ async fn get_graph_cross_tenant(pool: PgPool) {
         Extension(TenantContext(tenant_a)),
         Extension(auth_user(user)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(err, Err(ApiError::NotFound)));

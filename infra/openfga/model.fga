@@ -1,0 +1,35 @@
+model
+  schema 1.1
+
+type user
+
+type tenant
+  relations
+    define owner: [user]
+    define admin: [user]
+    define member: [user] or owner or admin
+
+type workspace
+  relations
+    define tenant: [tenant]
+    define owner: [user]
+    define admin: [user]
+    define member: [user] or owner or admin
+    define accessor: member or owner from tenant
+    define manager: owner or admin or owner from tenant
+
+type document
+  relations
+    define tenant: [tenant]
+    define workspace: [workspace]
+    define owner: [user]
+    define editor: [user, workspace#member] or owner
+    define viewer: [user, workspace#member, tenant#member] or editor or member from workspace
+
+type chat_session
+  relations
+    define tenant: [tenant]
+    define workspace: [workspace]
+    define owner: [user]
+    define editor: [user, workspace#member] or owner
+    define viewer: [user, workspace#member] or editor or member from workspace

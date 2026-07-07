@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeleteCollectionBuilder,
-    DeletePointsBuilder, Distance, FieldType, Filter, PointStruct, ScoredPoint,
-    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    DeletePointsBuilder, Distance, FieldType, Filter, PointId, PointStruct, ScoredPoint,
+    ScrollPoints, ScrollPointsBuilder, ScrollResponse, SearchPointsBuilder, UpsertPointsBuilder,
+    VectorParamsBuilder,
 };
 use uuid::Uuid;
 
@@ -32,6 +33,21 @@ pub struct QdrantStore {
     client: Arc<qdrant_client::Qdrant>,
 }
 
+/// One chunk point's provenance, as read back from Qdrant by the Phase 3
+/// reconciler. `document_id` is `None` when the payload field is absent or
+/// not a valid UUID (malformed point — reported, never auto-deleted blindly).
+#[derive(Debug, Clone)]
+pub struct ChunkPointRef {
+    pub document_id: Option<Uuid>,
+}
+
+/// One graph-node point's provenance, as read back from Qdrant by the Phase 3
+/// reconciler. `node_id` is `None` for malformed points.
+#[derive(Debug, Clone)]
+pub struct GraphNodePointRef {
+    pub node_id: Option<Uuid>,
+}
+
 impl QdrantStore {
     /// Build a `QdrantStore` from config and confirm the server is reachable.
     ///
@@ -44,14 +60,20 @@ impl QdrantStore {
             builder = builder.api_key(key.clone());
         }
         let client = builder.build()?;
-        let store = Self { client: Arc::new(client) };
+        let store = Self {
+            client: Arc::new(client),
+        };
         store.health_check().await?;
         Ok(store)
     }
 
     /// Liveness probe — wraps `qdrant_client::Qdrant::health_check`.
     pub async fn health_check(&self) -> Result<()> {
-        self.client.health_check().await.map_err(Error::from).map(|_| ())
+        self.client
+            .health_check()
+            .await
+            .map_err(Error::from)
+            .map(|_| ())
     }
 
     /// List the names of all collections on the server.
@@ -97,14 +119,17 @@ impl QdrantStore {
         if self.collection_exists(&name).await? {
             return Ok(());
         }
-        self.create_collection_with_indexes(&name, &[
-            ("workspace_id", FieldType::Uuid),
-            ("document_id", FieldType::Uuid),
-            ("chunk_index", FieldType::Integer),
-            ("filename", FieldType::Keyword),
-            ("owner_id", FieldType::Uuid),
-            ("visibility", FieldType::Keyword),
-        ])
+        self.create_collection_with_indexes(
+            &name,
+            &[
+                ("workspace_id", FieldType::Uuid),
+                ("document_id", FieldType::Uuid),
+                ("chunk_index", FieldType::Integer),
+                ("filename", FieldType::Keyword),
+                ("owner_id", FieldType::Uuid),
+                ("visibility", FieldType::Keyword),
+            ],
+        )
         .await
     }
 
@@ -123,18 +148,24 @@ impl QdrantStore {
         if self.collection_exists(&name).await? {
             return Ok(());
         }
-        self.create_collection_with_indexes(&name, &[
-            ("node_id", FieldType::Uuid),
-            ("workspace_id", FieldType::Uuid),
-            ("entity_name", FieldType::Keyword),
-        ])
+        self.create_collection_with_indexes(
+            &name,
+            &[
+                ("node_id", FieldType::Uuid),
+                ("workspace_id", FieldType::Uuid),
+                ("entity_name", FieldType::Keyword),
+            ],
+        )
         .await
     }
 
     /// Returns `true` if a collection with the given name exists on the
     /// server. Used by the idempotent `create_*` helpers (T30).
     async fn collection_exists(&self, name: &str) -> Result<bool> {
-        Ok(self.list_collection_names().await?.contains(&name.to_string()))
+        Ok(self
+            .list_collection_names()
+            .await?
+            .contains(&name.to_string()))
     }
 
     /// Provision both tenant-scoped collections (`chunks_{tenant_id}` and
@@ -189,11 +220,7 @@ impl QdrantStore {
     /// new points. For bulk ingestion of very large batches, consider
     /// splitting the points upstream and calling this method per chunk to
     /// avoid gRPC timeouts (Qdrant single-request limit).
-    pub async fn upsert_chunks(
-        &self,
-        tenant_id: Uuid,
-        points: Vec<PointStruct>,
-    ) -> Result<()> {
+    pub async fn upsert_chunks(&self, tenant_id: Uuid, points: Vec<PointStruct>) -> Result<()> {
         let name = format!("chunks_{tenant_id}");
         self.client
             .upsert_points(UpsertPointsBuilder::new(name, points).wait(true))
@@ -229,11 +256,7 @@ impl QdrantStore {
         if let Some(f) = filter {
             req = req.filter(f);
         }
-        let resp = self
-            .client
-            .search_points(req)
-            .await
-            .map_err(Error::from)?;
+        let resp = self.client.search_points(req).await.map_err(Error::from)?;
         Ok(resp.result)
     }
 
@@ -288,8 +311,7 @@ impl QdrantStore {
         top_k: u64,
     ) -> Result<Vec<ScoredPoint>> {
         let name = format!("graph_{tenant_id}");
-        let filter =
-            Filter::must([Condition::matches("workspace_id", workspace_id.to_string())]);
+        let filter = Filter::must([Condition::matches("workspace_id", workspace_id.to_string())]);
         let resp = self
             .client
             .search_points(
@@ -324,15 +346,155 @@ impl QdrantStore {
         if !self.collection_exists(&name).await? {
             return Ok(());
         }
-        let filter = Filter::must([Condition::matches(
-            "document_id",
-            document_id.to_string(),
-        )]);
+        let filter = Filter::must([Condition::matches("document_id", document_id.to_string())]);
         self.client
             .delete_points(DeletePointsBuilder::new(name).points(filter).wait(true))
             .await
             .map_err(Error::from)?;
         Ok(())
+    }
+
+    /// Delete every chunk point whose `workspace_id` payload matches
+    /// `workspace_id` from `chunks_{tenant_id}` (Phase 0 TASK-P0-04
+    /// workspace cleanup).
+    ///
+    /// Used by the workspace delete path to tear down the workspace's chunk
+    /// vectors before the Postgres cascade removes the workspace row.
+    /// Idempotent: a missing collection is a no-op. `.wait(true)` ensures
+    /// the points are gone before the call returns.
+    pub async fn delete_chunks_by_workspace(
+        &self,
+        tenant_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<()> {
+        let name = format!("chunks_{tenant_id}");
+        if !self.collection_exists(&name).await? {
+            return Ok(());
+        }
+        let filter = Filter::must([Condition::matches("workspace_id", workspace_id.to_string())]);
+        self.client
+            .delete_points(DeletePointsBuilder::new(name).points(filter).wait(true))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Bulk-delete graph node points by `node_id` payload from
+    /// `graph_{tenant_id}` (Phase 0 TASK-P0-04 document graph cleanup).
+    ///
+    /// `node_ids` may be empty (the call is a no-op). All node ids are sent
+    /// in a single `Filter::should` (OR over `node_id` matches) so this is
+    /// ONE network request regardless of how many nodes are removed — never
+    /// one request per node. Idempotent: a missing collection is a no-op.
+    /// `.wait(true)` ensures the points are gone before the call returns.
+    pub async fn delete_graph_nodes(&self, tenant_id: Uuid, node_ids: &[Uuid]) -> Result<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let name = format!("graph_{tenant_id}");
+        if !self.collection_exists(&name).await? {
+            return Ok(());
+        }
+        // OR over node_id payload matches — a single filtered delete request.
+        let conditions: Vec<_> = node_ids
+            .iter()
+            .map(|id| Condition::matches("node_id", id.to_string()))
+            .collect();
+        let filter = Filter::should(conditions);
+        self.client
+            .delete_points(DeletePointsBuilder::new(name).points(filter).wait(true))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Read a single string payload field from a Qdrant point payload.
+    ///
+    /// Qdrant returns payloads as `HashMap<String, prost::Value>`; the worker
+    /// writes `document_id` / `node_id` as string UUIDs, so this extracts the
+    /// `StringValue` variant directly (no serde round-trip needed). Returns
+    /// `None` for missing keys or non-string values.
+    fn payload_string(
+        payload: &std::collections::HashMap<String, qdrant_client::qdrant::Value>,
+        key: &str,
+    ) -> Option<String> {
+        use qdrant_client::qdrant::value::Kind;
+        let value = payload.get(key)?;
+        match &value.kind {
+            Some(Kind::StringValue(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Enumerate the `document_id` payload of every chunk point in the
+    /// tenant-scoped `chunks_{tenant_id}` collection (Phase 3 reconciler).
+    ///
+    /// Paginates with `ScrollPoints` (page size 256) until
+    /// `next_page_offset` is `None`. A missing collection (tenant never
+    /// ingested anything) returns an empty vec — orphan detection treats that
+    /// as "no points to reconcile", never an error. Points whose
+    /// `document_id` payload is absent or not a valid UUID are returned with
+    /// `document_id = None` so the caller can flag them as malformed.
+    pub async fn scroll_chunk_refs(&self, tenant_id: Uuid) -> Result<Vec<ChunkPointRef>> {
+        let name = format!("chunks_{tenant_id}");
+        if !self.collection_exists(&name).await? {
+            return Ok(Vec::new());
+        }
+        let mut refs = Vec::new();
+        let mut offset: Option<PointId> = None;
+        loop {
+            let mut builder = ScrollPointsBuilder::new(name.as_str())
+                .limit(256)
+                .with_payload(true);
+            if let Some(off) = offset {
+                builder = builder.offset(off);
+            }
+            let req: ScrollPoints = builder.into();
+            let resp: ScrollResponse = self.client.scroll(req).await.map_err(Error::from)?;
+            for point in resp.result {
+                let document_id = Self::payload_string(&point.payload, "document_id")
+                    .and_then(|s| Uuid::parse_str(&s).ok());
+                refs.push(ChunkPointRef { document_id });
+            }
+            match resp.next_page_offset {
+                Some(next) => offset = Some(next),
+                None => break,
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Enumerate the `node_id` payload of every graph-node point in the
+    /// tenant-scoped `graph_{tenant_id}` collection (Phase 3 reconciler).
+    ///
+    /// Mirrors [`scroll_chunk_refs`]; a missing collection is an empty vec.
+    pub async fn scroll_graph_node_refs(&self, tenant_id: Uuid) -> Result<Vec<GraphNodePointRef>> {
+        let name = format!("graph_{tenant_id}");
+        if !self.collection_exists(&name).await? {
+            return Ok(Vec::new());
+        }
+        let mut refs = Vec::new();
+        let mut offset: Option<PointId> = None;
+        loop {
+            let mut builder = ScrollPointsBuilder::new(name.as_str())
+                .limit(256)
+                .with_payload(true);
+            if let Some(off) = offset {
+                builder = builder.offset(off);
+            }
+            let req: ScrollPoints = builder.into();
+            let resp: ScrollResponse = self.client.scroll(req).await.map_err(Error::from)?;
+            for point in resp.result {
+                let node_id = Self::payload_string(&point.payload, "node_id")
+                    .and_then(|s| Uuid::parse_str(&s).ok());
+                refs.push(GraphNodePointRef { node_id });
+            }
+            match resp.next_page_offset {
+                Some(next) => offset = Some(next),
+                None => break,
+            }
+        }
+        Ok(refs)
     }
 
     /// Shared helper: create a 768-dim Cosine collection and attach a set of
@@ -489,22 +651,26 @@ mod tests {
             .config
             .as_ref()
             .expect("CollectionConfig must be present");
-        let params = cfg.params.as_ref().expect("CollectionParams must be present");
+        let params = cfg
+            .params
+            .as_ref()
+            .expect("CollectionParams must be present");
         let vc = params
             .vectors_config
             .as_ref()
             .expect("VectorsConfig must be present");
-        let inner = vc.config.as_ref().expect("vectors_config::Config must be present");
+        let inner = vc
+            .config
+            .as_ref()
+            .expect("vectors_config::Config must be present");
         match inner {
             Config::Params(vp) => {
                 assert_eq!(vp.size, 768, "vector size must be 768");
-                assert_eq!(
-                    vp.distance(),
-                    Distance::Cosine,
-                    "distance must be Cosine"
-                );
+                assert_eq!(vp.distance(), Distance::Cosine, "distance must be Cosine");
             }
-            Config::ParamsMap(_) => panic!("expected single (unnamed) vector config, got ParamsMap"),
+            Config::ParamsMap(_) => {
+                panic!("expected single (unnamed) vector config, got ParamsMap")
+            }
         }
 
         // Cleanup.
@@ -580,18 +746,26 @@ mod tests {
             .config
             .as_ref()
             .expect("CollectionConfig must be present");
-        let params = cfg.params.as_ref().expect("CollectionParams must be present");
+        let params = cfg
+            .params
+            .as_ref()
+            .expect("CollectionParams must be present");
         let vc = params
             .vectors_config
             .as_ref()
             .expect("VectorsConfig must be present");
-        let inner = vc.config.as_ref().expect("vectors_config::Config must be present");
+        let inner = vc
+            .config
+            .as_ref()
+            .expect("vectors_config::Config must be present");
         match inner {
             Config::Params(vp) => {
                 assert_eq!(vp.size, 768, "vector size must be 768");
                 assert_eq!(vp.distance(), Distance::Cosine, "distance must be Cosine");
             }
-            Config::ParamsMap(_) => panic!("expected single (unnamed) vector config, got ParamsMap"),
+            Config::ParamsMap(_) => {
+                panic!("expected single (unnamed) vector config, got ParamsMap")
+            }
         }
 
         // Cleanup.

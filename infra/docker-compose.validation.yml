@@ -1,0 +1,81 @@
+name: gmrag-openfga-validation
+
+# Throwaway, isolated validation stack for the OpenFGA migration runtime
+# validation task. Mirrors the pinned image versions and command wiring of
+# infra/docker-compose.yml (postgres16, openfga-migrate, openfga) but uses
+# dedicated container names, ports, network, and volumes so it cannot
+# collide with, or destroy, the existing developer stack ("g2-67-jr").
+#
+# This file is intentionally NOT part of the permanent repository surface;
+# it is created and torn down as part of runtime validation evidence.
+
+services:
+  postgres16-val:
+    image: postgres:16-alpine
+    container_name: gmrag-postgres16-val
+    environment:
+      POSTGRES_USER: gmrag_val
+      POSTGRES_PASSWORD: GmragVal2026Secure
+      POSTGRES_DB: gmrag_val
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata_val:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmrag_val -d gmrag_val"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - gmrag-net-val
+
+  openfga-migrate-val:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga-migrate-val
+    command: migrate
+    restart: "no"
+    depends_on:
+      postgres16-val:
+        condition: service_healthy
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://gmrag_val:GmragVal2026Secure@postgres16-val:5432/openfga_val?sslmode=disable
+    networks:
+      - gmrag-net-val
+
+  openfga-val:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga-val
+    command: run
+    depends_on:
+      postgres16-val:
+        condition: service_healthy
+      openfga-migrate-val:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://gmrag_val:GmragVal2026Secure@postgres16-val:5432/openfga_val?sslmode=disable
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: val-openfga-token-9f3d2a1c
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: json
+    ports:
+      - "8189:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - gmrag-net-val
+
+networks:
+  gmrag-net-val:
+    name: gmrag-net-val
+    driver: bridge
+
+volumes:
+  pgdata_val:
+    name: gmrag-pgdata-val

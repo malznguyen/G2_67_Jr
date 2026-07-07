@@ -9,7 +9,7 @@
 
 use gmrag_core::config::QdrantConfig;
 use gmrag_core::QdrantStore;
-use gmrag_worker::{Chunk, DualWriteInput, dual_write_ingestion};
+use gmrag_worker::{dual_write_ingestion, Chunk, DualWriteInput};
 use gmrag_worker::{ExtractedEdge, ExtractedNode, GraphExtraction};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -121,7 +121,18 @@ async fn dual_write_inserts_chunks_nodes_edges_and_qdrant_points(pool: PgPool) {
         owner_id: owner,
         visibility: "private",
         filename: "t42.pdf",
-        chunks: &[Chunk { text: "chunk zero".to_string(), page_start: 1, page_end: 1 }, Chunk { text: "chunk one".to_string(), page_start: 1, page_end: 1 }],
+        chunks: &[
+            Chunk {
+                text: "chunk zero".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+            Chunk {
+                text: "chunk one".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+        ],
         chunk_vectors: vec![vec768(0.1), vec768(0.2)],
         extraction: &extraction,
         node_vectors: vec![vec768(0.3), vec768(0.4)],
@@ -179,7 +190,18 @@ async fn dual_write_preserves_idempotency_on_retry(pool: PgPool) {
         owner_id: owner,
         visibility: "private",
         filename: "t42.pdf",
-        chunks: &[Chunk { text: "chunk zero".to_string(), page_start: 1, page_end: 1 }, Chunk { text: "chunk one".to_string(), page_start: 1, page_end: 1 }],
+        chunks: &[
+            Chunk {
+                text: "chunk zero".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+            Chunk {
+                text: "chunk one".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+        ],
         chunk_vectors: vec![vec768(0.1), vec768(0.2)],
         extraction: &extraction,
         node_vectors: vec![vec768(0.3), vec768(0.4)],
@@ -197,7 +219,18 @@ async fn dual_write_preserves_idempotency_on_retry(pool: PgPool) {
         owner_id: owner,
         visibility: "private",
         filename: "t42.pdf",
-        chunks: &[Chunk { text: "chunk zero".to_string(), page_start: 1, page_end: 1 }, Chunk { text: "chunk one".to_string(), page_start: 1, page_end: 1 }],
+        chunks: &[
+            Chunk {
+                text: "chunk zero".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+            Chunk {
+                text: "chunk one".to_string(),
+                page_start: 1,
+                page_end: 1,
+            },
+        ],
         chunk_vectors: vec![vec768(0.1), vec768(0.2)],
         extraction: &extraction,
         node_vectors: vec![vec768(0.3), vec768(0.4)],
@@ -255,7 +288,11 @@ async fn dual_write_rolls_back_postgres_when_qdrant_fails(pool: PgPool) {
         owner_id: owner,
         visibility: "private",
         filename: "t42.pdf",
-        chunks: &[Chunk { text: "chunk zero".to_string(), page_start: 1, page_end: 1 }],
+        chunks: &[Chunk {
+            text: "chunk zero".to_string(),
+            page_start: 1,
+            page_end: 1,
+        }],
         chunk_vectors: vec![bad_vec.clone()],
         extraction: &extraction,
         node_vectors: vec![bad_vec],

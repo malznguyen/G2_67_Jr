@@ -1,7 +1,7 @@
 //! Integration tests for chat routes (T61/T62).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use axum::extract::{Extension, Path};
 use axum::http::{header, StatusCode};
@@ -14,6 +14,7 @@ use uuid::Uuid;
 use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
+use gmrag_api::authz::{chat_session_obj, tuple, user_obj, AuthzService, REL_VIEWER};
 use gmrag_api::chat::{ChunkHit, GraphContext};
 use gmrag_api::error::ApiError;
 use gmrag_api::llm::provider::{
@@ -25,6 +26,10 @@ use gmrag_api::routes::chat::{
     authorize_chat_session, create_session, delete_session, list_sessions,
     post_chat_sse_with_context, CreateSessionBody,
 };
+
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -106,12 +111,7 @@ async fn insert_chat_session(
     id
 }
 
-async fn insert_workspace(
-    pool: &PgPool,
-    tenant_id: Uuid,
-    created_by: Uuid,
-    name: &str,
-) -> Uuid {
+async fn insert_workspace(pool: &PgPool, tenant_id: Uuid, created_by: Uuid, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO workspaces (id, tenant_id, name, slug, created_by) VALUES ($1, $2, $3, $4, $5)",
@@ -140,25 +140,22 @@ async fn add_workspace_member(pool: &PgPool, ws_id: Uuid, tenant_id: Uuid, user_
 }
 
 async fn insert_grant(
-    pool: &PgPool,
-    tenant_id: Uuid,
+    authz: &AuthzService,
     session_id: Uuid,
-    principal_type: &str,
     principal_id: Uuid,
     permission: &str,
 ) {
-    sqlx::query(
-        "INSERT INTO resource_acl (tenant_id, resource_type, resource_id, principal_type, principal_id, permission)
-         VALUES ($1, 'chat_session', $2, $3, $4, $5)",
-    )
-    .bind(tenant_id)
-    .bind(session_id)
-    .bind(principal_type)
-    .bind(principal_id)
-    .bind(permission)
-    .execute(pool)
-    .await
-    .unwrap();
+    authz
+        .write_relationships(
+            vec![tuple(
+                user_obj(principal_id),
+                permission,
+                chat_session_obj(session_id),
+            )],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
 }
 
 async fn rls_conn(pool: &PgPool, tenant_id: Uuid) -> SharedConnection {
@@ -196,9 +193,9 @@ impl LlmProvider for StaticChatProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let body = self.body;
         Box::pin(async move {
-            let stream: ChatStream = Box::pin(futures::stream::iter(body.lines().map(|line| {
-                Ok(parse_test_sse_line(line))
-            })));
+            let stream: ChatStream = Box::pin(futures::stream::iter(
+                body.lines().map(|line| Ok(parse_test_sse_line(line))),
+            ));
             Ok(stream)
         })
     }
@@ -263,7 +260,11 @@ async fn collect_sse_body(sse: impl IntoResponse) -> (StatusCode, String, String
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, content_type, String::from_utf8(bytes.to_vec()).unwrap())
+    (
+        status,
+        content_type,
+        String::from_utf8(bytes.to_vec()).unwrap(),
+    )
 }
 
 // ─── T61: SSE chat ───────────────────────────────────────────────────────────
@@ -306,7 +307,9 @@ async fn post_chat_streams_sse_events(pool: PgPool) {
 
     let events = parse_sse_json_chunks(&body);
     assert!(events.iter().any(|e| e["type"] == "text"));
-    assert!(events.iter().any(|e| e["type"] == "citation" && e["index"] == 1));
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "citation" && e["index"] == 1));
     assert!(events.iter().any(|e| e["type"] == "done"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 }
@@ -321,8 +324,9 @@ async fn post_chat_denied_without_viewer(pool: PgPool) {
     let sid = insert_chat_session(&pool, tenant, owner, None, "private").await;
 
     let conn = rls_conn(&pool, tenant).await;
+    let authz = test_authz(&pool);
     let mut guard = conn.lock().await;
-    let err = authorize_chat_session(&mut guard, sid, stranger).await;
+    let err = authorize_chat_session(&authz, &mut guard, sid, stranger).await;
     assert!(matches!(err, Err(ApiError::NotFound)));
 }
 
@@ -335,8 +339,9 @@ async fn post_chat_cross_tenant_returns_not_found(pool: PgPool) {
     let sid = insert_chat_session(&pool, tenant_b, owner, None, "other tenant").await;
 
     let conn = rls_conn(&pool, tenant_a).await;
+    let authz = test_authz(&pool);
     let mut guard = conn.lock().await;
-    let err = authorize_chat_session(&mut guard, sid, owner).await;
+    let err = authorize_chat_session(&authz, &mut guard, sid, owner).await;
     assert!(matches!(err, Err(ApiError::NotFound)));
 }
 
@@ -352,7 +357,8 @@ async fn list_sessions_returns_owned_and_shared(pool: PgPool) {
 
     let owned = insert_chat_session(&pool, tenant, owner, None, "mine").await;
     let shared = insert_chat_session(&pool, tenant, owner, None, "shared").await;
-    insert_grant(&pool, tenant, shared, "user", viewer, "viewer").await;
+    let authz = test_authz(&pool);
+    insert_grant(&authz, shared, viewer, REL_VIEWER).await;
     insert_chat_session(&pool, tenant, owner, None, "hidden").await;
 
     let conn = rls_conn(&pool, tenant).await;
@@ -361,6 +367,7 @@ async fn list_sessions_returns_owned_and_shared(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(viewer)),
         Extension(conn),
+        Extension(authz),
     )
     .await
     .unwrap()
@@ -383,10 +390,9 @@ async fn list_sessions_returns_owned_and_shared(pool: PgPool) {
 }
 
 /// C14 regression: a chat_session in a workspace where the caller is a member
-/// (but has no explicit `resource_acl` grant and is not the owner) must be
-/// visible in `list_sessions` via workspace inheritance — mirroring
-/// `check_relation(chat_session, viewer, user)` rewrite
-/// `tuple_to_userset(workspace → member)`.
+/// (but has no explicit OpenFGA grant and is not the owner) must be visible
+/// in `list_sessions` via workspace inheritance — OpenFGA's
+/// `chat_session#viewer` includes `member from workspace`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_sessions_includes_workspace_member_inheritance(pool: PgPool) {
     let tenant = insert_tenant(&pool, "list-ws-inheritance").await;
@@ -413,6 +419,7 @@ async fn list_sessions_includes_workspace_member_inheritance(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await
     .unwrap()
@@ -452,6 +459,7 @@ async fn create_session_sets_owner_to_caller(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(user)),
         Extension(conn.clone()),
+        Extension(test_authz(&pool)),
         Json(CreateSessionBody {
             title: Some("New chat".into()),
             workspace_id: None,
@@ -479,6 +487,97 @@ async fn create_session_sets_owner_to_caller(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn create_workspace_session_requires_workspace_access(pool: PgPool) {
+    let creator = create_user(&pool, "creator@p15chat.com").await;
+    let ws_member = create_user(&pool, "member@p15chat.com").await;
+    let tenant_owner = create_user(&pool, "tenantowner@p15chat.com").await;
+    let tenant_admin = create_user(&pool, "tenantadmin@p15chat.com").await;
+    let unrelated = create_user(&pool, "unrelated@p15chat.com").await;
+    let other_user = create_user(&pool, "other@p15chat.com").await;
+    let tenant = insert_tenant(&pool, "P1.5 Chat").await;
+    let other_tenant = insert_tenant(&pool, "P1.5 Chat Other").await;
+    add_tenant_member(&pool, tenant, ws_member, "member").await;
+    add_tenant_member(&pool, tenant, tenant_owner, "owner").await;
+    add_tenant_member(&pool, tenant, tenant_admin, "admin").await;
+    add_tenant_member(&pool, tenant, unrelated, "member").await;
+    add_tenant_member(&pool, other_tenant, other_user, "owner").await;
+    let ws = insert_workspace(&pool, tenant, creator, "chat-guard").await;
+    let other_ws = insert_workspace(&pool, other_tenant, other_user, "chat-other").await;
+    add_workspace_member(&pool, ws, tenant, ws_member).await;
+
+    for allowed in [ws_member, tenant_owner] {
+        let conn = rls_conn(&pool, tenant).await;
+        let resp = create_session(
+            Path(tenant),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(allowed)),
+            Extension(conn),
+            Extension(test_authz(&pool)),
+            Json(CreateSessionBody {
+                title: Some("workspace chat".into()),
+                workspace_id: Some(ws),
+                model: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let null_conn = rls_conn(&pool, tenant).await;
+    let null_resp = create_session(
+        Path(tenant),
+        Extension(TenantContext(tenant)),
+        Extension(auth_user(unrelated)),
+        Extension(null_conn),
+        Extension(test_authz(&pool)),
+        Json(CreateSessionBody {
+            title: Some("loose chat".into()),
+            workspace_id: None,
+            model: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_response();
+    assert_eq!(null_resp.status(), StatusCode::CREATED);
+
+    for (caller, workspace_id, expected) in [
+        (unrelated, ws, StatusCode::FORBIDDEN),
+        (tenant_admin, ws, StatusCode::FORBIDDEN),
+        (tenant_owner, other_ws, StatusCode::NOT_FOUND),
+        (tenant_owner, Uuid::new_v4(), StatusCode::NOT_FOUND),
+    ] {
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let conn = rls_conn(&pool, tenant).await;
+        let result = create_session(
+            Path(tenant),
+            Extension(TenantContext(tenant)),
+            Extension(auth_user(caller)),
+            Extension(conn),
+            Extension(test_authz(&pool)),
+            Json(CreateSessionBody {
+                title: Some("denied workspace chat".into()),
+                workspace_id: Some(workspace_id),
+                model: None,
+            }),
+        )
+        .await;
+        let status = result.into_response().status();
+        assert_eq!(status, expected);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn delete_session_requires_owner(pool: PgPool) {
     let tenant = insert_tenant(&pool, "delete-session-tenant").await;
     let owner = create_user(&pool, "del-owner@test.com").await;
@@ -487,7 +586,8 @@ async fn delete_session_requires_owner(pool: PgPool) {
     add_tenant_member(&pool, tenant, viewer, "member").await;
 
     let sid = insert_chat_session(&pool, tenant, owner, None, "to delete").await;
-    insert_grant(&pool, tenant, sid, "user", viewer, "viewer").await;
+    let authz = test_authz(&pool);
+    insert_grant(&authz, sid, viewer, REL_VIEWER).await;
 
     let conn = rls_conn(&pool, tenant).await;
     let forbidden = delete_session(
@@ -495,6 +595,7 @@ async fn delete_session_requires_owner(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(viewer)),
         Extension(conn.clone()),
+        Extension(authz.clone()),
     )
     .await;
     assert!(matches!(forbidden, Err(ApiError::Forbidden(_))));
@@ -504,6 +605,7 @@ async fn delete_session_requires_owner(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(owner)),
         Extension(conn),
+        Extension(authz),
     )
     .await
     .unwrap()
@@ -525,6 +627,7 @@ async fn delete_session_cross_tenant(pool: PgPool) {
         Extension(TenantContext(tenant_a)),
         Extension(auth_user(owner)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(err, Err(ApiError::NotFound)));

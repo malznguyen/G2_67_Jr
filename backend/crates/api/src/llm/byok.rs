@@ -5,7 +5,7 @@
 //! existing `SET LOCAL app.tenant_id` context.
 
 use gmrag_core::config::{DeepSeekConfig, OllamaConfig};
-use gmrag_core::crypto::{CryptoError, decrypt_with_aad};
+use gmrag_core::crypto::{decrypt_with_aad, CryptoError};
 use sqlx::PgConnection;
 use thiserror::Error;
 use uuid::Uuid;
@@ -98,9 +98,8 @@ pub async fn resolve_llm_config(
     ) {
         (Some(ciphertext), Some(nonce)) => {
             let key = tenant_key_encryption_key.ok_or(ByokError::MissingEncryptionKey)?;
-            let decrypted =
-                decrypt_with_aad(ciphertext, nonce, key, tenant_id.as_bytes())
-                    .map_err(map_crypto_error)?;
+            let decrypted = decrypt_with_aad(ciphertext, nonce, key, tenant_id.as_bytes())
+                .map_err(map_crypto_error)?;
             (decrypted, LlmConfigSource::TenantEncrypted)
         }
         (None, None) => match row.api_key.filter(|v| !v.trim().is_empty()) {

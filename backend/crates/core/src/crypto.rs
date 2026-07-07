@@ -20,8 +20,8 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 
 /// Encrypt `plaintext` with AES-256-GCM, binding the ciphertext to `aad`
 /// (typically `tenant_id.as_bytes()`).
@@ -110,10 +110,10 @@ mod tests {
         let plaintext = "sk-test-api-key-12345";
         let aad = b"tenant-uuid-bytes-here";
 
-        let (ciphertext, nonce) = encrypt_with_aad(plaintext, &key, aad)
-            .expect("encrypt must succeed");
-        let decrypted = decrypt_with_aad(&ciphertext, &nonce, &key, aad)
-            .expect("decrypt must succeed");
+        let (ciphertext, nonce) =
+            encrypt_with_aad(plaintext, &key, aad).expect("encrypt must succeed");
+        let decrypted =
+            decrypt_with_aad(&ciphertext, &nonce, &key, aad).expect("decrypt must succeed");
 
         assert_eq!(plaintext, decrypted);
     }

@@ -11,9 +11,9 @@ import { UploadDropzone } from "@/components/UploadDropzone";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { AclShareDialog } from "@/components/AclShareDialog";
-import type { components_schemas } from "@/lib/api/schema";
+import type { components } from "@/lib/api/schema";
 
-type DocumentItem = components_schemas["DocumentsResponse"]["documents"][number];
+type DocumentItem = components["schemas"]["DocumentsResponse"]["documents"][number];
 
 interface ShareTarget {
   doc: DocumentItem;
@@ -52,8 +52,11 @@ function DocumentsView({
 
   const deleteMutation = useMutation({
     async mutationFn(docId: string) {
-      const { error: err } = await client.DELETE("/tenants/{tid}/documents/{doc_id}", {
-        params: { path: { tid, doc_id: docId } },
+      const { error: err } = await client.DELETE("/tenants/{tid}/documents/{did}", {
+        params: {
+          path: { tid, did: docId },
+          header: { "X-Tenant-ID": tid },
+        },
       });
       if (err) throw err;
     },
@@ -103,7 +106,6 @@ function DocumentsView({
             <thead className="bg-muted/50 text-left text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">{t("columns.title")}</th>
-                <th className="px-3 py-2 font-medium">{t("columns.filename")}</th>
                 <th className="px-3 py-2 font-medium">{t("columns.visibility")}</th>
                 <th className="px-3 py-2 font-medium">{t("columns.status")}</th>
                 <th className="px-3 py-2 font-medium">{t("columns.createdAt")}</th>
@@ -114,7 +116,6 @@ function DocumentsView({
               {documents.map((doc) => (
                 <tr key={doc.id} className="hover:bg-muted/30">
                   <td className="px-3 py-2 text-foreground">{doc.title}</td>
-                  <td className="px-3 py-2 text-muted-foreground">{doc.filename}</td>
                   <td className="px-3 py-2">
                     <span className="text-muted-foreground">
                       {t(`visibility.${doc.visibility}`)}

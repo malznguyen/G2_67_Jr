@@ -91,6 +91,9 @@ pub enum ApiError {
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
 
+    #[error("authorization unavailable: {0}")]
+    AuthorizationUnavailable(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -105,6 +108,7 @@ impl ApiError {
             ApiError::Forbidden(_) => "forbidden".into(),
             ApiError::BadRequest(_) => "bad-request".into(),
             ApiError::QuotaExceeded(_) => "quota-exceeded".into(),
+            ApiError::AuthorizationUnavailable(_) => "authorization-unavailable".into(),
             ApiError::Internal(_) => "internal-error".into(),
         }
     }
@@ -117,6 +121,7 @@ impl ApiError {
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::AuthorizationUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -167,10 +172,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], "invalid-token");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("bad"));
+        assert!(body["error"]["message"].as_str().unwrap().contains("bad"));
     }
 
     #[tokio::test]
@@ -288,16 +290,14 @@ mod tests {
             ApiError::Forbidden("x".into()).into_response(),
             ApiError::BadRequest("x".into()).into_response(),
             ApiError::QuotaExceeded("x".into()).into_response(),
+            ApiError::AuthorizationUnavailable("x".into()).into_response(),
             ApiError::Internal("x".into()).into_response(),
             ApiError::from(gmrag_core::Error::Config("x".into())).into_response(),
         ];
 
         for resp in errors {
             let body = body_json(resp).await;
-            assert!(
-                body.get("error").is_some(),
-                "missing 'error' key in {body}"
-            );
+            assert!(body.get("error").is_some(), "missing 'error' key in {body}");
             assert!(
                 body["error"]["code"].is_string(),
                 "'code' must be a string, got: {}",

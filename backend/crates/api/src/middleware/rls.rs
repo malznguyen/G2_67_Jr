@@ -17,7 +17,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use sqlx::pool::PoolConnection;
-use sqlx::{PgConnection, Postgres, PgPool};
+use sqlx::{PgConnection, PgPool, Postgres};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -47,7 +47,11 @@ impl SharedConnection {
 ///
 /// Used when work must outlive the request middleware transaction — e.g. SSE
 /// post-stream metering/persistence after the handler returns.
-pub async fn with_rls_connection<T, F, Fut>(pool: &PgPool, tenant_id: Uuid, f: F) -> Result<T, sqlx::Error>
+pub async fn with_rls_connection<T, F, Fut>(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    f: F,
+) -> Result<T, sqlx::Error>
 where
     F: for<'a> FnOnce(&'a mut PgConnection) -> Fut,
     Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
@@ -191,9 +195,7 @@ mod tests {
     }
 
     /// A handler that returns the SharedConnection presence.
-    async fn check_shared_conn(
-        conn: Option<Extension<SharedConnection>>,
-    ) -> impl IntoResponse {
+    async fn check_shared_conn(conn: Option<Extension<SharedConnection>>) -> impl IntoResponse {
         match conn {
             Some(Extension(_)) => axum::Json(json!({ "has_connection": true })),
             None => axum::Json(json!({ "has_connection": false })),
@@ -218,12 +220,7 @@ mod tests {
         let app = build_app_with_rls(stub_app_pool(), TenantContext(uuid::Uuid::new_v4()));
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -246,12 +243,7 @@ mod tests {
             .layer(Extension(stub_app_pool()));
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -274,12 +266,7 @@ mod tests {
             .layer(Extension(tenant_ctx));
 
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
             .await
             .unwrap();
 

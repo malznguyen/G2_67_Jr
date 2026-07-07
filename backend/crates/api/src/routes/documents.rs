@@ -3,14 +3,17 @@
 //! Tenant-scoped: runs inside the `tenant_middleware` + `rls_middleware` chain
 //! and executes on the per-request [`SharedConnection`], so PostgreSQL RLS
 //! confines every query to the current tenant. On top of tenant isolation, the
-//! list applies a per-user visibility + ACL filter:
+//! list applies a per-user visibility filter backed by OpenFGA:
 //!
-//! A document is returned iff the caller holds the `viewer` relation on it
-//! (ReBAC, T83): `visibility = 'shared'`, owner, a member of the document's
-//! workspace (inheritance), or the recipient of a `resource_acl` grant
-//! (directly or via a workspace-group share). This is the set-compiled form of
-//! [`crate::rbac::check::check_relation`]`(document, viewer, user)` so the
-//! listing stays a single indexed query instead of an N+1 per-row Check.
+//! A document is returned iff OpenFGA's `ListObjects(user, viewer, document)`
+//! includes it. The `viewer` relation (see `infra/openfga/model.fga`) is true
+//! when `visibility = 'shared'` (tenant-wide share), the caller is the owner,
+//! the caller is a member of the document's workspace (inheritance), or the
+//! caller holds a direct or workspace-userset `viewer`/`editor` grant. The
+//! OpenFGA object IDs are then intersected with a tenant/workspace-scoped SQL
+//! query (see [`crate::chat::retrieval::accessible_document_ids`]) so stale,
+//! malformed, or cross-tenant IDs returned by OpenFGA are discarded rather
+//! than trusted directly.
 //!
 //! An optional `workspace_id` query parameter further narrows the result.
 
@@ -25,14 +28,20 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::{
+    check_or_unavailable, delete_object_or_unavailable, document_obj, document_owner_tuple,
+    document_shared_tuple, document_tenant_tuple, document_workspace_tuple,
+    list_objects_or_unavailable, parsed_uuid_set, user_obj, write_or_unavailable, AuthzService,
+    CheckRequest, Consistency, REL_OWNER, REL_VIEWER, TYPE_DOCUMENT,
+};
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::queue::{IngestJobPayload, JobEnqueuer};
-use crate::rbac::check::check_relation;
-use crate::rbac::model::{ObjectRef, Principal, Relation, NS_DOCUMENT};
 use crate::routes::tenants::ensure_path_matches_context;
+use crate::routes::workspace_auth::require_workspace_access;
 use crate::storage::ObjectStore;
-use crate::vector::VectorCleaner;
+use crate::vector::{GraphCleaner, VectorCleaner};
+use gmrag_core::status::{document as doc_status, ingest_job as job_status};
 
 /// Marks a document as readable by anyone in the tenant.
 const VISIBILITY_SHARED: &str = "shared";
@@ -89,7 +98,7 @@ pub struct DocListParams {
     tag = "Documents",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
         ("workspace_id" = Option<Uuid>, Query, description = "Optional workspace filter"),
     ),
     security(("bearer_auth" = [])),
@@ -97,6 +106,7 @@ pub struct DocListParams {
         (status = 200, description = "Document list (unpaginated)", body = crate::openapi::schemas::DocumentsResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -105,39 +115,36 @@ pub async fn list_documents(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Query(params): Query<DocListParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
+
+    let objects = list_objects_or_unavailable(
+        &authz,
+        &user_obj(auth_user.user_id),
+        REL_VIEWER,
+        TYPE_DOCUMENT,
+        Consistency::MinimizeLatency,
+    )
+    .await?;
+    let (document_ids, malformed) = parsed_uuid_set(objects, TYPE_DOCUMENT);
+    if malformed > 0 {
+        tracing::warn!(malformed, "openfga returned malformed document object ids");
+    }
+    if document_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "documents": [] })));
+    }
 
     let mut guard = conn.lock().await;
     let rows = sqlx::query_as::<_, DocumentRow>(
         "SELECT id, title, visibility, owner_id, workspace_id, status, created_at
          FROM documents
-         WHERE (
-                 visibility = $1
-                 OR owner_id = $2
-                 OR (workspace_id IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM workspace_members wm
-                       WHERE wm.workspace_id = documents.workspace_id
-                         AND wm.user_id = $2))
-                 OR EXISTS (
-                       SELECT 1 FROM resource_acl ra
-                       WHERE ra.resource_type = 'document'
-                         AND ra.resource_id = documents.id
-                         AND ra.permission IN ('owner', 'editor', 'viewer')
-                         AND (
-                               (ra.principal_type = 'user' AND ra.principal_id = $2)
-                               OR (ra.principal_type = 'workspace' AND EXISTS (
-                                     SELECT 1 FROM workspace_members wmg
-                                     WHERE wmg.workspace_id = ra.principal_id
-                                       AND wmg.user_id = $2))
-                             ))
-               )
-           AND ($3::uuid IS NULL OR workspace_id = $3)
+         WHERE id = ANY($1)
+           AND ($2::uuid IS NULL OR workspace_id = $2)
          ORDER BY created_at DESC",
     )
-    .bind(VISIBILITY_SHARED)
-    .bind(auth_user.user_id)
+    .bind(&document_ids)
     .bind(params.workspace_id)
     .fetch_all(&mut *guard)
     .await
@@ -154,7 +161,7 @@ pub async fn list_documents(
     tag = "Documents",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body(
@@ -166,15 +173,20 @@ pub async fn list_documents(
         (status = 201, description = "Document uploaded", body = crate::openapi::schemas::CreateDocumentResponse),
         (status = 400, description = "Invalid form", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — workspace access required", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
         (status = 429, description = "Quota exceeded", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_document(
     Path(tid): Path<Uuid>,
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Extension(store): Extension<Arc<dyn ObjectStore>>,
     Extension(enqueuer): Extension<Arc<dyn JobEnqueuer>>,
     mut multipart: Multipart,
@@ -220,9 +232,8 @@ pub async fn upload_document(
                     .text()
                     .await
                     .map_err(|e| ApiError::BadRequest(format!("reading workspace_id: {e}")))?;
-                let id = Uuid::parse_str(raw.trim()).map_err(|_| {
-                    ApiError::BadRequest("workspace_id is not a valid UUID".into())
-                })?;
+                let id = Uuid::parse_str(raw.trim())
+                    .map_err(|_| ApiError::BadRequest("workspace_id is not a valid UUID".into()))?;
                 workspace_id = Some(id);
             }
             Some("title") => {
@@ -250,6 +261,8 @@ pub async fn upload_document(
     let filename = filename.unwrap_or_else(|| "upload.bin".to_string());
     let title = title.unwrap_or_else(|| filename.clone());
     let byte_size = bytes.len() as i64;
+
+    require_workspace_access(&conn, &authz, workspace_id, owner).await?;
 
     // 3. Quota check (RLS-scoped). Missing quota row → no enforcement.
     {
@@ -302,13 +315,14 @@ pub async fn upload_document(
         sqlx::query(
             "INSERT INTO documents
                (id, tenant_id, workspace_id, owner_id, title, status, visibility, mime_type, byte_size, s3_key)
-             VALUES ($1, $2, $3, $4, $5, 'uploaded', $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(document_id)
         .bind(tid)
         .bind(workspace_id)
         .bind(owner)
         .bind(&title)
+        .bind(doc_status::UPLOADED)
         .bind(visibility.as_str())
         .bind(&content_type)
         .bind(byte_size)
@@ -319,11 +333,12 @@ pub async fn upload_document(
 
         let job_id: (Uuid,) = sqlx::query_as(
             "INSERT INTO ingest_jobs (tenant_id, document_id, status)
-             VALUES ($1, $2, 'pending')
+             VALUES ($1, $2, $3)
              RETURNING id",
         )
         .bind(tid)
         .bind(document_id)
+        .bind(job_status::PENDING)
         .fetch_one(&mut *guard)
         .await
         .map_err(|e| ApiError::Internal(format!("insert ingest_job: {e}")))?;
@@ -366,13 +381,27 @@ pub async fn upload_document(
     let job_id = match insert_result {
         Ok(id) => id,
         Err(e) => {
-            let _ =
-                sqlx::Executor::execute(&mut *guard, "ROLLBACK TO SAVEPOINT sp_upload").await;
+            let _ = sqlx::Executor::execute(&mut *guard, "ROLLBACK TO SAVEPOINT sp_upload").await;
             drop(guard);
             let _ = store.delete(&s3_key).await;
             return Err(e);
         }
     };
+
+    let mut tuples = vec![
+        document_tenant_tuple(tid, document_id),
+        document_workspace_tuple(workspace_id, document_id),
+        document_owner_tuple(owner, document_id),
+    ];
+    if visibility.as_str() == VISIBILITY_SHARED {
+        tuples.push(document_shared_tuple(tid, document_id));
+    }
+    if let Err(e) = write_or_unavailable(&authz, tuples, Vec::new()).await {
+        let _ = sqlx::Executor::execute(&mut *guard, "ROLLBACK TO SAVEPOINT sp_upload").await;
+        drop(guard);
+        let _ = store.delete(&s3_key).await;
+        return Err(e);
+    }
 
     // The JobEnqueuer extension is retained for tests/legacy callers but is
     // no longer used at runtime — `enqueuer` is intentionally unused here so
@@ -398,7 +427,7 @@ pub async fn upload_document(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("did" = Uuid, Path, description = "Document ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -407,22 +436,30 @@ pub async fn upload_document(
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Document not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_document(
     Path((tid, did)): Path<(Uuid, Uuid)>,
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Extension(store): Extension<Arc<dyn ObjectStore>>,
     Extension(cleaner): Extension<Arc<dyn VectorCleaner>>,
+    Extension(graph_cleaner): Extension<Arc<dyn GraphCleaner>>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
-    // 1. Load the document under RLS (cross-tenant → no row → 404), then apply
-    //    the ReBAC owner guard via the Check engine (T83).
-    let s3_key = {
+    // 1. Load the document under RLS (cross-tenant → no row → 404), apply
+    //    the ReBAC owner guard, and capture the graph node ids linked to
+    //    this document via `graph_node_documents` BEFORE the cascade delete
+    //    removes those provenance rows. These candidates are the only nodes
+    //    that could become orphans (nodes never linked to this document are
+    //    unaffected by its deletion).
+    let (s3_key, candidate_node_ids): (Option<String>, Vec<Uuid>) = {
         let mut guard = conn.lock().await;
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT s3_key FROM documents WHERE id = $1")
@@ -433,24 +470,37 @@ pub async fn delete_document(
         let s3_key = row.ok_or(ApiError::NotFound)?.0;
 
         // 2. Owner-only guard (delete is an owner action in the ResourceBAC matrix).
-        let is_owner = check_relation(
-            &mut guard,
-            &ObjectRef::new(NS_DOCUMENT, did),
-            Relation::Owner,
-            Principal::User(auth_user.user_id),
+        let is_owner = check_or_unavailable(
+            &authz,
+            CheckRequest::new(user_obj(auth_user.user_id), REL_OWNER, document_obj(did)),
         )
-        .await
-        .map_err(|e| ApiError::Internal(format!("owner check: {e}")))?;
+        .await?;
         if !is_owner {
             drop(guard);
             return Err(ApiError::Forbidden(
                 "only the document owner may delete it".into(),
             ));
         }
-        s3_key
+
+        // Candidate graph nodes = nodes linked to this document through
+        // graph_node_documents (RLS-scoped to the current tenant).
+        let node_ids: Vec<Uuid> =
+            sqlx::query_as("SELECT node_id FROM graph_node_documents WHERE document_id = $1")
+                .bind(did)
+                .fetch_all(&mut *guard)
+                .await
+                .map_err(|e| ApiError::Internal(format!("load graph provenance: {e}")))?
+                .into_iter()
+                .map(|(id,)| id)
+                .collect();
+
+        (s3_key, node_ids)
     };
 
+    delete_object_or_unavailable(&authz, &document_obj(did)).await?;
+
     // 3. Best-effort external cleanup: S3 object, then Qdrant chunk vectors.
+    //    Failures are warn-logged and never block the Postgres delete.
     if let Some(key) = &s3_key {
         if let Err(e) = store.delete(key).await {
             tracing::warn!(error = %e, document_id = %did, "s3 delete failed during document delete");
@@ -460,7 +510,10 @@ pub async fn delete_document(
         tracing::warn!(error = %e, document_id = %did, "qdrant cleanup failed during document delete");
     }
 
-    // 4. Postgres delete (cascade: document_chunks + ingest_jobs).
+    // 4. Postgres delete (cascade: document_chunks, ingest_jobs, and the
+    //    graph_node_documents rows for this document). The DB remains the
+    //    source of truth — graph nodes themselves are NOT cascade-deleted
+    //    (they have no FK to documents), so shared nodes survive.
     {
         let mut guard = conn.lock().await;
         sqlx::query("DELETE FROM documents WHERE id = $1")
@@ -468,6 +521,73 @@ pub async fn delete_document(
             .execute(&mut *guard)
             .await
             .map_err(|e| ApiError::Internal(format!("delete document: {e}")))?;
+    }
+
+    // 5. Graph provenance cleanup (Phase 0 TASK-P0-04): among the candidate
+    //    nodes captured before the delete, remove only those that now have
+    //    ZERO remaining `graph_node_documents` rows — i.e. this document was
+    //    their final provenance source. Nodes still referenced by any other
+    //    document are kept. The orphan set is computed race-safely in one
+    //    SQL statement scoped to the current tenant.
+    let orphan_node_ids: Vec<Uuid> = {
+        let mut guard = conn.lock().await;
+        sqlx::query_as::<_, (Uuid,)>(
+            r#"
+            SELECT gn.id
+            FROM graph_nodes gn
+            WHERE gn.id = ANY($1)
+              AND NOT EXISTS (
+                SELECT 1 FROM graph_node_documents gnd
+                WHERE gnd.node_id = gn.id
+              )
+            "#,
+        )
+        .bind(&candidate_node_ids)
+        .fetch_all(&mut *guard)
+        .await
+        .map_err(|e| ApiError::Internal(format!("load orphan graph nodes: {e}")))?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect()
+    };
+
+    if !orphan_node_ids.is_empty() {
+        // Delete orphan graph_nodes from Postgres. graph_edges cascade via
+        // the existing ON DELETE CASCADE FKs on src_node_id/dst_node_id.
+        let deleted_count = {
+            let mut guard = conn.lock().await;
+            sqlx::query("DELETE FROM graph_nodes WHERE id = ANY($1)")
+                .bind(&orphan_node_ids)
+                .execute(&mut *guard)
+                .await
+                .map_err(|e| ApiError::Internal(format!("delete orphan graph nodes: {e}")))?
+                .rows_affected()
+        };
+
+        if deleted_count == 0 {
+            // Another concurrent delete already removed them — harmless.
+            tracing::debug!(
+                document_id = %did,
+                tenant_id = %tid,
+                candidate_orphans = orphan_node_ids.len(),
+                "orphan graph nodes already removed by a concurrent delete",
+            );
+        }
+
+        // Bulk-delete the matching Qdrant graph points (one request, not
+        // one per node). Best-effort: warn on failure, never block.
+        if let Err(e) = graph_cleaner
+            .delete_graph_nodes(tid, &orphan_node_ids)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                tenant_id = %tid,
+                document_id = %did,
+                node_count = orphan_node_ids.len(),
+                "qdrant graph node cleanup failed during document delete",
+            );
+        }
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -506,7 +626,7 @@ const PREVIEW_CHUNK_LIMIT: i64 = 50;
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("did" = Uuid, Path, description = "Document ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -514,6 +634,7 @@ const PREVIEW_CHUNK_LIMIT: i64 = 50;
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -522,6 +643,7 @@ pub async fn preview_document(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
@@ -539,14 +661,11 @@ pub async fn preview_document(
     .map_err(|e| ApiError::Internal(format!("load document: {e}")))?
     .ok_or(ApiError::NotFound)?;
 
-    let can_view = check_relation(
-        &mut guard,
-        &ObjectRef::new(NS_DOCUMENT, did),
-        Relation::Viewer,
-        Principal::User(auth_user.user_id),
+    let can_view = check_or_unavailable(
+        &authz,
+        CheckRequest::new(user_obj(auth_user.user_id), REL_VIEWER, document_obj(did)),
     )
-    .await
-    .map_err(|e| ApiError::Internal(format!("viewer check: {e}")))?;
+    .await?;
     if !can_view {
         drop(guard);
         return Err(ApiError::NotFound);

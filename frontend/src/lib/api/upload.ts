@@ -44,8 +44,13 @@ export async function uploadDocument(
   }
 
   const { data, error } = await client.POST("/tenants/{tid}/documents", {
-    params: { path: { tid: input.tid } },
-    body: formData,
+    params: {
+      path: { tid: input.tid },
+      header: { "X-Tenant-ID": input.tid },
+    },
+    // openapi-typescript represents multipart binary fields as strings, but
+    // openapi-fetch accepts FormData at runtime and preserves the boundary.
+    body: formData as never,
   });
 
   if (error || !data) {

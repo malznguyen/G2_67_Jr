@@ -8,6 +8,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
+use crate::authz::{
+    list_objects_or_unavailable, parsed_uuid_set, user_obj, AuthzService, Consistency, REL_MEMBER,
+    TYPE_TENANT,
+};
 use crate::error::ApiError;
 use crate::pool::AdminPool;
 
@@ -19,7 +23,7 @@ struct UserRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::FromRow)]
 struct TenantRow {
     id: Uuid,
     name: String,
@@ -36,12 +40,14 @@ struct TenantRow {
         (status = 200, description = "User profile and tenant list", body = crate::openapi::schemas::MeResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "User not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn get_me(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = sqlx::query_as!(
         UserRow,
@@ -53,17 +59,33 @@ pub async fn get_me(
     .map_err(|e| ApiError::Internal(format!("db error: {e}")))?
     .ok_or(ApiError::NotFound)?;
 
-    let tenants = sqlx::query_as!(
-        TenantRow,
-        "SELECT t.id, t.name, tm.role
-         FROM tenant_members tm
-         JOIN tenants t ON t.id = tm.tenant_id
-         WHERE tm.user_id = $1",
-        auth_user.user_id
+    let objects = list_objects_or_unavailable(
+        &authz,
+        &user_obj(auth_user.user_id),
+        REL_MEMBER,
+        TYPE_TENANT,
+        Consistency::MinimizeLatency,
     )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
+    .await?;
+    let (tenant_ids, malformed) = parsed_uuid_set(objects, TYPE_TENANT);
+    if malformed > 0 {
+        tracing::warn!(malformed, "openfga returned malformed tenant object ids");
+    }
+    let tenants = if tenant_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, TenantRow>(
+            "SELECT t.id, t.name, tm.role
+             FROM tenant_members tm
+             JOIN tenants t ON t.id = tm.tenant_id
+             WHERE tm.user_id = $1 AND t.id = ANY($2)",
+        )
+        .bind(auth_user.user_id)
+        .bind(&tenant_ids)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("db error: {e}")))?
+    };
 
     Ok(Json(json!({
         "user": {
@@ -91,7 +113,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use axum::{Extension, Router};
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use tower::ServiceExt;
 
     const TEST_PEM_PRIV: &[u8] = include_bytes!("../auth/test_keys/test_rsa_private.pem");
@@ -116,7 +138,12 @@ mod tests {
     fn make_token(claims: &JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn make_auth_state() -> AuthState {

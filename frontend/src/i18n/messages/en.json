@@ -5,7 +5,8 @@
     "cancel": "Cancel",
     "confirm": "Confirm",
     "close": "Close",
-    "back": "Back"
+    "back": "Back",
+    "retry": "Retry"
   },
   "auth": {
     "signInTitle": "GMRAG2",
@@ -13,7 +14,24 @@
     "signInWithKeycloak": "Sign in with Keycloak",
     "signOut": "Sign out",
     "signedInAs": "Signed in as {email}",
-    "unauthenticated": "You are not signed in."
+    "unauthenticated": "You are not signed in.",
+    "redirecting": "Redirecting…",
+    "secureNote": "Single Sign-On via your organization's identity provider. Sessions are encrypted end-to-end.",
+    "welcomeBack": "Sign in to the knowledge graph",
+    "welcomeBody": "Multi-tenant GraphRAG platform — tenant-scoped authorization, knowledge graphs for the enterprise.",
+    "errors": {
+      "Configuration": "The identity server is misconfigured. Please contact an administrator.",
+      "AccessDenied": "You do not have access. Contact your organization administrator if needed.",
+      "Verification": "The sign-in link expired. Please try again.",
+      "OAuthSignin": "Could not reach the identity server. Try again in a moment.",
+      "OAuthCallback": "Sign-in failed while receiving the identity server response. Try again.",
+      "OAuthCreateAccount": "Could not create an account from the identity server.",
+      "EmailCreateAccount": "Could not create an account with this email.",
+      "Callback": "The sign-in link is invalid or expired. Try again.",
+      "AccountNotFound": "This account is not authorized on this system.",
+      "Default": "Sign-in failed. Please try again.",
+      "default": "Sign-in failed. Please try again."
+    }
   },
   "nav": {
     "documents": "Documents",
@@ -25,6 +43,58 @@
   "tenant": {
     "switch": "Switch tenant",
     "none": "No tenant"
+  },
+  "tenants": {
+    "kicker": "Choose a tenant",
+    "title": "Your tenants",
+    "subtitle": "Pick a tenant to work in. Your role in each tenant is shown below.",
+    "loading": "Loading tenants…",
+    "skeleton": "Fetching authorization data",
+    "listHeader": "Tenant",
+    "listHeaderRole": "Role",
+    "select": "Open",
+    "selecting": "Opening…",
+    "selected": "Active",
+    "signedInAs": "Signed in as {email}",
+    "signOut": "Sign out",
+    "roles": {
+      "owner": "Owner",
+      "admin": "Admin",
+      "member": "Member"
+    },
+    "roleHint": {
+      "owner": "Highest role — delete tenant, invite members.",
+      "admin": "Administrator — manage member permissions.",
+      "member": "Member — access Documents, Chat, Knowledge graph."
+    },
+    "create": {
+      "cta": "Create a new tenant",
+      "heading": "No tenants yet",
+      "description": "Your account doesn't belong to any tenant yet. Create your first one to start uploading documents and building a knowledge graph.",
+      "action": "Create your first tenant",
+      "openForm": "Create another tenant",
+      "label": "Tenant name",
+      "placeholder": "e.g. Legal — Internal Crawl",
+      "submit": "Create tenant",
+      "submitting": "Creating…",
+      "cancel": "Cancel",
+      "errorNameRequired": "Please enter a tenant name.",
+      "errorTaken": "A tenant with this name already exists.",
+      "errorGeneric": "Could not create the tenant. Please try again."
+    },
+    "errors": {
+      "networkTitle": "Lost connection to the server",
+      "networkBody": "Couldn't reach GMRAG2. Check your network and try again.",
+      "unauthorizedTitle": "Session expired",
+      "unauthorizedBody": "Your session has expired or is invalid. Sign in again to continue.",
+      "unauthorizedAction": "Sign in again",
+      "forbiddenTitle": "Access denied",
+      "forbiddenBody": "This account hasn't been granted access. Contact your tenant administrator.",
+      "serverTitle": "The server is having trouble",
+      "serverBody": "GMRAG2 is temporarily unavailable. We've been notified — try again shortly.",
+      "unknownTitle": "Couldn't load tenants",
+      "unknownBody": "Something went wrong loading this data. Retry or sign in again."
+    }
   },
   "language": {
     "label": "Language",

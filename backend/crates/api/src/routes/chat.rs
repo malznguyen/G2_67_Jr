@@ -4,12 +4,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
-use gmrag_core::config::{DeepSeekConfig, OllamaConfig};
+use gmrag_core::config::{DeepSeekConfig, OllamaConfig, RateLimitConfig};
 use gmrag_core::QdrantStore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
@@ -17,19 +17,25 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::{
+    chat_owner_tuple, chat_session_obj, chat_tenant_tuple, chat_workspace_tuple,
+    check_or_unavailable, delete_object_or_unavailable, list_objects_or_unavailable,
+    parsed_uuid_set, user_obj, write_or_unavailable, AuthzService, CheckRequest, Consistency,
+    REL_OWNER, REL_VIEWER, TYPE_CHAT_SESSION,
+};
+use crate::chat::streaming::{assistant_text_from_events, meter_rag_chat_completion};
 use crate::chat::{
     enrich_stream_events, retrieve_all_with_metering, stream_rag_response, ChatSsePayload,
     ChatStreamEvent, ChunkHit, EnrichedChatStreamEvent, GraphContext, RetrievalParams,
 };
-use crate::chat::streaming::{assistant_text_from_events, meter_rag_chat_completion};
 use crate::error::ApiError;
 use crate::llm::byok::resolve_llm_config;
 use crate::llm::provider::{DeepSeekProvider, LlmProvider};
+use crate::middleware::rate_limit::{SseConnectionLimiter, SseSlotGuard};
 use crate::middleware::rls::SharedConnection;
 use crate::pool::AppPool;
-use crate::rbac::check::check_relation;
-use crate::rbac::model::{ObjectRef, Principal, Relation, NS_CHAT_SESSION};
 use crate::routes::tenants::ensure_path_matches_context;
+use crate::routes::workspace_auth::require_workspace_access;
 
 /// Tenant LLM configuration injected at startup (T61).
 #[derive(Clone)]
@@ -104,13 +110,14 @@ fn sse_error(code: &str, message: impl Into<String>) -> Event {
     tag = "Chat",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Session list (unpaginated)", body = crate::openapi::schemas::ChatSessionsResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -119,36 +126,37 @@ pub async fn list_sessions(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
-    let user_id = auth_user.user_id;
+    let objects = list_objects_or_unavailable(
+        &authz,
+        &user_obj(auth_user.user_id),
+        REL_VIEWER,
+        TYPE_CHAT_SESSION,
+        Consistency::MinimizeLatency,
+    )
+    .await?;
+    let (session_ids, malformed) = parsed_uuid_set(objects, TYPE_CHAT_SESSION);
+    if malformed > 0 {
+        tracing::warn!(
+            malformed,
+            "openfga returned malformed chat_session object ids"
+        );
+    }
+    if session_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "sessions": [] })));
+    }
+
     let mut guard = conn.lock().await;
     let rows = sqlx::query_as::<_, ChatSessionRow>(
         "SELECT cs.id, cs.title, cs.workspace_id, cs.model, cs.created_at, cs.updated_at
          FROM chat_sessions cs
-         WHERE (
-                 cs.user_id = $1
-                 OR (cs.workspace_id IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM workspace_members wm
-                       WHERE wm.workspace_id = cs.workspace_id
-                         AND wm.user_id = $1))
-                 OR EXISTS (
-                       SELECT 1 FROM resource_acl ra
-                       WHERE ra.resource_type = 'chat_session'
-                         AND ra.resource_id = cs.id
-                         AND ra.permission IN ('owner', 'editor', 'viewer')
-                         AND (
-                               (ra.principal_type = 'user' AND ra.principal_id = $1)
-                               OR (ra.principal_type = 'workspace' AND EXISTS (
-                                     SELECT 1 FROM workspace_members wmg
-                                     WHERE wmg.workspace_id = ra.principal_id
-                                       AND wmg.user_id = $1))
-                             ))
-               )
+         WHERE cs.id = ANY($1)
          ORDER BY cs.updated_at DESC",
     )
-    .bind(user_id)
+    .bind(&session_ids)
     .fetch_all(&mut *guard)
     .await
     .map_err(|e| ApiError::Internal(format!("list chat sessions: {e}")))?;
@@ -164,7 +172,7 @@ pub async fn list_sessions(
     tag = "Chat",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::CreateChatSessionRequest,
@@ -172,6 +180,9 @@ pub async fn list_sessions(
         (status = 201, description = "Session created", body = crate::openapi::schemas::CreateChatSessionResponse),
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 403, description = "Forbidden — workspace access required", body = crate::openapi::schemas::ErrorResponse),
+        (status = 404, description = "Workspace not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -180,11 +191,16 @@ pub async fn create_session(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
     let title = body.title.unwrap_or_default();
+    if let Some(workspace_id) = body.workspace_id {
+        require_workspace_access(&conn, &authz, workspace_id, auth_user.user_id).await?;
+    }
+
     let mut guard = conn.lock().await;
     let id: (Uuid,) = sqlx::query_as(
         "INSERT INTO chat_sessions (tenant_id, user_id, workspace_id, title, model)
@@ -199,9 +215,28 @@ pub async fn create_session(
     .fetch_one(&mut *guard)
     .await
     .map_err(|e| ApiError::Internal(format!("create chat session: {e}")))?;
+    let session_id = id.0;
+    let mut tuples = vec![
+        chat_tenant_tuple(tid, session_id),
+        chat_owner_tuple(auth_user.user_id, session_id),
+    ];
+    if let Some(workspace_id) = body.workspace_id {
+        tuples.push(chat_workspace_tuple(workspace_id, session_id));
+    }
+    if let Err(e) = write_or_unavailable(&authz, tuples, Vec::new()).await {
+        let _ = sqlx::query("DELETE FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *guard)
+            .await;
+        drop(guard);
+        return Err(e);
+    }
     drop(guard);
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id.0 }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": session_id })),
+    ))
 }
 
 /// Delete a chat session (owner-only).
@@ -212,7 +247,7 @@ pub async fn create_session(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("sid" = Uuid, Path, description = "Chat session ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -221,6 +256,7 @@ pub async fn create_session(
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -229,34 +265,39 @@ pub async fn delete_session(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
     let mut guard = conn.lock().await;
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = $1)")
-        .bind(sid)
-        .fetch_one(&mut *guard)
-        .await
-        .map_err(|e| ApiError::Internal(format!("load chat session: {e}")))?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = $1)")
+            .bind(sid)
+            .fetch_one(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load chat session: {e}")))?;
     if !exists {
         drop(guard);
         return Err(ApiError::NotFound);
     }
 
-    let is_owner = check_relation(
-        &mut guard,
-        &ObjectRef::new(NS_CHAT_SESSION, sid),
-        Relation::Owner,
-        Principal::User(auth_user.user_id),
+    let is_owner = check_or_unavailable(
+        &authz,
+        CheckRequest::new(
+            user_obj(auth_user.user_id),
+            REL_OWNER,
+            chat_session_obj(sid),
+        ),
     )
-    .await
-    .map_err(|e| ApiError::Internal(format!("owner check: {e}")))?;
+    .await?;
     if !is_owner {
         drop(guard);
         return Err(ApiError::Forbidden(
             "only the chat session owner may delete it".into(),
         ));
     }
+
+    delete_object_or_unavailable(&authz, &chat_session_obj(sid)).await?;
 
     sqlx::query("DELETE FROM chat_sessions WHERE id = $1")
         .bind(sid)
@@ -280,7 +321,7 @@ pub async fn delete_session(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("sid" = Uuid, Path, description = "Chat session ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -289,6 +330,7 @@ pub async fn delete_session(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Session not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -297,13 +339,14 @@ pub async fn list_messages(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
     // Viewer-gate (404 on missing-or-denied — no existence leak).
     {
         let mut guard = conn.lock().await;
-        authorize_chat_session(&mut guard, sid, auth_user.user_id).await?;
+        authorize_chat_session(&authz, &mut guard, sid, auth_user.user_id).await?;
     }
 
     let mut guard = conn.lock().await;
@@ -337,7 +380,7 @@ pub async fn list_messages(
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("sid" = Uuid, Path, description = "Chat session ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::PostChatRequest,
@@ -348,6 +391,8 @@ pub async fn list_messages(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Session not found or no viewer access", body = crate::openapi::schemas::ErrorResponse),
+        (status = 429, description = "Too many open chat streams", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -360,13 +405,45 @@ pub async fn post_chat(
     Extension(app_pool): Extension<AppPool>,
     Extension(qdrant): Extension<QdrantStore>,
     Extension(llm_runtime): Extension<LlmRuntime>,
+    Extension(authz): Extension<AuthzService>,
+    Extension(rate_cfg): Extension<RateLimitConfig>,
+    Extension(sse_limiter): Extension<SseConnectionLimiter>,
     Json(body): Json<PostChatBody>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
     if body.message.trim().is_empty() {
         return Err(ApiError::BadRequest("message must not be empty".into()));
     }
+
+    let sse_slot = if rate_cfg.enabled {
+        match sse_limiter
+            .try_acquire(tid, rate_cfg.chat_concurrent_per_tenant)
+            .await
+        {
+            Ok(slot) => Some(slot),
+            Err(retry_after_secs) => {
+                crate::metrics::metrics().inc_rate_limit_rejection("chat_concurrent");
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "rate-limit-exceeded",
+                            "message": "too many open chat streams",
+                            "category": "chat_concurrent"
+                        }
+                    })),
+                )
+                    .into_response();
+                let retry = HeaderValue::from_str(&retry_after_secs.max(1).to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("1"));
+                response.headers_mut().insert(header::RETRY_AFTER, retry);
+                return Ok(response);
+            }
+        }
+    } else {
+        None
+    };
 
     let mut guard = conn.lock().await;
     let resolved = resolve_llm_config(
@@ -379,7 +456,7 @@ pub async fn post_chat(
     .await
     .map_err(|e| ApiError::Internal(format!("resolve llm config: {e}")))?;
 
-    let session = load_session_for_chat(&mut guard, sid, auth_user.user_id).await?;
+    let session = load_session_for_chat(&authz, &mut guard, sid, auth_user.user_id).await?;
     drop(guard);
 
     let provider = Arc::new(DeepSeekProvider::new(resolved.provider));
@@ -390,47 +467,50 @@ pub async fn post_chat(
         auth_user.user_id,
         conn,
         app_pool,
+        authz,
         &qdrant,
         provider,
         llm_runtime.chat_history_limit,
+        sse_slot,
     )
     .await
+    .map(IntoResponse::into_response)
 }
 
 /// Authorize viewer access to a chat session (404 if missing or denied).
 pub async fn authorize_chat_session(
+    authz: &AuthzService,
     conn: &mut PgConnection,
     sid: Uuid,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
-    load_session_for_chat(conn, sid, user_id).await.map(|_| ())
+    load_session_for_chat(authz, conn, sid, user_id)
+        .await
+        .map(|_| ())
 }
 
 async fn load_session_for_chat(
+    authz: &AuthzService,
     conn: &mut PgConnection,
     sid: Uuid,
     user_id: Uuid,
 ) -> Result<SessionContext, ApiError> {
-    let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
-        "SELECT workspace_id, model FROM chat_sessions WHERE id = $1",
-    )
-    .bind(sid)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| ApiError::Internal(format!("load chat session: {e}")))?;
+    let row: Option<(Option<Uuid>, Option<String>)> =
+        sqlx::query_as("SELECT workspace_id, model FROM chat_sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load chat session: {e}")))?;
 
     let Some((workspace_id, model)) = row else {
         return Err(ApiError::NotFound);
     };
 
-    let can_view = check_relation(
-        conn,
-        &ObjectRef::new(NS_CHAT_SESSION, sid),
-        Relation::Viewer,
-        Principal::User(user_id),
+    let can_view = check_or_unavailable(
+        authz,
+        CheckRequest::new(user_obj(user_id), REL_VIEWER, chat_session_obj(sid)),
     )
-    .await
-    .map_err(|e| ApiError::Internal(format!("viewer check: {e}")))?;
+    .await?;
     if !can_view {
         return Err(ApiError::NotFound);
     }
@@ -480,7 +560,96 @@ async fn load_chat_history(
     Ok(ordered)
 }
 
+/// T84D Phase 5 / Phase 0 TASK-P0-03 — compensate an orphan user message.
+///
+/// If upstream streaming fails before a durable assistant response is
+/// stored, the user message we inserted at the start of the turn would
+/// remain as a user-only orphan turn. This deletes EXACTLY that one
+/// message row (by `id`), in a tenant-scoped transaction, so no other
+/// concurrent messages are touched. Never deletes by timestamp or broad
+/// session criteria.
+///
+/// Best-effort: a compensation failure is warn-logged but does NOT
+/// suppress the `stream-failed` event the client still receives.
+async fn compensate_user_message(
+    pool: &AppPool,
+    tenant_id: Uuid,
+    user_message_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let acquired = pool.acquire().await?;
+    let mut conn = acquired.detach();
+
+    sqlx::Executor::execute(&mut conn, "BEGIN").await?;
+    sqlx::Executor::execute(&mut conn, "SET LOCAL ROLE gmrag_app").await?;
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{tenant_id}'"))
+        .execute(&mut conn)
+        .await?;
+
+    let res = sqlx::query("DELETE FROM chat_messages WHERE id = $1")
+        .bind(user_message_id)
+        .execute(&mut conn)
+        .await;
+
+    match res {
+        Ok(_) => {
+            sqlx::Executor::execute(&mut conn, "COMMIT").await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sqlx::Executor::execute(&mut conn, "ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+/// SSE `done` event carrying the preserved upstream `finish_reason`.
+fn sse_done(finish_reason: Option<String>) -> Event {
+    Event::default()
+        .json_data(ChatSsePayload::Done { finish_reason })
+        .expect("done payload serializes")
+}
+
+struct SseOutcomeGuard {
+    terminal_recorded: bool,
+}
+
+impl SseOutcomeGuard {
+    fn new() -> Self {
+        Self {
+            terminal_recorded: false,
+        }
+    }
+
+    fn record(&mut self, outcome: &'static str) {
+        if !self.terminal_recorded {
+            crate::metrics::metrics().inc_sse_outcome(outcome);
+            self.terminal_recorded = true;
+        }
+    }
+}
+
+impl Drop for SseOutcomeGuard {
+    fn drop(&mut self) {
+        if !self.terminal_recorded {
+            crate::metrics::metrics().inc_sse_outcome("dropped");
+            self.terminal_recorded = true;
+        }
+    }
+}
+
 /// Core SSE chat implementation.
+///
+/// Phase 0 TASK-P0-03 (durable-before-done) contract:
+/// - text/citation events are streamed as they arrive;
+/// - the upstream `Done` event is HELD — `done` is only emitted AFTER the
+///   assistant message + usage are successfully persisted;
+/// - on persistence failure: emit `persist-failed` (no `done`);
+/// - on upstream stream failure: emit `stream-failed` (no `done`) and
+///   compensate the just-created user message so no user-only orphan turn
+///   remains. Compensation failure is warn-logged but the client still
+///   receives `stream-failed`;
+/// - exactly one terminal application event is emitted (`done` XOR
+///   `persist-failed` XOR `stream-failed`).
 #[allow(clippy::too_many_arguments)]
 async fn post_chat_sse(
     tenant_id: Uuid,
@@ -489,30 +658,33 @@ async fn post_chat_sse(
     user_id: Uuid,
     conn: SharedConnection,
     pool: AppPool,
+    authz: AuthzService,
     qdrant: &QdrantStore,
     provider: Arc<dyn LlmProvider>,
     chat_history_limit: usize,
+    sse_slot: Option<SseSlotGuard>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let sid = session.session_id;
 
-    // Phase A — request transaction: history, user message, retrieval.
-    let (chunks, graph, history) = {
+    // Phase A — request transaction: user message, retrieval, history.
+    let (chunks, graph, history, user_message_id) = {
         let mut guard = conn.lock().await;
 
-        sqlx::query(
+        let user_message_id: (Uuid,) = sqlx::query_as(
             "INSERT INTO chat_messages (tenant_id, session_id, role, content)
-             VALUES ($1, $2, 'user', $3)",
+             VALUES ($1, $2, 'user', $3)
+             RETURNING id",
         )
         .bind(tenant_id)
         .bind(sid)
         .bind(&user_message)
-        .execute(&mut *guard)
+        .fetch_one(&mut *guard)
         .await
         .map_err(|e| ApiError::Internal(format!("insert user message: {e}")))?;
 
         let (chunks, graph) = if let Some(workspace_id) = session.workspace_id {
             let params = RetrievalParams::new(tenant_id, workspace_id, user_id, &user_message);
-            retrieve_all_with_metering(&mut guard, qdrant, provider.as_ref(), &params)
+            retrieve_all_with_metering(&mut guard, &authz, qdrant, provider.as_ref(), &params)
                 .await
                 .map_err(|e| ApiError::Internal(format!("retrieval: {e}")))?
         } else {
@@ -529,7 +701,7 @@ async fn post_chat_sse(
             .await
             .map_err(|e| ApiError::Internal(format!("touch session: {e}")))?;
 
-        (chunks, graph, history)
+        (chunks, graph, history, user_message_id.0)
     };
 
     let query = user_message.clone();
@@ -537,10 +709,16 @@ async fn post_chat_sse(
     let graph_for_stream = graph.clone();
     let history_for_stream = history.clone();
     let pool_for_post = pool.clone();
+    let pool_for_comp = pool.clone();
     let provider_for_stream = Arc::clone(&provider);
 
     let stream = async_stream::stream! {
+        let _sse_slot = sse_slot;
+        let mut outcome_guard = SseOutcomeGuard::new();
         let mut raw_events: Vec<ChatStreamEvent> = Vec::new();
+        // Held-back upstream Done finish_reason — only emitted after durable
+        // persistence succeeds (durable-before-done).
+        let mut held_finish_reason: Option<String> = None;
 
         let mut upstream = match stream_rag_response(
             provider_for_stream.as_ref(),
@@ -553,28 +731,68 @@ async fn post_chat_sse(
         {
             Ok(s) => s,
             Err(e) => {
+                // Upstream failed to even start — compensate the user turn.
+                if let Err(comp) =
+                    compensate_user_message(&pool_for_comp, tenant_id, user_message_id).await
+                {
+                    tracing::warn!(
+                        error = %comp,
+                        tenant_id = %tenant_id,
+                        session_id = %sid,
+                        user_message_id = %user_message_id,
+                        "compensation failed after stream start failure"
+                    );
+                }
+                outcome_guard.record("error");
                 yield Ok(sse_error("stream-failed", e.to_string()));
                 return;
             }
         };
 
+        let mut stream_failed: Option<String> = None;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(ev) => {
+                    // Hold back the Done event: persist before emitting done.
+                    if let ChatStreamEvent::Done { finish_reason } = &ev {
+                        held_finish_reason = finish_reason.clone();
+                        // Still record it so assistant_text_from_events sees the
+                        // full event sequence (Done carries no text anyway).
+                        raw_events.push(ev.clone());
+                        continue;
+                    }
                     raw_events.push(ev.clone());
                     for enriched in enrich_stream_events(&chunks_for_stream, &[ev]) {
                         yield Ok(sse_from_enriched(&enriched));
                     }
                 }
                 Err(e) => {
-                    yield Ok(sse_error("stream-failed", e.to_string()));
-                    return;
+                    stream_failed = Some(e.to_string());
+                    break;
                 }
             }
         }
 
+        if let Some(msg) = stream_failed {
+            // Upstream stream failed mid-flight — compensate the user turn.
+            if let Err(comp) =
+                compensate_user_message(&pool_for_comp, tenant_id, user_message_id).await
+            {
+                tracing::warn!(
+                    error = %comp,
+                    tenant_id = %tenant_id,
+                    session_id = %sid,
+                    user_message_id = %user_message_id,
+                    "compensation failed after stream failure"
+                );
+            }
+            outcome_guard.record("error");
+            yield Ok(sse_error("stream-failed", msg));
+            return;
+        }
+
         let assistant_text = assistant_text_from_events(&raw_events);
-        if let Err(e) = persist_chat_completion(
+        match persist_chat_completion(
             &pool_for_post,
             tenant_id,
             sid,
@@ -587,7 +805,19 @@ async fn post_chat_sse(
         )
         .await
         {
-            yield Ok(sse_error("persist-failed", e.to_string()));
+            Ok(()) => {
+                // Durable-before-done: persistence succeeded, emit the
+                // single terminal success event with the preserved
+                // finish_reason.
+                outcome_guard.record("done");
+                yield Ok(sse_done(held_finish_reason));
+            }
+            Err(e) => {
+                // Persistence failed — do NOT emit done. The assistant row
+                // was rolled back inside persist_chat_completion.
+                outcome_guard.record("error");
+                yield Ok(sse_error("persist-failed", e.to_string()));
+            }
         }
     };
 
@@ -717,28 +947,32 @@ async fn post_chat_sse_with_context_inner(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let sid = session.session_id;
 
-    {
+    let user_message_id: Uuid = {
         let mut guard = conn.lock().await;
-        sqlx::query(
+        let row: (Uuid,) = sqlx::query_as(
             "INSERT INTO chat_messages (tenant_id, session_id, role, content)
-             VALUES ($1, $2, 'user', $3)",
+             VALUES ($1, $2, 'user', $3)
+             RETURNING id",
         )
         .bind(tenant_id)
         .bind(sid)
         .bind(&user_message)
-        .execute(&mut *guard)
+        .fetch_one(&mut *guard)
         .await
         .map_err(|e| ApiError::Internal(format!("insert user message: {e}")))?;
-    }
+        row.0
+    };
 
     let query = user_message.clone();
     let chunks_for_stream = chunks.clone();
     let graph_for_stream = graph.clone();
     let pool_for_post = pool.clone();
+    let pool_for_comp = pool.clone();
     let provider_for_stream = Arc::clone(&provider);
 
     let stream = async_stream::stream! {
         let mut raw_events: Vec<ChatStreamEvent> = Vec::new();
+        let mut held_finish_reason: Option<String> = None;
 
         let mut upstream = match stream_rag_response(
             provider_for_stream.as_ref(),
@@ -754,28 +988,61 @@ async fn post_chat_sse_with_context_inner(
         {
             Ok(s) => s,
             Err(e) => {
+                if let Err(comp) =
+                    compensate_user_message(&pool_for_comp, tenant_id, user_message_id).await
+                {
+                    tracing::warn!(
+                        error = %comp,
+                        tenant_id = %tenant_id,
+                        session_id = %sid,
+                        user_message_id = %user_message_id,
+                        "compensation failed after stream start failure"
+                    );
+                }
                 yield Ok(sse_error("stream-failed", e.to_string()));
                 return;
             }
         };
 
+        let mut stream_failed: Option<String> = None;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(ev) => {
+                    if let ChatStreamEvent::Done { finish_reason } = &ev {
+                        held_finish_reason = finish_reason.clone();
+                        raw_events.push(ev.clone());
+                        continue;
+                    }
                     raw_events.push(ev.clone());
                     for enriched in enrich_stream_events(&chunks_for_stream, &[ev]) {
                         yield Ok(sse_from_enriched(&enriched));
                     }
                 }
                 Err(e) => {
-                    yield Ok(sse_error("stream-failed", e.to_string()));
-                    return;
+                    stream_failed = Some(e.to_string());
+                    break;
                 }
             }
         }
 
+        if let Some(msg) = stream_failed {
+            if let Err(comp) =
+                compensate_user_message(&pool_for_comp, tenant_id, user_message_id).await
+            {
+                tracing::warn!(
+                    error = %comp,
+                    tenant_id = %tenant_id,
+                    session_id = %sid,
+                    user_message_id = %user_message_id,
+                    "compensation failed after stream failure"
+                );
+            }
+            yield Ok(sse_error("stream-failed", msg));
+            return;
+        }
+
         let assistant_text = assistant_text_from_events(&raw_events);
-        let _ = persist_chat_completion(
+        match persist_chat_completion(
             &pool_for_post,
             tenant_id,
             sid,
@@ -786,7 +1053,15 @@ async fn post_chat_sse_with_context_inner(
             &raw_events,
             &assistant_text,
         )
-        .await;
+        .await
+        {
+            Ok(()) => {
+                yield Ok(sse_done(held_finish_reason));
+            }
+            Err(e) => {
+                yield Ok(sse_error("persist-failed", e.to_string()));
+            }
+        }
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

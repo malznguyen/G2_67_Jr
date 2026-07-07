@@ -114,11 +114,7 @@ pub enum RenderError {
 /// `PdfiumRenderer` (pdfium-render + libpdfium); tests use `MockRenderer`
 /// to avoid the native library dependency.
 pub trait PageRenderer: Send + Sync {
-    fn render_page_to_png(
-        &self,
-        data: &[u8],
-        page_number: u32,
-    ) -> Result<Vec<u8>, RenderError>;
+    fn render_page_to_png(&self, data: &[u8], page_number: u32) -> Result<Vec<u8>, RenderError>;
 }
 
 /// Mock renderer for tests. Returns canned PNG bytes regardless of input.
@@ -133,11 +129,7 @@ impl MockRenderer {
 }
 
 impl PageRenderer for MockRenderer {
-    fn render_page_to_png(
-        &self,
-        _data: &[u8],
-        _page_number: u32,
-    ) -> Result<Vec<u8>, RenderError> {
+    fn render_page_to_png(&self, _data: &[u8], _page_number: u32) -> Result<Vec<u8>, RenderError> {
         Ok(self.image_bytes.clone())
     }
 }
@@ -180,7 +172,7 @@ fn extract_pages_blocking(data: &[u8]) -> Result<Vec<PdfPage>, PdfParseError> {
 
 /// Extract text from a single page via `pdf_extract::output_doc_page`.
 fn extract_page_text(doc: &lopdf::Document, page_number: u32) -> String {
-    use pdf_extract::{PlainTextOutput, output_doc_page};
+    use pdf_extract::{output_doc_page, PlainTextOutput};
     let mut text = String::new();
     let result = {
         let mut output = PlainTextOutput::new(&mut text);
@@ -304,12 +296,15 @@ impl PdfiumRenderer {
 }
 
 #[cfg(feature = "ocr-pdfium")]
+impl Default for PdfiumRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "ocr-pdfium")]
 impl PageRenderer for PdfiumRenderer {
-    fn render_page_to_png(
-        &self,
-        _data: &[u8],
-        _page_number: u32,
-    ) -> Result<Vec<u8>, RenderError> {
+    fn render_page_to_png(&self, _data: &[u8], _page_number: u32) -> Result<Vec<u8>, RenderError> {
         // The pdfium-render bindings require unsafe FFI + a bundled
         // libpdfium at link time. T84D intentionally leaves the wiring
         // off-by-default (the feature is gated); operators who build the
@@ -376,9 +371,9 @@ pub async fn parse_pdf_for_ingest(
         #[cfg(feature = "ocr-pdfium")]
         let renderer = PdfiumRenderer::new();
         let mut out = Vec::with_capacity(page_count);
-        let mut pages_iter = pages.into_iter();
+        let pages_iter = pages.into_iter();
         let mut used_ocr = false;
-        while let Some(page) = pages_iter.next() {
+        for page in pages_iter {
             #[allow(unused_mut)]
             let mut text = page.text;
             if page.needs_ocr {
@@ -444,10 +439,7 @@ mod tests {
         let result = parse_pdf(data, 30).await;
         assert!(result.is_ok(), "parse should succeed: {:?}", result.err());
         let parsed = result.unwrap();
-        assert!(
-            parsed.page_count > 0,
-            "page_count must be > 0"
-        );
+        assert!(parsed.page_count > 0, "page_count must be > 0");
         assert!(
             !parsed.text.is_empty() || parsed.extraction_method == ExtractionMethod::Fallback,
             "either text is extracted or fallback is used (method={:?})",
@@ -504,7 +496,11 @@ mod tests {
         let ocr = NoOcr; // panics if called
 
         let result = parse_pdf_with_ocr(data, 30, &renderer, &ocr).await;
-        assert!(result.is_ok(), "text PDF should parse without OCR: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "text PDF should parse without OCR: {:?}",
+            result.err()
+        );
         let parsed = result.unwrap();
         assert_ne!(
             parsed.extraction_method,

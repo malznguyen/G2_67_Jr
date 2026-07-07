@@ -77,9 +77,7 @@ pub async fn auth_middleware(mut request: Request<Body>, next: Next) -> Response
     let user_id = match Uuid::parse_str(&claims.sub) {
         Ok(id) => id,
         Err(e) => {
-            return auth_error_response(AuthError::InvalidToken(format!(
-                "invalid 'sub' UUID: {e}"
-            )))
+            return auth_error_response(AuthError::InvalidToken(format!("invalid 'sub' UUID: {e}")))
         }
     };
 
@@ -125,7 +123,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Extension, Json, Router};
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -151,7 +149,12 @@ mod tests {
     fn make_token(claims: &JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn make_auth_state() -> AuthState {

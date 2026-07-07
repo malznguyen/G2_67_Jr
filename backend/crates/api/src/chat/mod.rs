@@ -4,10 +4,9 @@ pub mod retrieval;
 pub mod streaming;
 
 pub use retrieval::{
-    accessible_document_ids, retrieve_all, retrieve_all_with_metering,
-    retrieve_all_with_provider, retrieve_chunks, retrieve_chunks_with_vector,
-    retrieve_graph_context, ChunkHit, GraphContext, GraphEdgeHit, GraphNodeHit, RetrievalError,
-    RetrievalParams, DEFAULT_TOP_K,
+    accessible_document_ids, retrieve_all, retrieve_all_with_metering, retrieve_all_with_provider,
+    retrieve_chunks, retrieve_chunks_with_vector, retrieve_graph_context, ChunkHit, GraphContext,
+    GraphEdgeHit, GraphNodeHit, RetrievalError, RetrievalParams, DEFAULT_TOP_K,
 };
 pub use streaming::{
     assistant_text_from_events, collect_stream_events, meter_rag_chat_completion,
@@ -62,10 +61,7 @@ pub fn resolve_chunk_index_citations(
     chunks: &[ChunkHit],
     indices: impl IntoIterator<Item = u32>,
 ) -> Vec<ResolvedCitation> {
-    let by_index: HashMap<u32, &ChunkHit> = chunks
-        .iter()
-        .map(|c| (c.citation_index, c))
-        .collect();
+    let by_index: HashMap<u32, &ChunkHit> = chunks.iter().map(|c| (c.citation_index, c)).collect();
     let mut seen = HashMap::new();
     let mut out = Vec::new();
     for index in indices {

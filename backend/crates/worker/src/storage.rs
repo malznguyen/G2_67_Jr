@@ -4,10 +4,10 @@
 //! (custom endpoint, static credentials, `force_path_style = true`).
 //! Tests use `wiremock` to mock the S3 REST API — no live MinIO required.
 
-use aws_sdk_s3::Client as S3SdkClient;
-use aws_sdk_s3::Config;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3SdkClient;
+use aws_sdk_s3::Config;
 
 use gmrag_core::config::S3Config;
 
@@ -94,9 +94,9 @@ impl S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
     use wiremock::Mock;
     use wiremock::MockServer;
-    use wiremock::matchers::{method, path};
     use wiremock::ResponseTemplate;
 
     fn test_s3_config(endpoint: String) -> S3Config {
@@ -125,14 +125,16 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/gmrag-uploads/roundtrip-test"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(b"hello s3 roundtrip".to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello s3 roundtrip".to_vec()))
             .mount(&server)
             .await;
 
         client
-            .upload("roundtrip-test", b"hello s3 roundtrip".to_vec(), "text/plain")
+            .upload(
+                "roundtrip-test",
+                b"hello s3 roundtrip".to_vec(),
+                "text/plain",
+            )
             .await
             .expect("upload should succeed");
 

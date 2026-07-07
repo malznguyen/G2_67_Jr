@@ -205,6 +205,153 @@ async fn rls_tenant_members_isolation(pool: PgPool) {
 // every new tenant-scoped table. Before the rls_apply_all migration, the
 // gmrag_app role sees ALL rows (no policy) → these tests FAIL (red).
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_catalog_has_force_and_with_check_for_all_tenant_tables(pool: PgPool) {
+    let expected = [
+        ("tenants", "tenant_isolation", "id"),
+        ("tenant_members", "tenant_members_isolation", "tenant_id"),
+        ("workspaces", "workspaces_isolation", "tenant_id"),
+        (
+            "workspace_members",
+            "workspace_members_isolation",
+            "tenant_id",
+        ),
+        ("documents", "documents_isolation", "tenant_id"),
+        ("document_chunks", "document_chunks_isolation", "tenant_id"),
+        ("graph_nodes", "graph_nodes_isolation", "tenant_id"),
+        ("graph_edges", "graph_edges_isolation", "tenant_id"),
+        (
+            "graph_node_documents",
+            "graph_node_documents_isolation",
+            "tenant_id",
+        ),
+        ("chat_sessions", "chat_sessions_isolation", "tenant_id"),
+        ("chat_messages", "chat_messages_isolation", "tenant_id"),
+        ("invitations", "invitations_isolation", "tenant_id"),
+        ("tenant_quotas", "tenant_quotas_isolation", "tenant_id"),
+        ("usage_events", "usage_events_isolation", "tenant_id"),
+        ("audit_log", "audit_log_isolation", "tenant_id"),
+        ("ingest_jobs", "ingest_jobs_isolation", "tenant_id"),
+        (
+            "tenant_llm_config",
+            "tenant_llm_config_isolation",
+            "tenant_id",
+        ),
+        ("ingest_outbox", "ingest_outbox_isolation", "tenant_id"),
+    ];
+
+    for (table, policy, tenant_column) in expected {
+        let (rls_enabled, force_rls): (bool, bool) = sqlx::query_as(
+            "SELECT relrowsecurity, relforcerowsecurity
+             FROM pg_class
+             WHERE oid = $1::regclass",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(rls_enabled, "{table} must have RLS enabled");
+        assert!(force_rls, "{table} must have FORCE RLS enabled");
+
+        let (using_expr, check_expr): (String, String) = sqlx::query_as(
+            "SELECT pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid)
+             FROM pg_policy
+             WHERE polrelid = $1::regclass AND polname = $2",
+        )
+        .bind(table)
+        .bind(policy)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            normalize_policy_expr(&using_expr),
+            normalize_policy_expr(&check_expr),
+            "{table}.{policy} WITH CHECK must match USING"
+        );
+        assert!(
+            normalize_policy_expr(&check_expr).contains(&normalize_policy_expr(&format!(
+                "{tenant_column}=gmrag_current_tenant()"
+            ))),
+            "{table}.{policy} WITH CHECK must scope by {tenant_column}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_with_check_rejects_wrong_tenant_insert_and_update(pool: PgPool) {
+    let tenant_a = create_tenant(&pool, "Tenant A").await;
+    let tenant_b = create_tenant(&pool, "Tenant B").await;
+    let user = create_user(&pool, "rls-writes@test.com").await;
+
+    let mut tx = begin_rls_tx(&pool).await;
+    set_tenant(&mut tx, tenant_a).await;
+
+    let ws_a: Uuid = sqlx::query_scalar(
+        "INSERT INTO workspaces (tenant_id, name, slug, created_by)
+         VALUES ($1, 'A', 'a', $2)
+         RETURNING id",
+    )
+    .bind(tenant_a)
+    .bind(user)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+
+    let wrong_insert = sqlx::query(
+        "INSERT INTO workspaces (tenant_id, name, slug, created_by)
+         VALUES ($1, 'B', 'b', $2)",
+    )
+    .bind(tenant_b)
+    .bind(user)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        wrong_insert.is_err(),
+        "tenant A context must not insert tenant B workspace"
+    );
+
+    let wrong_update = sqlx::query("UPDATE workspaces SET tenant_id = $1 WHERE id = $2")
+        .bind(tenant_b)
+        .bind(ws_a)
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        wrong_update.is_err(),
+        "tenant A context must not update a workspace to tenant B"
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rls_app_role_without_context_cannot_insert_tenant_scoped_rows(pool: PgPool) {
+    let tenant = create_tenant(&pool, "Tenant No Context").await;
+    let user = create_user(&pool, "no-context@test.com").await;
+    let mut tx = begin_rls_tx(&pool).await;
+
+    let result = sqlx::query(
+        "INSERT INTO workspaces (tenant_id, name, slug, created_by)
+         VALUES ($1, 'No Context', 'no-context', $2)",
+    )
+    .bind(tenant)
+    .bind(user)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        result.is_err(),
+        "gmrag_app without app.tenant_id must not insert tenant-scoped rows"
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+fn normalize_policy_expr(expr: &str) -> String {
+    expr.chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '(' && *ch != ')')
+        .collect::<String>()
+}
+
 /// Helper: insert a workspace and return its id.
 async fn create_workspace(pool: &PgPool, tenant_id: Uuid, name: &str, user_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
@@ -249,14 +396,16 @@ async fn rls_workspaces_blocks_cross_tenant_access(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(policy_count, 1, "workspaces_isolation policy must exist in test DB");
+    assert_eq!(
+        policy_count, 1,
+        "workspaces_isolation policy must exist in test DB"
+    );
 
-    let rls_enabled: bool = sqlx::query_scalar(
-        "SELECT relrowsecurity FROM pg_class WHERE relname = 'workspaces'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let rls_enabled: bool =
+        sqlx::query_scalar("SELECT relrowsecurity FROM pg_class WHERE relname = 'workspaces'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(rls_enabled, "RLS must be enabled on workspaces in test DB");
 
     let tenant_a = create_tenant(&pool, "Tenant A").await;
@@ -408,16 +557,20 @@ async fn rls_graph_nodes_blocks_cross_tenant_access(pool: PgPool) {
     let tenant_a = create_tenant(&pool, "Tenant A").await;
     let tenant_b = create_tenant(&pool, "Tenant B").await;
 
-    sqlx::query("INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node A')")
-        .bind(tenant_a)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node B')")
-        .bind(tenant_b)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node A')",
+    )
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO graph_nodes (tenant_id, kind, label) VALUES ($1, 'concept', 'Node B')",
+    )
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let mut tx = begin_rls_tx(&pool).await;
     set_tenant(&mut tx, tenant_a).await;
@@ -437,18 +590,22 @@ async fn rls_invitations_blocks_cross_tenant_access(pool: PgPool) {
     let tenant_b = create_tenant(&pool, "Tenant B").await;
     let user_a = create_user(&pool, "a@inv.com").await;
 
-    sqlx::query("INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'x@a.com', $2)")
-        .bind(tenant_a)
-        .bind(user_a)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'y@b.com', $2)")
-        .bind(tenant_b)
-        .bind(user_a)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'x@a.com', $2)",
+    )
+    .bind(tenant_a)
+    .bind(user_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invitations (tenant_id, email, invited_by) VALUES ($1, 'y@b.com', $2)",
+    )
+    .bind(tenant_b)
+    .bind(user_a)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let mut tx = begin_rls_tx(&pool).await;
     set_tenant(&mut tx, tenant_a).await;
@@ -483,7 +640,6 @@ async fn rls_no_context_hides_all_domain_tables(pool: PgPool) {
         "graph_edges",
         "chat_sessions",
         "chat_messages",
-        "resource_acl",
         "invitations",
         "tenant_quotas",
         "usage_events",

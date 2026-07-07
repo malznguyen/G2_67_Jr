@@ -46,7 +46,7 @@ pub struct AuthState {
 mod tests {
     use super::*;
     use crate::auth::jwt::JwtValidator;
-    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 
     #[allow(dead_code)]
     const TEST_PEM_PRIV: &[u8] = include_bytes!("test_keys/test_rsa_private.pem");
@@ -72,7 +72,12 @@ mod tests {
     fn make_token(claims: &super::super::jwt::JwtClaims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn make_auth_state() -> AuthState {
@@ -89,7 +94,9 @@ mod tests {
                 Algorithm::RS256,
             )
             .await;
-        AuthState { jwt_validator: validator }
+        AuthState {
+            jwt_validator: validator,
+        }
     }
 
     #[test]

@@ -5,4 +5,4 @@
 
 mod store;
 
-pub use store::QdrantStore;
+pub use store::{ChunkPointRef, GraphNodePointRef, QdrantStore};

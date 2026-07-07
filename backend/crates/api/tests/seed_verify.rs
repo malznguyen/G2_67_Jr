@@ -76,7 +76,10 @@ async fn seed_script_is_idempotent(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(tenant_count, 2, "re-running seed must not duplicate tenants");
+    assert_eq!(
+        tenant_count, 2,
+        "re-running seed must not duplicate tenants"
+    );
 
     let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
         .fetch_one(&pool)

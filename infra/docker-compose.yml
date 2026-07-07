@@ -102,7 +102,53 @@ services:
       - gmrag-net
     logging: *logging
 
-  # ---------- 5. Ollama ----------
+  # ---------- 5. OpenFGA migrations ----------
+  openfga-migrate:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga-migrate
+    command: migrate
+    restart: "no"
+    depends_on:
+      postgres16:
+        condition: service_healthy
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: ${OPENFGA_DATASTORE_URI}
+    networks:
+      - gmrag-net
+    logging: *logging
+
+  # ---------- 6. OpenFGA authorization ----------
+  openfga:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga
+    <<: *restart_policy
+    command: run
+    depends_on:
+      postgres16:
+        condition: service_healthy
+      openfga-migrate:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: ${OPENFGA_DATASTORE_URI}
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: ${OPENFGA_API_TOKEN}
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: json
+    ports:
+      - "${OPENFGA_HTTP_PORT:-8089}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - gmrag-net
+    logging: *logging
+
+  # ---------- 7. Ollama ----------
   ollama:
     image: ollama/ollama:0.5.7
     container_name: gmrag-ollama
@@ -121,7 +167,7 @@ services:
       - gmrag-net
     logging: *logging
 
-  # ---------- 6. Keycloak ----------
+  # ---------- 8. Keycloak ----------
   keycloak:
     image: quay.io/keycloak/keycloak:25.0.6
     container_name: gmrag-keycloak
@@ -147,7 +193,7 @@ services:
       - gmrag-net
     logging: *logging
 
-  # ---------- 7. Backend (Rust / axum) ----------
+  # ---------- 9. Backend (Rust / axum) ----------
   backend:
     build:
       context: ..
@@ -164,6 +210,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      openfga:
+        condition: service_healthy
       keycloak:
         condition: service_started
     environment:
@@ -171,6 +219,12 @@ services:
       QDRANT_URL: ${QDRANT_URL}
       QDRANT_COLLECTION_DEFAULT: ${QDRANT_COLLECTION_DEFAULT}
       REDIS_URL: ${REDIS_URL}
+      OPENFGA_API_URL: ${OPENFGA_API_URL}
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID}
+      OPENFGA_AUTHORIZATION_MODEL_ID: ${OPENFGA_AUTHORIZATION_MODEL_ID}
+      OPENFGA_API_TOKEN: ${OPENFGA_API_TOKEN}
+      OPENFGA_REQUEST_TIMEOUT_MS: ${OPENFGA_REQUEST_TIMEOUT_MS:-1500}
+      OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS: ${OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS:-5}
       S3_ENDPOINT: ${S3_ENDPOINT}
       S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT}
       S3_REGION: ${S3_REGION}
@@ -189,6 +243,12 @@ services:
       GMRAG_RUST_LOG: ${GMRAG_RUST_LOG}
       GMRAG_HTTP_BIND: ${GMRAG_HTTP_BIND}
       GMRAG_TENANT_HEADER: ${GMRAG_TENANT_HEADER}
+      GMRAG_RATELIMIT_ENABLED: ${GMRAG_RATELIMIT_ENABLED:-true}
+      GMRAG_RATELIMIT_AUTH_PER_MIN: ${GMRAG_RATELIMIT_AUTH_PER_MIN:-10}
+      GMRAG_RATELIMIT_JOB_CREATE_PER_MIN: ${GMRAG_RATELIMIT_JOB_CREATE_PER_MIN:-20}
+      GMRAG_RATELIMIT_CHAT_CREATE_PER_MIN: ${GMRAG_RATELIMIT_CHAT_CREATE_PER_MIN:-30}
+      GMRAG_RATELIMIT_CHAT_CONCURRENT_PER_TENANT: ${GMRAG_RATELIMIT_CHAT_CONCURRENT_PER_TENANT:-50}
+      GMRAG_RATELIMIT_GENERAL_PER_MIN: ${GMRAG_RATELIMIT_GENERAL_PER_MIN:-300}
       # T84D tuning: explicit pool ceiling + chat history length.
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       GMRAG_CHAT_HISTORY_LIMIT: ${GMRAG_CHAT_HISTORY_LIMIT:-10}
@@ -208,7 +268,7 @@ services:
       - gmrag-net
     logging: *logging
 
-  # ---------- 8. Worker (Rust) ----------
+  # ---------- 10. Worker (Rust) ----------
   worker:
     build:
       context: ..
@@ -231,6 +291,12 @@ services:
       QDRANT_URL: ${QDRANT_URL}
       QDRANT_COLLECTION_DEFAULT: ${QDRANT_COLLECTION_DEFAULT}
       REDIS_URL: ${REDIS_URL}
+      OPENFGA_API_URL: ${OPENFGA_API_URL}
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID}
+      OPENFGA_AUTHORIZATION_MODEL_ID: ${OPENFGA_AUTHORIZATION_MODEL_ID}
+      OPENFGA_API_TOKEN: ${OPENFGA_API_TOKEN}
+      OPENFGA_REQUEST_TIMEOUT_MS: ${OPENFGA_REQUEST_TIMEOUT_MS:-1500}
+      OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS: ${OPENFGA_HIGHER_CONSISTENCY_WINDOW_SECS:-5}
       S3_ENDPOINT: ${S3_ENDPOINT}
       S3_REGION: ${S3_REGION}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY}
@@ -251,11 +317,18 @@ services:
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
       GMRAG_TENANT_HEADER: ${GMRAG_TENANT_HEADER}
+      GMRAG_WORKER_METRICS_BIND: ${GMRAG_WORKER_METRICS_BIND:-0.0.0.0:9091}
       # T84D tuning: pool ceiling + outbox relay / sweeper / OCR flags.
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-10}
       GMRAG_OCR_ENABLED: ${GMRAG_OCR_ENABLED:-false}
       GMRAG_OUTBOX_POLL_INTERVAL_SECS: ${GMRAG_OUTBOX_POLL_INTERVAL_SECS:-3}
       GMRAG_SWEEP_INTERVAL_SECS: ${GMRAG_SWEEP_INTERVAL_SECS:-60}
+      # Phase 0 (TASK-P0-04): bounded retention loop (admin_pool).
+      GMRAG_RETENTION_INTERVAL_SECS: ${GMRAG_RETENTION_INTERVAL_SECS:-86400}
+      GMRAG_OUTBOX_RETENTION_DAYS: ${GMRAG_OUTBOX_RETENTION_DAYS:-30}
+      GMRAG_USAGE_RETENTION_DAYS: ${GMRAG_USAGE_RETENTION_DAYS:-90}
+      GMRAG_AUDIT_RETENTION_DAYS: ${GMRAG_AUDIT_RETENTION_DAYS:-365}
+      GMRAG_RETENTION_BATCH_SIZE: ${GMRAG_RETENTION_BATCH_SIZE:-1000}
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f gmrag-worker >/dev/null || exit 1"]
       interval: 30s
@@ -264,9 +337,11 @@ services:
       start_period: 30s
     networks:
       - gmrag-net
+    ports:
+      - "9091:9091"
     logging: *logging
 
-  # ---------- 9. Frontend (Next.js) ----------
+  # ---------- 11. Frontend (Next.js) ----------
   frontend:
     build:
       context: ..

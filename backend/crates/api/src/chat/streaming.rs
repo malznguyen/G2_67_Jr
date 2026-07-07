@@ -61,9 +61,7 @@ impl DeepseekTokenParser {
             return Vec::new();
         }
         let remaining = std::mem::take(&mut self.buffer);
-        vec![ChatStreamEvent::Text {
-            content: remaining,
-        }]
+        vec![ChatStreamEvent::Text { content: remaining }]
     }
 
     fn drain_complete(&mut self) -> Vec<ChatStreamEvent> {
@@ -201,16 +199,14 @@ pub async fn meter_rag_chat_completion(
     let system = assemble_system_prompt(chunks, graph);
     let input_text = format!("{system}\n{user_query}");
     let output_text = assistant_text_from_events(events);
-    Ok(
-        metering::record_llm_usage(
-            conn,
-            tenant_id,
-            &input_text,
-            &output_text,
-            provider.chat_model(),
-        )
-        .await?,
+    Ok(metering::record_llm_usage(
+        conn,
+        tenant_id,
+        &input_text,
+        &output_text,
+        provider.chat_model(),
     )
+    .await?)
 }
 
 /// Collect all events from a parsed chat stream (testing helper).
@@ -329,9 +325,9 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let body = self.body;
             Box::pin(async move {
-                let stream: ChatStream = Box::pin(stream::iter(body.lines().map(|line| {
-                    Ok(parse_test_sse_line(line))
-                })));
+                let stream: ChatStream = Box::pin(stream::iter(
+                    body.lines().map(|line| Ok(parse_test_sse_line(line))),
+                ));
                 Ok(stream)
             })
         }
@@ -394,15 +390,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
-        let mut stream = stream_rag_response(
-            &provider,
-            &[],
-            &GraphContext::default(),
-            "question?",
-            &[],
-        )
-        .await
-        .expect("stream");
+        let mut stream =
+            stream_rag_response(&provider, &[], &GraphContext::default(), "question?", &[])
+                .await
+                .expect("stream");
 
         let events = collect_stream_events(&mut stream).await.expect("events");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -454,15 +445,9 @@ mod tests {
             },
         });
 
-        let mut stream = stream_rag_response(
-            &provider,
-            &[],
-            &GraphContext::default(),
-            "hi",
-            &[],
-        )
-        .await
-        .expect("stream");
+        let mut stream = stream_rag_response(&provider, &[], &GraphContext::default(), "hi", &[])
+            .await
+            .expect("stream");
 
         let events = collect_stream_events(&mut stream).await.expect("events");
         assert!(events.contains(&ChatStreamEvent::Citation { index: 1 }));

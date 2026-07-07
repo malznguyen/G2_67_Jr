@@ -64,8 +64,7 @@ impl RedisEnqueuer {
 #[async_trait::async_trait]
 impl JobEnqueuer for RedisEnqueuer {
     async fn enqueue(&self, job: &IngestJobPayload) -> Result<(), String> {
-        let payload =
-            serde_json::to_vec(job).map_err(|e| format!("serialize ingest job: {e}"))?;
+        let payload = serde_json::to_vec(job).map_err(|e| format!("serialize ingest job: {e}"))?;
         let mut conn = self.conn.clone();
         conn.lpush::<_, _, ()>(INGEST_JOBS_KEY, payload)
             .await

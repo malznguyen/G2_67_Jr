@@ -70,3 +70,135 @@ body {
   color: hsl(var(--foreground));
   border-radius: 0;
 }
+
+/* ============================================================
+   Auth screens — "GraphRAG instrument" canvas
+   Scoped to `.auth-canvas`. Does not touch shared tokens.
+   ============================================================ */
+.auth-canvas {
+  --gc-bg: 222 24% 7%;
+  --gc-bg-2: 220 20% 10%;
+  --gc-fg: 210 30% 92%;
+  --gc-muted: 215 16% 58%;
+  --gc-edge: 200 18% 38%;
+  --gc-node: 178 60% 52%;
+  --gc-node-strong: 178 70% 62%;
+  --gc-accent: 178 60% 45%;
+  --gc-card: 222 22% 11% / 0.72;
+  --gc-border: 200 18% 28% / 0.55;
+  background:
+    radial-gradient(120% 80% at 12% 8%, hsl(216 28% 12% / 0.9) 0%, transparent 55%),
+    radial-gradient(100% 70% at 88% 92%, hsl(184 30% 9% / 0.85) 0%, transparent 55%),
+    linear-gradient(160deg, hsl(var(--gc-bg)) 0%, hsl(var(--gc-bg-2)) 100%);
+  color: hsl(var(--gc-fg));
+}
+
+/* faint graph-paper grid overlay */
+.auth-canvas::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(hsl(var(--gc-edge) / 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(var(--gc-edge) / 0.08) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, #000 0%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, #000 0%, transparent 100%);
+}
+
+.auth-lattice {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: hsl(var(--gc-node));
+}
+
+.auth-lattice .lattice-edge {
+  stroke: hsl(var(--gc-edge) / 0.35);
+  stroke-width: 1;
+  fill: none;
+  stroke-dasharray: 1200;
+  stroke-dashoffset: 1200;
+  animation: lattice-draw 1.6s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+
+.auth-lattice .lattice-node {
+  fill: hsl(var(--gc-node) / 0.85);
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: lattice-pop 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+
+.auth-lattice .lattice-node-strong {
+  fill: hsl(var(--gc-node-strong));
+  filter: drop-shadow(0 0 6px hsl(var(--gc-node-strong) / 0.55));
+}
+
+.auth-card {
+  background: hsl(var(--gc-card));
+  border: 1px solid hsl(var(--gc-border));
+  backdrop-filter: blur(14px) saturate(120%);
+  -webkit-backdrop-filter: blur(14px) saturate(120%);
+  box-shadow:
+    0 1px 0 hsl(0 0% 100% / 0.04) inset,
+    0 30px 80px -30px hsl(220 40% 2% / 0.8);
+}
+
+.auth-accent-text {
+  color: hsl(var(--gc-node-strong));
+}
+
+.auth-divider {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--gc-edge) / 0.45),
+    transparent
+  );
+}
+
+@keyframes lattice-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes lattice-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.2);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes fade-up {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-lattice .lattice-edge,
+  .auth-lattice .lattice-node,
+  .animate-fade-up {
+    animation: none;
+    opacity: 1;
+    stroke-dashoffset: 0;
+    transform: none;
+  }
+}

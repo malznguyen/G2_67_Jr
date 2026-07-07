@@ -8,12 +8,16 @@
 use std::time::Duration;
 
 use gmrag_core::config::{DeepSeekConfig, OllamaConfig};
-use gmrag_core::{QdrantStore, init_app_pool, init_pool};
+use gmrag_core::status::{document as doc_status, ingest_job as job_status};
+use gmrag_core::{init_app_pool, init_pool, QdrantStore};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::qdrant_writer::{DualWriteInput, dual_write_ingestion};
-use crate::{S3Client, chunk_page_texts_with_pages, parse_pdf_for_ingest, select_embedder, select_graph_extractor};
+use crate::qdrant_writer::{dual_write_ingestion, DualWriteInput};
+use crate::{
+    chunk_page_texts_with_pages, parse_pdf_for_ingest, select_embedder, select_graph_extractor,
+    S3Client,
+};
 
 /// Maximum number of attempts before a job is marked `failed`.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -130,21 +134,16 @@ impl IngestContext {
         //    GMRAG_OCR_ENABLED + the `ocr-pdfium` Cargo feature — Phase 1.3).
         //    When OCR is requested we hand the dispatcher an Ollama vision
         //    client built from the context's Ollama config.
-        let ocr_client: Option<crate::ocr::OllamaVisionOcr> =
-            if self.ocr_enabled {
-                Some(crate::ocr::OllamaVisionOcr::new(&self.ollama))
-            } else {
-                None
-            };
+        let ocr_client: Option<crate::ocr::OllamaVisionOcr> = if self.ocr_enabled {
+            Some(crate::ocr::OllamaVisionOcr::new(&self.ollama))
+        } else {
+            None
+        };
         let ocr_ref = ocr_client.as_ref().map(|c| c as &dyn crate::ocr::OcrClient);
-        let (page_texts, _method) = parse_pdf_for_ingest(
-            bytes,
-            PDF_PARSE_TIMEOUT_SECS,
-            self.ocr_enabled,
-            ocr_ref,
-        )
-        .await
-        .map_err(|e| format!("pdf parse: {e}"))?;
+        let (page_texts, _method) =
+            parse_pdf_for_ingest(bytes, PDF_PARSE_TIMEOUT_SECS, self.ocr_enabled, ocr_ref)
+                .await
+                .map_err(|e| format!("pdf parse: {e}"))?;
 
         let full_text = page_texts
             .iter()
@@ -156,19 +155,21 @@ impl IngestContext {
         // T84D Phase 3.1: per-page strings typed as `Vec<String>` for the
         // page-aware chunker. The chunker maps each chunk's byte range back
         // to page numbers and emits `Chunk { text, page_start, page_end }`.
-        let chunk_inputs: Vec<String> = page_texts
-            .iter()
-            .map(|p| p.text.clone())
-            .collect();
+        let chunk_inputs: Vec<String> = page_texts.iter().map(|p| p.text.clone()).collect();
 
         // 3. Chunk (page-aware — feeds Phase 3 page metadata).
-        let chunks = chunk_page_texts_with_pages(&chunk_inputs)
-            .map_err(|e| format!("chunking: {e}"))?;
+        let chunks =
+            chunk_page_texts_with_pages(&chunk_inputs).map_err(|e| format!("chunking: {e}"))?;
 
         // 4. Embed chunks (per-tenant BYOK or Ollama).
-        let embedder = select_embedder(&self.pool, job.tenant_id, &self.ollama, self.enc_key.as_ref())
-            .await
-            .map_err(|e| format!("select_embedder: {e}"))?;
+        let embedder = select_embedder(
+            &self.pool,
+            job.tenant_id,
+            &self.ollama,
+            self.enc_key.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("select_embedder: {e}"))?;
         let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let chunk_vectors = embedder
             .embed_batch(&chunk_texts)
@@ -176,9 +177,14 @@ impl IngestContext {
             .map_err(|e| format!("embed chunks: {e}"))?;
 
         // 5. Graph extract via DeepSeek (global) or tenant BYOK LLM.
-        let extractor = select_graph_extractor(&self.pool, job.tenant_id, &self.deepseek, self.enc_key.as_ref())
-            .await
-            .map_err(|e| format!("select_graph_extractor: {e}"))?;
+        let extractor = select_graph_extractor(
+            &self.pool,
+            job.tenant_id,
+            &self.deepseek,
+            self.enc_key.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("select_graph_extractor: {e}"))?;
         let extraction = extractor
             .extract(&full_text)
             .await
@@ -226,13 +232,31 @@ impl IngestContext {
     }
 }
 
-/// Run a job with up to [`MAX_ATTEMPTS`] attempts, in-memory exponential
-/// backoff, and `ingest_jobs` status tracking.
+/// Run a job with up to [`MAX_ATTEMPTS`] total attempts, in-memory
+/// exponential backoff, and `ingest_jobs` status tracking.
 ///
-/// - On success: `ingest_jobs.status='completed'`, `documents.status='indexed'`.
-/// - On each failure: `attempts++`, `last_error` recorded, backoff sleep.
-/// - After exhausting attempts: `ingest_jobs.status='failed'`,
-///   `documents.status='failed'`.
+/// # Prior attempts accounting (Phase 1, Task 2)
+/// A job requeued by the sweeper arrives with `job.attempts` already
+/// reflecting prior real attempts (the sweeper does
+/// `attempts = row.attempts + 1` at requeue time). This wrapper must NOT
+/// give such a job a fresh full set of `MAX_ATTEMPTS` in-memory retries —
+/// it would let a requeued job retry far past the intended cap, wasting
+/// external API calls (embeddings, graph LLM). The in-memory loop is
+/// therefore bounded by `MAX_ATTEMPTS - job.attempts` (the remaining
+/// budget), not `0..MAX_ATTEMPTS`.
+///
+/// # Persisted `attempts` semantics
+/// The persisted `ingest_jobs.attempts` counter counts EVERY real
+/// `runner.run()` invocation (failures AND the successful attempt), so it
+/// stays accurate across multiple sweeper requeues — not just one. On
+/// success it equals `start_attempts + attempts_made_this_session`; on
+/// final exhaustion it equals `MAX_ATTEMPTS`.
+///
+/// # Fail-fast at the cap
+/// If `job.attempts >= MAX_ATTEMPTS` when picked up (e.g. a race with the
+/// sweeper), the job is marked `failed` immediately without invoking the
+/// runner — no external API calls are spent on a job that has already
+/// exhausted its budget.
 ///
 /// Returns `Ok(())` once the job is either completed or marked failed
 /// (so the poll loop never crashes the worker). Returns `Err` only if the
@@ -242,36 +266,100 @@ pub async fn process_job_with_retry(
     pool: &PgPool,
     job: &IngestJob,
 ) -> anyhow::Result<()> {
-    update_job_status(pool, job.tenant_id, job.id, "processing", job.attempts as i32, None)
-        .await?;
-    update_document_status(pool, job.tenant_id, job.document_id, "processing").await?;
+    let started = std::time::Instant::now();
+    let start_attempts = job.attempts;
 
+    // Fail-fast: a job already at/over the attempt cap (e.g. a sweeper race)
+    // must not run again — mark it failed immediately.
+    if start_attempts >= MAX_ATTEMPTS {
+        let msg = format!("job already reached max attempts ({MAX_ATTEMPTS}); not retrying");
+        update_job_status(
+            pool,
+            job.tenant_id,
+            job.id,
+            job_status::FAILED,
+            start_attempts as i32,
+            Some(&msg),
+        )
+        .await?;
+        update_document_status(pool, job.tenant_id, job.document_id, doc_status::FAILED).await?;
+        tracing::error!(
+            job_id = %job.id,
+            attempts = start_attempts,
+            "job marked failed: already at/over max attempts"
+        );
+        gmrag_api::metrics::metrics().inc_job_outcome(
+            "ingest",
+            "failure",
+            started.elapsed().as_secs_f64(),
+        );
+        return Ok(());
+    }
+
+    update_job_status(
+        pool,
+        job.tenant_id,
+        job.id,
+        job_status::PROCESSING,
+        start_attempts as i32,
+        None,
+    )
+    .await?;
+    update_document_status(pool, job.tenant_id, job.document_id, doc_status::PROCESSING).await?;
+
+    // In-memory budget: the number of NEW real attempts this session may run.
+    // A fresh job (start=0) gets the full MAX_ATTEMPTS; a requeued job with
+    // start=2 gets MAX_ATTEMPTS - 2 = 1 more try.
+    let remaining = MAX_ATTEMPTS - start_attempts;
     let mut last_error = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    for i in 0..remaining {
+        // Persisted attempts = start + (i + 1) — every real run counts.
+        let attempts_after = start_attempts + i + 1;
         match runner.run(job).await {
             Ok(()) => {
-                update_job_status(pool, job.tenant_id, job.id, "completed", attempt as i32, None)
-                    .await?;
-                update_document_status(pool, job.tenant_id, job.document_id, "indexed").await?;
-                tracing::info!(job_id = %job.id, attempt, "job completed");
-                return Ok(());
-            }
-            Err(e) => {
-                last_error = e;
-                let failures = attempt + 1;
-                tracing::warn!(job_id = %job.id, attempt = failures, error = %last_error, "job attempt failed");
                 update_job_status(
                     pool,
                     job.tenant_id,
                     job.id,
-                    "processing",
-                    failures as i32,
+                    job_status::COMPLETED,
+                    attempts_after as i32,
+                    None,
+                )
+                .await?;
+                update_document_status(pool, job.tenant_id, job.document_id, doc_status::INDEXED)
+                    .await?;
+                tracing::info!(job_id = %job.id, attempt = attempts_after, "job completed");
+                gmrag_api::metrics::metrics().inc_job_outcome(
+                    "ingest",
+                    "success",
+                    started.elapsed().as_secs_f64(),
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                last_error = e;
+                tracing::warn!(
+                    job_id = %job.id,
+                    attempt = attempts_after,
+                    error = %last_error,
+                    "job attempt failed"
+                );
+                // Persist the cumulative attempt count so it survives a
+                // crash and is visible to the sweeper.
+                update_job_status(
+                    pool,
+                    job.tenant_id,
+                    job.id,
+                    job_status::PROCESSING,
+                    attempts_after as i32,
                     Some(&last_error),
                 )
                 .await?;
 
-                if failures < MAX_ATTEMPTS {
-                    let delay = (BACKOFF_BASE_MS * 2_u64.pow(attempt)).min(BACKOFF_CAP_MS);
+                if i + 1 < remaining {
+                    // Backoff is indexed by the session-local attempt so it
+                    // keeps growing across the in-memory retries.
+                    let delay = (BACKOFF_BASE_MS * 2_u64.pow(i)).min(BACKOFF_CAP_MS);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
             }
@@ -282,13 +370,18 @@ pub async fn process_job_with_retry(
         pool,
         job.tenant_id,
         job.id,
-        "failed",
+        job_status::FAILED,
         MAX_ATTEMPTS as i32,
         Some(&last_error),
     )
     .await?;
-    update_document_status(pool, job.tenant_id, job.document_id, "failed").await?;
+    update_document_status(pool, job.tenant_id, job.document_id, doc_status::FAILED).await?;
     tracing::error!(job_id = %job.id, error = %last_error, "job marked failed after max attempts");
+    gmrag_api::metrics::metrics().inc_job_outcome(
+        "ingest",
+        "failure",
+        started.elapsed().as_secs_f64(),
+    );
     Ok(())
 }
 

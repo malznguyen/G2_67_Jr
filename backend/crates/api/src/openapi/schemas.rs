@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+// The role enums are ToSchema types referenced by the membership
+// request/response schemas below. Re-exported so the OpenApi
+// `components(schemas(...))` list in `mod.rs` can name them directly via its
+// `use crate::openapi::schemas::*;` glob.
+pub use crate::roles::{TenantMemberRole, WorkspaceMemberRole};
+
 // ─── Error envelope ──────────────────────────────────────────────────────────
 
 /// Standard error response envelope.
@@ -36,6 +42,7 @@ pub struct HealthResponse {
 pub struct HealthzResponse {
     pub status: String,
     pub db: String,
+    pub openfga: String,
 }
 
 // ─── Users ───────────────────────────────────────────────────────────────────
@@ -58,8 +65,8 @@ pub struct UserProfile {
 pub struct UserTenantMembership {
     pub id: Uuid,
     pub name: String,
-    /// Tenant role: `owner` or `member`.
-    pub role: String,
+    /// Tenant role: `owner`, `admin`, or `member`.
+    pub role: TenantMemberRole,
 }
 
 // ─── Tenants ─────────────────────────────────────────────────────────────────
@@ -69,8 +76,8 @@ pub struct TenantListItem {
     pub id: Uuid,
     pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Membership role: `owner` or `member`.
-    pub role: String,
+    /// Membership role: `owner`, `admin`, or `member`.
+    pub role: TenantMemberRole,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -87,7 +94,7 @@ pub struct CreateTenantRequest {
 pub struct CreateTenantResponse {
     pub id: Uuid,
     pub name: String,
-    pub role: String,
+    pub role: TenantMemberRole,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -106,7 +113,7 @@ pub struct UpdateTenantResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TenantMemberItem {
     pub user_id: Uuid,
-    pub role: String,
+    pub role: TenantMemberRole,
     pub email: String,
     pub name: String,
 }
@@ -119,14 +126,15 @@ pub struct TenantMembersResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct InviteMemberRequest {
     pub email: String,
-    pub role: Option<String>,
+    /// Optional tenant role (`owner`, `admin`, `member`); defaults to `member`.
+    pub role: Option<TenantMemberRole>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct InviteMemberResponse {
     pub id: Uuid,
     pub email: String,
-    pub role: String,
+    pub role: TenantMemberRole,
     pub token: Uuid,
     /// Invitation status, e.g. `pending`.
     pub status: String,
@@ -181,7 +189,7 @@ pub struct UpdateWorkspaceResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct WorkspaceMemberItem {
     pub user_id: Uuid,
-    pub role: String,
+    pub role: WorkspaceMemberRole,
     pub email: String,
     pub name: String,
 }
@@ -194,14 +202,16 @@ pub struct WorkspaceMembersResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddWorkspaceMemberRequest {
     pub user_id: Uuid,
-    pub role: Option<String>,
+    /// Optional workspace role (`owner`, `admin`, `member`); defaults to
+    /// `member`.
+    pub role: Option<WorkspaceMemberRole>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddWorkspaceMemberResponse {
     pub workspace_id: Uuid,
     pub user_id: Uuid,
-    pub role: String,
+    pub role: WorkspaceMemberRole,
 }
 
 // ─── Documents ───────────────────────────────────────────────────────────────
@@ -317,11 +327,13 @@ pub enum AclRelation {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GrantItem {
-    pub id: Uuid,
+    /// Opaque OpenFGA tuple identifier, suitable only for `DELETE /acl/{grant_id}`.
+    pub id: String,
     pub principal_type: String,
     pub principal_id: Uuid,
     pub relation: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// OpenFGA direct tuples do not expose creation timestamps.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -340,7 +352,8 @@ pub struct CreateGrantRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGrantResponse {
-    pub id: Uuid,
+    /// Opaque OpenFGA tuple identifier, suitable only for `DELETE /acl/{grant_id}`.
+    pub id: String,
     pub resource_type: String,
     pub resource_id: Uuid,
     pub principal_type: String,

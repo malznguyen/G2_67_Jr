@@ -14,8 +14,8 @@ use crate::error::AuthError;
 /// If the user already exists, updates `email` and `name` to match the
 /// latest claims. If the user doesn't exist, inserts a new record.
 pub async fn provision_user(pool: &PgPool, claims: &JwtClaims) -> Result<(), AuthError> {
-    let user_id =
-        Uuid::parse_str(&claims.sub).map_err(|e| AuthError::InvalidToken(format!("invalid sub: {e}")))?;
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|e| AuthError::InvalidToken(format!("invalid sub: {e}")))?;
 
     let email = claims.email.as_deref().unwrap_or("");
     let name = claims.preferred_username.as_deref().unwrap_or("");

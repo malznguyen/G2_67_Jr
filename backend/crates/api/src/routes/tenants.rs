@@ -1,7 +1,7 @@
 //! Tenant CRUD routes (T52 + T53).
 //!
 //! - `GET /tenants` and `POST /tenants` are **cross-tenant / pre-tenant**
-//!   operations: they run before any `X-Tenant-Id` context exists, so they use
+//!   operations: they run before any `X-Tenant-ID` context exists, so they use
 //!   [`AdminPool`] (bypasses RLS), mirroring `GET /users/me`. `POST` creates a
 //!   tenant and auto-adds the creator as `owner`.
 //! - `PATCH /tenants/{tid}` and `DELETE /tenants/{tid}` are tenant-scoped and
@@ -20,6 +20,11 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::{
+    check_or_unavailable, delete_object_or_unavailable, list_objects_or_unavailable,
+    parsed_uuid_set, tenant_obj, tenant_role_tuple, user_obj, AuthzService, CheckRequest,
+    Consistency, REL_MEMBER, REL_OWNER, TYPE_TENANT,
+};
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
 use crate::pool::AdminPool;
@@ -56,21 +61,40 @@ pub struct UpdateTenantBody {
     responses(
         (status = 200, description = "Tenant list", body = crate::openapi::schemas::TenantsResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn list_tenants(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let objects = list_objects_or_unavailable(
+        &authz,
+        &user_obj(auth_user.user_id),
+        REL_MEMBER,
+        TYPE_TENANT,
+        Consistency::MinimizeLatency,
+    )
+    .await?;
+    let (tenant_ids, malformed) = parsed_uuid_set(objects, TYPE_TENANT);
+    if malformed > 0 {
+        tracing::warn!(malformed, "openfga returned malformed tenant object ids");
+    }
+    if tenant_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "tenants": [] })));
+    }
+
     let rows = sqlx::query_as::<_, TenantListRow>(
         "SELECT t.id, t.name, t.created_at, tm.role
          FROM tenant_members tm
          JOIN tenants t ON t.id = tm.tenant_id
-         WHERE tm.user_id = $1
+         WHERE tm.user_id = $1 AND t.id = ANY($2)
          ORDER BY t.created_at",
     )
     .bind(auth_user.user_id)
+    .bind(&tenant_ids)
     .fetch_all(&pool)
     .await
     .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
@@ -89,12 +113,14 @@ pub async fn list_tenants(
         (status = 201, description = "Tenant created", body = crate::openapi::schemas::CreateTenantResponse),
         (status = 400, description = "Invalid name", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
 pub async fn create_tenant(
     Extension(auth_user): Extension<AuthUser>,
     Extension(AdminPool(pool)): Extension<AdminPool>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<CreateTenantBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let name = body.name.trim();
@@ -125,6 +151,27 @@ pub async fn create_tenant(
         .await
         .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
 
+    if let Err(e) = crate::authz::write_or_unavailable(
+        &authz,
+        vec![tenant_role_tuple(auth_user.user_id, ROLE_OWNER, tenant_id)],
+        Vec::new(),
+    )
+    .await
+    {
+        if let Err(cleanup) = sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+        {
+            tracing::error!(
+                error = %cleanup,
+                tenant_id = %tenant_id,
+                "failed to compensate tenant create after OpenFGA write failure"
+            );
+        }
+        return Err(e);
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -142,7 +189,7 @@ pub async fn create_tenant(
     tag = "Tenants",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::UpdateTenantRequest,
@@ -152,6 +199,7 @@ pub async fn create_tenant(
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Tenant not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -160,6 +208,7 @@ pub async fn update_tenant(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<UpdateTenantBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
@@ -169,7 +218,7 @@ pub async fn update_tenant(
         return Err(ApiError::BadRequest("tenant name must not be empty".into()));
     }
 
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let updated = sqlx::query("UPDATE tenants SET name = $1 WHERE id = $2")
@@ -194,7 +243,7 @@ pub async fn update_tenant(
     tag = "Tenants",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -203,6 +252,7 @@ pub async fn update_tenant(
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Tenant not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -211,11 +261,49 @@ pub async fn delete_tenant(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Extension(qdrant): Extension<QdrantStore>,
     Extension(object_store): Extension<Arc<dyn ObjectStore>>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
+
+    let (workspace_ids, document_ids, chat_ids): (Vec<Uuid>, Vec<Uuid>, Vec<Uuid>) = {
+        let mut guard = conn.lock().await;
+        let workspace_ids = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM workspaces")
+            .fetch_all(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load tenant workspaces: {e}")))?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+        let document_ids = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM documents")
+            .fetch_all(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load tenant documents: {e}")))?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+        let chat_ids = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM chat_sessions")
+            .fetch_all(&mut *guard)
+            .await
+            .map_err(|e| ApiError::Internal(format!("load tenant chat sessions: {e}")))?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+        (workspace_ids, document_ids, chat_ids)
+    };
+
+    delete_object_or_unavailable(&authz, &tenant_obj(tid)).await?;
+    for workspace_id in workspace_ids {
+        delete_object_or_unavailable(&authz, &crate::authz::workspace_obj(workspace_id)).await?;
+    }
+    for document_id in document_ids {
+        delete_object_or_unavailable(&authz, &crate::authz::document_obj(document_id)).await?;
+    }
+    for chat_id in chat_ids {
+        delete_object_or_unavailable(&authz, &crate::authz::chat_session_obj(chat_id)).await?;
+    }
 
     // T84D Phase 2.2 (SEC-4): teardown the tenant's external state BEFORE
     // the cascade SQL delete — the Qdrant collections + the S3 object
@@ -247,16 +335,13 @@ pub async fn delete_tenant(
 }
 
 /// Guard: the `{tid}` path segment must equal the resolved [`TenantContext`]
-/// (which is derived from the `X-Tenant-Id` header validated by the tenant
+/// (which is derived from the `X-Tenant-ID` header validated by the tenant
 /// middleware). This prevents acting on a tenant other than the one the caller
 /// authenticated against.
-pub(crate) fn ensure_path_matches_context(
-    tid: Uuid,
-    ctx: &TenantContext,
-) -> Result<(), ApiError> {
+pub(crate) fn ensure_path_matches_context(tid: Uuid, ctx: &TenantContext) -> Result<(), ApiError> {
     if tid != ctx.0 {
         return Err(ApiError::BadRequest(
-            "path tenant id does not match X-Tenant-Id".into(),
+            "path tenant id does not match X-Tenant-ID".into(),
         ));
     }
     Ok(())
@@ -264,26 +349,25 @@ pub(crate) fn ensure_path_matches_context(
 
 /// Authorisation guard: the caller must be an `owner` of the current tenant.
 ///
-/// Reads `tenant_members.role` on the RLS-scoped [`SharedConnection`], so only
-/// the current tenant's membership is visible.
+/// Backed by an OpenFGA `Check(user, owner, tenant)` call. Fails closed
+/// (`ApiError::AuthorizationUnavailable`, HTTP 503) if OpenFGA cannot be
+/// reached, and never falls back to reading `tenant_members` directly.
 pub(crate) async fn require_owner(
-    conn: &SharedConnection,
+    authz: &AuthzService,
+    tenant_id: Uuid,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
-    let mut guard = conn.lock().await;
-    let role: Option<String> =
-        sqlx::query_scalar("SELECT role FROM tenant_members WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_optional(&mut *guard)
-            .await
-            .map_err(|e| ApiError::Internal(format!("db error: {e}")))?;
-    drop(guard);
-
-    match role.as_deref() {
-        Some(ROLE_OWNER) => Ok(()),
-        _ => Err(ApiError::Forbidden(
+    let allowed = check_or_unavailable(
+        authz,
+        CheckRequest::new(user_obj(user_id), REL_OWNER, tenant_obj(tenant_id)),
+    )
+    .await?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
             "only a tenant owner may perform this action".into(),
-        )),
+        ))
     }
 }
 

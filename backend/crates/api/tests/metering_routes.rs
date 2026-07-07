@@ -7,12 +7,18 @@ use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
 use gmrag_api::error::ApiError;
-use gmrag_api::metering::{record_embedding_usage, record_llm_usage, METRIC_EMBEDDING_TOKENS, METRIC_LLM_TOKENS};
+use gmrag_api::metering::{
+    record_embedding_usage, record_llm_usage, METRIC_EMBEDDING_TOKENS, METRIC_LLM_TOKENS,
+};
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::routes::metering::{get_audit_logs, get_quotas, get_usage};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
 
 fn claims_for(user_id: Uuid) -> JwtClaims {
     JwtClaims {
@@ -119,6 +125,7 @@ async fn non_owner_get_usage_forbidden(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
     )
     .await;
 
@@ -136,6 +143,7 @@ async fn non_owner_get_quotas_forbidden(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
     )
     .await;
 
@@ -153,6 +161,7 @@ async fn non_owner_get_audit_logs_forbidden(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
     )
     .await;
 
@@ -192,6 +201,7 @@ async fn get_usage_aggregates_metrics(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(rls_conn(&pool, tenant).await),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -225,6 +235,7 @@ async fn get_quotas_returns_row_or_defaults(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(rls_conn(&pool, tenant).await),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -250,6 +261,7 @@ async fn get_quotas_returns_row_or_defaults(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(rls_conn(&pool, tenant).await),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -287,6 +299,7 @@ async fn get_audit_logs_respects_limit_and_order(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(rls_conn(&pool, tenant).await),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -325,6 +338,7 @@ async fn usage_rls_isolates_tenants(pool: PgPool) {
             Extension(TenantContext(tenant_b)),
             Extension(auth_user(owner_b)),
             Extension(rls_conn(&pool, tenant_b).await),
+            Extension(test_authz(&pool)),
         )
         .await,
     )

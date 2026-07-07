@@ -106,7 +106,11 @@ impl ObjectStore for S3ObjectStore {
 
         let mut continuation: Option<String> = None;
         loop {
-            let mut list = self.client.list_objects_v2().bucket(&self.bucket).prefix(prefix);
+            let mut list = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
             if let Some(token) = continuation.as_deref() {
                 list = list.continuation_token(token);
             }
@@ -119,7 +123,12 @@ impl ObjectStore for S3ObjectStore {
                 .contents()
                 .iter()
                 .filter_map(|o| o.key().map(|k| k.to_string()))
-                .map(|k| ObjectIdentifier::builder().key(k).build().map_err(|e| e.to_string()))
+                .map(|k| {
+                    ObjectIdentifier::builder()
+                        .key(k)
+                        .build()
+                        .map_err(|e| e.to_string())
+                })
                 .collect::<Result<Vec<_>, _>>()?;
 
             if !keys.is_empty() {

@@ -1,0 +1,48 @@
+name: gmrag-openfga-backfill
+
+# Dedicated OpenFGA instance pointed at the `openfga_backfill` datastore
+# (created manually in gmrag-postgres16-val). Used to validate the legacy
+# ACL backfill against a known-empty tuple set, separate from the main
+# validation store on port 8189.
+
+services:
+  openfga-migrate-backfill:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga-migrate-backfill
+    command: migrate
+    restart: "no"
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://gmrag_val:GmragVal2026Secure@postgres16-val:5432/openfga_backfill?sslmode=disable
+    networks:
+      - gmrag-net-val
+
+  openfga-backfill:
+    image: openfga/openfga:v1.18.1
+    container_name: gmrag-openfga-backfill
+    command: run
+    depends_on:
+      openfga-migrate-backfill:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://gmrag_val:GmragVal2026Secure@postgres16-val:5432/openfga_backfill?sslmode=disable
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: val-openfga-token-9f3d2a1c
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: json
+    ports:
+      - "8190:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - gmrag-net-val
+
+networks:
+  gmrag-net-val:
+    name: gmrag-net-val
+    external: true

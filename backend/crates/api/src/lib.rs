@@ -1,15 +1,18 @@
 //! gmrag-api library — HTTP service modules and bootstrap.
 
 pub mod auth;
+pub mod authz;
 pub mod chat;
 pub mod error;
 pub mod llm;
 pub mod metering;
+pub mod metrics;
 pub mod middleware;
 pub mod openapi;
 pub mod pool;
 pub mod queue;
-pub mod rbac;
+pub mod reconcile;
+pub mod roles;
 pub mod routes;
 pub mod storage;
 pub mod vector;
@@ -21,19 +24,24 @@ use anyhow::Context as _;
 use auth::extractor::AuthState;
 use auth::jwt::JwtValidator;
 use auth::middleware::auth_middleware;
-use auth::tenant::tenant_middleware;
+use auth::tenant::{tenant_middleware, TenantHeaderName};
+use authz::{AuthzService, OpenFgaAuthorizationService};
 use axum::{
-    Extension, Router, extract::DefaultBodyLimit, extract::State, http::StatusCode,
+    extract::DefaultBodyLimit,
+    extract::State,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post},
+    Extension, Router,
 };
-use gmrag_core::{Config, QdrantStore, init_app_pool, init_pool};
-use routes::chat::LlmRuntime;
+use gmrag_core::{init_app_pool, init_pool, Config, QdrantStore};
+use middleware::rate_limit::{RedisRateLimiter, SharedRateLimiter, SseConnectionLimiter};
 use middleware::rls::rls_middleware;
 use pool::{AdminPool, AppPool};
 use queue::RedisEnqueuer;
-use storage::S3ObjectStore;
+use routes::chat::LlmRuntime;
 use serde_json::json;
+use storage::S3ObjectStore;
 use tokio::signal;
 use tracing::{info, warn};
 
@@ -50,6 +58,8 @@ pub async fn run() -> anyhow::Result<()> {
         bind = %cfg.bind_address(),
         "gmrag-api starting"
     );
+    let tenant_header = TenantHeaderName::from_config(&cfg.tenant_header)
+        .with_context(|| format!("invalid GMRAG_TENANT_HEADER '{}'", cfg.tenant_header))?;
 
     let admin_pool = init_pool(&cfg.database_url)
         .await
@@ -72,6 +82,13 @@ pub async fn run() -> anyhow::Result<()> {
         .context("initialising qdrant store")?;
     info!(qdrant_url = %cfg.qdrant.url, "qdrant store ready");
 
+    let authz: AuthzService = Arc::new(
+        OpenFgaAuthorizationService::new(&cfg.openfga)
+            .context("initialising openfga authorization client")?,
+    );
+    authz.health().await.context("checking openfga readiness")?;
+    info!(openfga_url = %cfg.openfga.api_url, "openfga authorization ready");
+
     // T58/T59: document upload/delete dependencies (S3, Redis, vector cleanup).
     let object_store: Arc<dyn storage::ObjectStore> = Arc::new(S3ObjectStore::new(&cfg.s3));
     info!(bucket = %cfg.s3.bucket, "s3 object store ready");
@@ -82,8 +99,15 @@ pub async fn run() -> anyhow::Result<()> {
             .context("connecting redis enqueuer")?,
     );
     info!(redis_url = %cfg.redis.url, "redis enqueuer ready");
+    let rate_limiter: SharedRateLimiter = Arc::new(
+        RedisRateLimiter::connect(&cfg.redis.url)
+            .await
+            .context("connecting redis rate limiter")?,
+    );
+    let sse_limiter = SseConnectionLimiter::default();
 
     let vector_cleaner: Arc<dyn vector::VectorCleaner> = Arc::new(qdrant.clone());
+    let graph_cleaner: Arc<dyn vector::GraphCleaner> = Arc::new(qdrant.clone());
 
     let llm_runtime = LlmRuntime {
         deepseek: cfg.deepseek.clone(),
@@ -95,7 +119,10 @@ pub async fn run() -> anyhow::Result<()> {
     let jwt_validator = JwtValidator::new(
         cfg.oidc.issuer.clone(),
         cfg.oidc.issuer_verify.clone(),
-        vec![cfg.oidc.client_id.clone(), cfg.oidc.frontend_client_id.clone()],
+        vec![
+            cfg.oidc.client_id.clone(),
+            cfg.oidc.frontend_client_id.clone(),
+        ],
         cfg.oidc.client_id.clone(),
     );
     let auth_state = AuthState { jwt_validator };
@@ -104,6 +131,7 @@ pub async fn run() -> anyhow::Result<()> {
     let public: Router<AppState> = Router::new()
         .route("/health", get(health))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_endpoint))
         .merge(openapi::swagger_router());
 
     let authed: Router<AppState> = Router::new()
@@ -112,6 +140,9 @@ pub async fn run() -> anyhow::Result<()> {
             "/tenants",
             get(routes::tenants::list_tenants).post(routes::tenants::create_tenant),
         )
+        .layer(axum::middleware::from_fn(
+            middleware::rate_limit::rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn(auth_middleware));
 
     let tenant_scoped: Router<AppState> = Router::new()
@@ -133,7 +164,8 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .route(
             "/tenants/:tid/workspaces/:wid",
-            patch(routes::workspaces::update_workspace).delete(routes::workspaces::delete_workspace),
+            patch(routes::workspaces::update_workspace)
+                .delete(routes::workspaces::delete_workspace),
         )
         .route(
             "/tenants/:tid/workspaces/:wid/members",
@@ -199,6 +231,9 @@ pub async fn run() -> anyhow::Result<()> {
         // Allow large multipart document uploads (default axum limit is 2 MiB).
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(axum::middleware::from_fn(rls_middleware))
+        .layer(axum::middleware::from_fn(
+            middleware::rate_limit::rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn(tenant_middleware))
         .layer(axum::middleware::from_fn(auth_middleware));
 
@@ -207,15 +242,22 @@ pub async fn run() -> anyhow::Result<()> {
         .merge(tenant_scoped)
         .layer(Extension(AppPool(app_pool.clone())))
         .layer(Extension(AdminPool(admin_pool.clone())))
+        .layer(Extension(authz))
         .layer(Extension(qdrant))
         .layer(Extension(object_store))
         .layer(Extension(enqueuer))
         .layer(Extension(vector_cleaner))
+        .layer(Extension(graph_cleaner))
         .layer(Extension(llm_runtime))
-        .layer(Extension(auth_state.clone()));
+        .layer(Extension(auth_state.clone()))
+        .layer(Extension(cfg.rate_limit.clone()))
+        .layer(Extension(tenant_header.clone()))
+        .layer(Extension(rate_limiter))
+        .layer(Extension(sse_limiter));
 
     let app = merged
-        .layer(middleware::cors::layer_from_env())
+        .layer(middleware::cors::layer_from_env(&tenant_header.0))
+        .layer(axum::middleware::from_fn(metrics::http_metrics_middleware))
         .with_state(AppState {
             started_at: chrono::Utc::now(),
         });
@@ -231,6 +273,18 @@ pub async fn run() -> anyhow::Result<()> {
         .context("axum serve")?;
 
     Ok(())
+}
+
+pub async fn metrics_endpoint(
+    Extension(AdminPool(pool)): Extension<AdminPool>,
+) -> impl IntoResponse {
+    if let Err(e) = metrics::refresh_ingest_job_metrics(&pool).await {
+        warn!(error = %e, "refresh ingest job metrics failed");
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics::render_prometheus(),
+    )
 }
 
 /// Liveness probe — process is up.
@@ -261,21 +315,31 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         (status = 503, description = "Database unreachable", body = crate::openapi::schemas::HealthzResponse),
     )
 )]
-async fn healthz(Extension(AdminPool(pool)): Extension<AdminPool>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
+async fn healthz(
+    Extension(AdminPool(pool)): Extension<AdminPool>,
+    Extension(authz): Extension<AuthzService>,
+) -> impl IntoResponse {
+    let db = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&pool)
-        .await
-    {
-        Ok(_) => (
+        .await;
+    let fga = authz.health().await;
+
+    match (db, fga) {
+        (Ok(_), Ok(())) => (
             StatusCode::OK,
-            axum::Json(json!({ "status": "ready", "db": "ok" })),
+            axum::Json(json!({ "status": "ready", "db": "ok", "openfga": "ok" })),
         )
             .into_response(),
-        Err(e) => {
-            warn!(error = %e, "healthz: db ping failed");
+        (db_res, fga_res) => {
+            if let Err(e) = db_res {
+                warn!(error = %e, "healthz: db ping failed");
+            }
+            if let Err(e) = fga_res {
+                warn!(error = %e, "healthz: openfga ping failed");
+            }
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({ "status": "degraded", "db": "down" })),
+                axum::Json(json!({ "status": "degraded", "db": "checked", "openfga": "checked" })),
             )
                 .into_response()
         }

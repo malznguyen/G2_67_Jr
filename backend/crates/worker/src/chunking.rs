@@ -21,8 +21,8 @@
 //! are stable.
 
 use text_splitter::{ChunkConfig, TextSplitter};
-use tiktoken_rs::cl100k_base;
 use thiserror::Error;
+use tiktoken_rs::cl100k_base;
 
 const CHUNK_SIZE_TOKENS: usize = 1200;
 const CHUNK_OVERLAP_TOKENS: usize = 100;
@@ -261,11 +261,7 @@ mod tests {
 
     #[test]
     fn chunk_preserves_order() {
-        let pages = vec![
-            "Alice".to_string(),
-            "Bob".to_string(),
-            "Carol".to_string(),
-        ];
+        let pages = vec!["Alice".to_string(), "Bob".to_string(), "Carol".to_string()];
         let out = chunk_page_texts(&pages).expect("must succeed");
         assert_eq!(out.len(), 1, "short text -> 1 chunk");
         // Order: Alice before Bob before Carol in the joined text.
@@ -332,7 +328,9 @@ mod tests {
         let out = chunk_page_texts_with_pages(&pages).expect("must succeed");
         assert!(out.len() >= 3, "need >=3 chunks for page mapping");
         // Every chunk must have non-zero page metadata.
-        assert!(out.iter().all(|c| c.page_start >= 1 && c.page_end >= c.page_start));
+        assert!(out
+            .iter()
+            .all(|c| c.page_start >= 1 && c.page_end >= c.page_start));
         // At least one chunk's page_start must equal 1 (the first chunk
         // came from page 1) — robust against overlap spillover.
         assert_eq!(out[0].page_start, 1, "first chunk must start on page 1");
@@ -340,7 +338,9 @@ mod tests {
         assert!(
             out.iter().any(|c| c.page_end == 3),
             "at least one chunk must end on page 3, got: {:?}",
-            out.iter().map(|c| (c.page_start, c.page_end)).collect::<Vec<_>>()
+            out.iter()
+                .map(|c| (c.page_start, c.page_end))
+                .collect::<Vec<_>>()
         );
     }
 

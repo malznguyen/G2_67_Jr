@@ -1,6 +1,7 @@
-//! T83 regression tests: document read paths honour ReBAC `resource_acl`
-//! grants (direct user shares + workspace-group shares) in addition to the
-//! legacy `shared`/owner/workspace-member visibility, via the Check engine.
+//! Document read paths honour OpenFGA grants (direct user shares +
+//! workspace-group shares) in addition to shared/owner/workspace inheritance.
+
+use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
@@ -12,6 +13,10 @@ use uuid::Uuid;
 use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
+use gmrag_api::authz::{
+    document_obj, tuple, user_obj, workspace_member_userset, AuthzService,
+    PgTestAuthorizationService,
+};
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::routes::documents::{list_documents, preview_document, DocListParams};
@@ -35,6 +40,10 @@ fn auth_user(user_id: Uuid) -> AuthUser {
     AuthUser::new(user_id, claims_for(user_id))
 }
 
+fn test_authz(pool: &PgPool) -> AuthzService {
+    Arc::new(PgTestAuthorizationService::new(pool.clone()))
+}
+
 async fn create_user(pool: &PgPool, email: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)")
@@ -56,6 +65,16 @@ async fn insert_tenant(pool: &PgPool, name: &str) -> Uuid {
         .await
         .unwrap();
     id
+}
+
+async fn add_tenant_member(pool: &PgPool, tenant_id: Uuid, user_id: Uuid, role: &str) {
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn insert_workspace(pool: &PgPool, tenant_id: Uuid, created_by: Uuid, slug: &str) -> Uuid {
@@ -102,26 +121,24 @@ async fn insert_document(pool: &PgPool, tenant_id: Uuid, owner_id: Uuid, visibil
 }
 
 async fn insert_grant(
-    pool: &PgPool,
-    tenant_id: Uuid,
+    authz: &AuthzService,
     resource_id: Uuid,
     principal_type: &str,
     principal_id: Uuid,
     relation: &str,
 ) {
-    sqlx::query(
-        "INSERT INTO resource_acl
-           (tenant_id, resource_type, resource_id, principal_type, principal_id, permission)
-         VALUES ($1, 'document', $2, $3, $4, $5)",
-    )
-    .bind(tenant_id)
-    .bind(resource_id)
-    .bind(principal_type)
-    .bind(principal_id)
-    .bind(relation)
-    .execute(pool)
-    .await
-    .unwrap();
+    let user = match principal_type {
+        "user" => user_obj(principal_id),
+        "workspace" => workspace_member_userset(principal_id),
+        other => panic!("unsupported test principal_type {other}"),
+    };
+    authz
+        .write_relationships(
+            vec![tuple(user, relation, document_obj(resource_id))],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
 }
 
 async fn rls_conn(pool: &PgPool, tenant_id: Uuid) -> SharedConnection {
@@ -165,8 +182,11 @@ async fn list_includes_document_shared_via_acl(pool: PgPool) {
     let owner = create_user(&pool, "owner@t83l.com").await;
     let friend = create_user(&pool, "friend@t83l.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, friend, "member").await;
     let d = insert_document(&pool, tenant, owner, "private").await;
-    insert_grant(&pool, tenant, d, "user", friend, "viewer").await;
+    let authz = test_authz(&pool);
+    insert_grant(&authz, d, "user", friend, "viewer").await;
 
     let conn = rls_conn(&pool, tenant).await;
     let (status, body) = parts(
@@ -175,6 +195,7 @@ async fn list_includes_document_shared_via_acl(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(friend)),
             Extension(conn),
+            Extension(authz),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -184,7 +205,7 @@ async fn list_includes_document_shared_via_acl(pool: PgPool) {
     assert_eq!(
         doc_ids(&body),
         vec![d.to_string()],
-        "a document shared via resource_acl must appear in the recipient's list"
+        "a document shared through OpenFGA must appear in the recipient's list"
     );
 }
 
@@ -193,10 +214,13 @@ async fn list_includes_document_shared_with_workspace_group(pool: PgPool) {
     let owner = create_user(&pool, "owner@t83w.com").await;
     let member = create_user(&pool, "member@t83w.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, member, "member").await;
     let ws = insert_workspace(&pool, tenant, owner, "eng").await;
     add_workspace_member(&pool, ws, tenant, member).await;
     let d = insert_document(&pool, tenant, owner, "private").await;
-    insert_grant(&pool, tenant, d, "workspace", ws, "viewer").await;
+    let authz = test_authz(&pool);
+    insert_grant(&authz, d, "workspace", ws, "viewer").await;
 
     let conn = rls_conn(&pool, tenant).await;
     let (status, body) = parts(
@@ -205,6 +229,7 @@ async fn list_includes_document_shared_with_workspace_group(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(member)),
             Extension(conn),
+            Extension(authz),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -219,8 +244,11 @@ async fn preview_visible_to_acl_recipient(pool: PgPool) {
     let owner = create_user(&pool, "owner@t83p.com").await;
     let friend = create_user(&pool, "friend@t83p.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, friend, "member").await;
     let d = insert_document(&pool, tenant, owner, "private").await;
-    insert_grant(&pool, tenant, d, "user", friend, "viewer").await;
+    let authz = test_authz(&pool);
+    insert_grant(&authz, d, "user", friend, "viewer").await;
 
     let conn = rls_conn(&pool, tenant).await;
     let (status, body) = parts(
@@ -229,6 +257,7 @@ async fn preview_visible_to_acl_recipient(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(friend)),
             Extension(conn),
+            Extension(authz),
         )
         .await,
     )
@@ -242,7 +271,10 @@ async fn preview_denied_without_grant(pool: PgPool) {
     let owner = create_user(&pool, "owner@t83d.com").await;
     let stranger = create_user(&pool, "stranger@t83d.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
+    add_tenant_member(&pool, tenant, owner, "owner").await;
+    add_tenant_member(&pool, tenant, stranger, "member").await;
     let d = insert_document(&pool, tenant, owner, "private").await;
+    let authz = test_authz(&pool);
 
     let conn = rls_conn(&pool, tenant).await;
     let result = preview_document(
@@ -250,6 +282,7 @@ async fn preview_denied_without_grant(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(stranger)),
         Extension(conn),
+        Extension(authz),
     )
     .await;
     assert!(matches!(result, Err(ApiError::NotFound)));

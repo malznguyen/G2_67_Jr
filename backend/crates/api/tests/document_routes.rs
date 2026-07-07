@@ -26,6 +26,7 @@ use uuid::Uuid;
 use gmrag_api::auth::extractor::AuthUser;
 use gmrag_api::auth::jwt::JwtClaims;
 use gmrag_api::auth::tenant::TenantContext;
+use gmrag_api::authz::AuthzService;
 use gmrag_api::error::ApiError;
 use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::queue::{IngestJobPayload, JobEnqueuer};
@@ -33,7 +34,11 @@ use gmrag_api::routes::documents::{
     delete_document, list_documents, preview_document, DocListParams,
 };
 use gmrag_api::storage::ObjectStore;
-use gmrag_api::vector::VectorCleaner;
+use gmrag_api::vector::{GraphCleaner, VectorCleaner};
+
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -77,6 +82,16 @@ async fn insert_tenant(pool: &PgPool, name: &str) -> Uuid {
         .await
         .unwrap();
     id
+}
+
+async fn add_tenant_member(pool: &PgPool, tenant_id: Uuid, user_id: Uuid, role: &str) {
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn insert_workspace(pool: &PgPool, tenant_id: Uuid, created_by: Uuid, slug: &str) -> Uuid {
@@ -187,6 +202,7 @@ async fn shared_document_visible_to_everyone(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(other)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -210,6 +226,7 @@ async fn private_document_hidden_from_non_owner(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(other)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -232,6 +249,7 @@ async fn owner_sees_own_private_document(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -259,6 +277,7 @@ async fn workspace_member_sees_workspace_document(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(member)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -275,6 +294,7 @@ async fn workspace_member_sees_workspace_document(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(outsider)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -301,6 +321,7 @@ async fn filter_by_workspace_id(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams {
                 workspace_id: Some(ws_a),
             }),
@@ -328,6 +349,7 @@ async fn documents_are_tenant_isolated(pool: PgPool) {
             Extension(TenantContext(tenant_a)),
             Extension(auth_user(user_a)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Query(DocListParams { workspace_id: None }),
         )
         .await,
@@ -348,6 +370,7 @@ async fn list_documents_rejects_path_mismatch(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(owner)),
         Extension(conn),
+        Extension(test_authz(&pool)),
         Query(DocListParams { workspace_id: None }),
     )
     .await;
@@ -401,6 +424,7 @@ impl JobEnqueuer for MockEnqueuer {
 #[derive(Default)]
 struct MockVectorCleaner {
     cleaned: Mutex<Vec<(Uuid, Uuid)>>,
+    workspace_cleaned: Mutex<Vec<(Uuid, Uuid)>>,
 }
 
 #[async_trait::async_trait]
@@ -413,15 +437,42 @@ impl VectorCleaner for MockVectorCleaner {
         self.cleaned.lock().unwrap().push((tenant_id, document_id));
         Ok(())
     }
+
+    async fn delete_workspace_chunks(
+        &self,
+        tenant_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<(), String> {
+        self.workspace_cleaned
+            .lock()
+            .unwrap()
+            .push((tenant_id, workspace_id));
+        Ok(())
+    }
+}
+
+/// Records each `(tenant, node_ids)` graph cleanup request (Phase 0
+/// TASK-P0-04). Used by the document-delete graph provenance tests.
+#[derive(Default)]
+struct MockGraphCleaner {
+    graph_deletes: Mutex<Vec<(Uuid, Vec<Uuid>)>>,
+}
+
+#[async_trait::async_trait]
+impl GraphCleaner for MockGraphCleaner {
+    async fn delete_graph_nodes(&self, tenant_id: Uuid, node_ids: &[Uuid]) -> Result<(), String> {
+        self.graph_deletes
+            .lock()
+            .unwrap()
+            .push((tenant_id, node_ids.to_vec()));
+        Ok(())
+    }
 }
 
 const BOUNDARY: &str = "X-GMRAG-TEST-BOUNDARY";
 
 /// Build a `multipart/form-data` body with text fields and an optional file part.
-fn build_multipart(
-    text_fields: &[(&str, &str)],
-    file: Option<(&str, &str, &[u8])>,
-) -> Vec<u8> {
+fn build_multipart(text_fields: &[(&str, &str)], file: Option<(&str, &str, &[u8])>) -> Vec<u8> {
     let mut body = Vec::new();
     for (name, value) in text_fields {
         body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
@@ -434,10 +485,8 @@ fn build_multipart(
     if let Some((filename, content_type, bytes)) = file {
         body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
         body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
-            )
-            .as_bytes(),
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
         );
         body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
         body.extend_from_slice(bytes);
@@ -454,6 +503,7 @@ fn upload_app(
     user: Uuid,
     store: Arc<dyn ObjectStore>,
     enqueuer: Arc<dyn JobEnqueuer>,
+    authz: AuthzService,
 ) -> Router {
     Router::new()
         .route(
@@ -465,6 +515,7 @@ fn upload_app(
         .layer(Extension(auth_user(user)))
         .layer(Extension(store))
         .layer(Extension(enqueuer))
+        .layer(Extension(authz))
 }
 
 fn upload_request(tenant: Uuid, body: Vec<u8>) -> Request<Body> {
@@ -497,6 +548,7 @@ async fn upload_succeeds_writes_db_s3_and_enqueues(pool: PgPool) {
     let owner = create_user(&pool, "owner@t58ok.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
     let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    add_workspace_member(&pool, ws, tenant, owner).await;
 
     let store = Arc::new(MockObjectStore::default());
     let enqueuer = Arc::new(MockEnqueuer::default());
@@ -507,6 +559,7 @@ async fn upload_succeeds_writes_db_s3_and_enqueues(pool: PgPool) {
         owner,
         store.clone(),
         enqueuer.clone(),
+        test_authz(&pool),
     );
 
     let body = build_multipart(
@@ -553,13 +606,27 @@ async fn upload_succeeds_writes_db_s3_and_enqueues(pool: PgPool) {
             .fetch_one(&mut *guard)
             .await
             .unwrap();
+
+    // T84D outbox path: no direct Redis enqueue — payload is persisted in
+    // `ingest_outbox` inside the same transaction as the document row.
+    assert!(
+        enqueuer.jobs.lock().unwrap().is_empty(),
+        "upload must not call JobEnqueuer directly"
+    );
+    let outbox: (serde_json::Value, String) =
+        sqlx::query_as("SELECT payload, status FROM ingest_outbox WHERE document_id = $1")
+            .bind(doc_id)
+            .fetch_one(&mut *guard)
+            .await
+            .unwrap();
     drop(guard);
 
-    // Enqueued payload mirrors the row and carries owner_id + visibility.
-    let jobs = enqueuer.jobs.lock().unwrap();
-    assert_eq!(jobs.len(), 1);
-    let payload = &jobs[0];
-    assert_eq!(payload.id, job.0, "redis job id must equal ingest_jobs.id");
+    assert_eq!(outbox.1, "pending");
+    let payload: IngestJobPayload = serde_json::from_value(outbox.0).unwrap();
+    assert_eq!(
+        payload.id, job.0,
+        "outbox payload id must equal ingest_jobs.id"
+    );
     assert_eq!(payload.tenant_id, tenant);
     assert_eq!(payload.workspace_id, ws);
     assert_eq!(payload.document_id, doc_id);
@@ -570,10 +637,109 @@ async fn upload_succeeds_writes_db_s3_and_enqueues(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn upload_requires_workspace_access_before_s3_and_db_side_effects(pool: PgPool) {
+    let creator = create_user(&pool, "creator@p15upload.com").await;
+    let ws_member = create_user(&pool, "member@p15upload.com").await;
+    let tenant_owner = create_user(&pool, "tenantowner@p15upload.com").await;
+    let tenant_admin = create_user(&pool, "tenantadmin@p15upload.com").await;
+    let unrelated = create_user(&pool, "unrelated@p15upload.com").await;
+    let other_user = create_user(&pool, "other@p15upload.com").await;
+    let tenant = insert_tenant(&pool, "P1.5 Upload").await;
+    let other_tenant = insert_tenant(&pool, "P1.5 Upload Other").await;
+    add_tenant_member(&pool, tenant, tenant_owner, "owner").await;
+    add_tenant_member(&pool, tenant, tenant_admin, "admin").await;
+    add_tenant_member(&pool, tenant, unrelated, "member").await;
+    add_tenant_member(&pool, tenant, ws_member, "member").await;
+    add_tenant_member(&pool, other_tenant, other_user, "owner").await;
+    let ws = insert_workspace(&pool, tenant, creator, "upload-guard").await;
+    let other_ws = insert_workspace(&pool, other_tenant, other_user, "upload-other").await;
+    add_workspace_member(&pool, ws, tenant, ws_member).await;
+
+    for allowed in [ws_member, tenant_owner] {
+        let store = Arc::new(MockObjectStore::default());
+        let enqueuer = Arc::new(MockEnqueuer::default());
+        let conn = rls_conn(&pool, tenant).await;
+        let app = upload_app(
+            conn,
+            tenant,
+            allowed,
+            store.clone(),
+            enqueuer,
+            test_authz(&pool),
+        );
+        let body = build_multipart(
+            &[("visibility", "private"), ("workspace_id", &ws.to_string())],
+            Some(("ok.pdf", "application/pdf", b"ok")),
+        );
+        let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(store.put_keys.lock().unwrap().len(), 1);
+    }
+
+    for (caller, workspace_id, expected_status) in [
+        (unrelated, ws, StatusCode::FORBIDDEN),
+        (tenant_admin, ws, StatusCode::FORBIDDEN),
+        (tenant_owner, other_ws, StatusCode::NOT_FOUND),
+        (tenant_owner, Uuid::new_v4(), StatusCode::NOT_FOUND),
+    ] {
+        let before_docs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let before_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingest_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let before_outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingest_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let store = Arc::new(MockObjectStore::default());
+        let enqueuer = Arc::new(MockEnqueuer::default());
+        let conn = rls_conn(&pool, tenant).await;
+        let app = upload_app(
+            conn,
+            tenant,
+            caller,
+            store.clone(),
+            enqueuer,
+            test_authz(&pool),
+        );
+        let body = build_multipart(
+            &[
+                ("visibility", "private"),
+                ("workspace_id", &workspace_id.to_string()),
+            ],
+            Some(("denied.pdf", "application/pdf", b"denied")),
+        );
+        let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
+        assert_eq!(resp.status(), expected_status);
+        assert!(store.put_keys.lock().unwrap().is_empty());
+
+        let after_docs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let after_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingest_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let after_outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingest_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_docs, before_docs);
+        assert_eq!(after_jobs, before_jobs);
+        assert_eq!(after_outbox, before_outbox);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn upload_over_quota_returns_429(pool: PgPool) {
     let owner = create_user(&pool, "owner@t58q.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
     let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    add_workspace_member(&pool, ws, tenant, owner).await;
     // 5-byte storage limit; the upload is far bigger.
     insert_quota(&pool, tenant, 5, 100).await;
 
@@ -586,11 +752,16 @@ async fn upload_over_quota_returns_429(pool: PgPool) {
         owner,
         store.clone(),
         enqueuer.clone(),
+        test_authz(&pool),
     );
 
     let body = build_multipart(
         &[("visibility", "private"), ("workspace_id", &ws.to_string())],
-        Some(("big.pdf", "application/pdf", b"this is way more than five bytes")),
+        Some((
+            "big.pdf",
+            "application/pdf",
+            b"this is way more than five bytes",
+        )),
     );
     let resp = app.oneshot(upload_request(tenant, body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -621,6 +792,7 @@ async fn upload_invalid_visibility_returns_400(pool: PgPool) {
         owner,
         store.clone(),
         enqueuer.clone(),
+        test_authz(&pool),
     );
 
     let body = build_multipart(
@@ -633,16 +805,21 @@ async fn upload_invalid_visibility_returns_400(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
+async fn upload_rolls_back_s3_and_db_when_outbox_insert_fails(pool: PgPool) {
     let owner = create_user(&pool, "owner@t58rb.com").await;
     let tenant = insert_tenant(&pool, "Acme").await;
     let ws = insert_workspace(&pool, tenant, owner, "eng").await;
+    add_workspace_member(&pool, ws, tenant, owner).await;
+
+    // Block outbox inserts so the handler's post-S3 DB transaction fails and
+    // rolls back document + ingest_jobs + outbox (T84D outbox path).
+    sqlx::query("ALTER TABLE ingest_outbox ADD CONSTRAINT test_block_outbox CHECK (false)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let store = Arc::new(MockObjectStore::default());
-    let enqueuer = Arc::new(MockEnqueuer {
-        fail: true,
-        ..Default::default()
-    });
+    let enqueuer = Arc::new(MockEnqueuer::default());
     let conn = rls_conn(&pool, tenant).await;
     let app = upload_app(
         conn.clone(),
@@ -650,6 +827,7 @@ async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
         owner,
         store.clone(),
         enqueuer.clone(),
+        test_authz(&pool),
     );
 
     let body = build_multipart(
@@ -665,7 +843,7 @@ async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
     assert_eq!(put.len(), 1);
     assert_eq!(deleted, put, "the uploaded key must be deleted on rollback");
 
-    // No document/ingest_jobs rows persisted (ROLLBACK TO SAVEPOINT).
+    // No document/ingest_jobs/outbox rows persisted (ROLLBACK TO SAVEPOINT).
     let mut guard = conn.lock().await;
     let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM documents")
         .fetch_one(&mut *guard)
@@ -675,8 +853,22 @@ async fn upload_rolls_back_s3_and_db_when_enqueue_fails(pool: PgPool) {
         .fetch_one(&mut *guard)
         .await
         .unwrap();
+    let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_outbox")
+        .fetch_one(&mut *guard)
+        .await
+        .unwrap();
     assert_eq!(docs, 0, "document insert must be rolled back");
     assert_eq!(jobs, 0, "ingest_jobs insert must be rolled back");
+    assert_eq!(outbox, 0, "ingest_outbox insert must be rolled back");
+    sqlx::Executor::execute(&mut *guard, "ROLLBACK")
+        .await
+        .unwrap();
+    drop(guard);
+
+    sqlx::query("ALTER TABLE ingest_outbox DROP CONSTRAINT test_block_outbox")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 // ─── T59: delete — cascade + S3/Qdrant orphan cleanup ─────────────────────────
@@ -729,6 +921,7 @@ async fn delete_document_owner_cascades_and_cleans_up(pool: PgPool) {
 
     let store = Arc::new(MockObjectStore::default());
     let cleaner = Arc::new(MockVectorCleaner::default());
+    let graph_cleaner = Arc::new(MockGraphCleaner::default());
     let conn = rls_conn(&pool, tenant).await;
     let (status, _) = parts(
         delete_document(
@@ -736,8 +929,10 @@ async fn delete_document_owner_cascades_and_cleans_up(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
             Extension(store.clone() as Arc<dyn ObjectStore>),
             Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+            Extension(graph_cleaner.clone() as Arc<dyn GraphCleaner>),
         )
         .await,
     )
@@ -780,14 +975,17 @@ async fn delete_document_non_owner_returns_403(pool: PgPool) {
 
     let store = Arc::new(MockObjectStore::default());
     let cleaner = Arc::new(MockVectorCleaner::default());
+    let graph_cleaner = Arc::new(MockGraphCleaner::default());
     let conn = rls_conn(&pool, tenant).await;
     let result = delete_document(
         Path((tenant, doc)),
         Extension(TenantContext(tenant)),
         Extension(auth_user(other)),
         Extension(conn.clone()),
+        Extension(test_authz(&pool)),
         Extension(store.clone() as Arc<dyn ObjectStore>),
         Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+        Extension(graph_cleaner.clone() as Arc<dyn GraphCleaner>),
     )
     .await;
     assert!(matches!(result, Err(ApiError::Forbidden(_))));
@@ -814,6 +1012,7 @@ async fn delete_document_cross_tenant_returns_404(pool: PgPool) {
 
     let store = Arc::new(MockObjectStore::default());
     let cleaner = Arc::new(MockVectorCleaner::default());
+    let graph_cleaner = Arc::new(MockGraphCleaner::default());
     // Caller operates in tenant A; doc_b belongs to tenant B → RLS hides it.
     let conn = rls_conn(&pool, tenant_a).await;
     let result = delete_document(
@@ -821,8 +1020,10 @@ async fn delete_document_cross_tenant_returns_404(pool: PgPool) {
         Extension(TenantContext(tenant_a)),
         Extension(auth_user(user_a)),
         Extension(conn.clone()),
+        Extension(test_authz(&pool)),
         Extension(store.clone() as Arc<dyn ObjectStore>),
         Extension(cleaner.clone() as Arc<dyn VectorCleaner>),
+        Extension(graph_cleaner.clone() as Arc<dyn GraphCleaner>),
     )
     .await;
     assert!(matches!(result, Err(ApiError::NotFound)));
@@ -857,6 +1058,7 @@ async fn preview_owner_returns_metadata_and_ordered_chunks(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -872,7 +1074,11 @@ async fn preview_owner_returns_metadata_and_ordered_chunks(pool: PgPool) {
         .iter()
         .map(|c| c["chunk_index"].as_i64().unwrap())
         .collect();
-    assert_eq!(indices, vec![0, 1, 2], "chunks must be ordered by chunk_index");
+    assert_eq!(
+        indices,
+        vec![0, 1, 2],
+        "chunks must be ordered by chunk_index"
+    );
     assert_eq!(chunks[0]["content"].as_str().unwrap(), "chunk 0");
 }
 
@@ -890,6 +1096,7 @@ async fn preview_shared_document_visible_to_other(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(other)),
             Extension(conn),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -915,6 +1122,7 @@ async fn preview_workspace_member_sees_private_document(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(member)),
             Extension(conn),
+            Extension(test_authz(&pool)),
         )
         .await,
     )
@@ -936,6 +1144,7 @@ async fn preview_private_hidden_from_non_owner_returns_404(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(other)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(result, Err(ApiError::NotFound)));
@@ -955,6 +1164,7 @@ async fn preview_cross_tenant_returns_404(pool: PgPool) {
         Extension(TenantContext(tenant_a)),
         Extension(auth_user(user_a)),
         Extension(conn),
+        Extension(test_authz(&pool)),
     )
     .await;
     assert!(matches!(result, Err(ApiError::NotFound)));

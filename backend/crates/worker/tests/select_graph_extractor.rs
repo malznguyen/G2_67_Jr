@@ -5,7 +5,7 @@
 
 use gmrag_core::config::DeepSeekConfig;
 use gmrag_core::crypto::encrypt_with_aad;
-use gmrag_worker::{DeepSeekGraphExtractor, select_graph_extractor};
+use gmrag_worker::{select_graph_extractor, DeepSeekGraphExtractor};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -114,7 +114,10 @@ async fn select_graph_extractor_falls_back_when_disabled(pool: PgPool) {
     let ext = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
         .await
         .expect("factory must succeed");
-    assert!(ext.url().contains("api.deepseek.com"), "disabled BYOK must fall back");
+    assert!(
+        ext.url().contains("api.deepseek.com"),
+        "disabled BYOK must fall back"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -210,8 +213,7 @@ async fn select_graph_extractor_encrypted_without_enc_key_returns_error(pool: Pg
     .await
     .unwrap();
 
-    let result = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None)
-        .await;
+    let result = select_graph_extractor(&pool, tenant, &global_deepseek_cfg(), None).await;
     match result {
         Err(e) => assert!(
             e.to_string().contains("decrypt failed"),

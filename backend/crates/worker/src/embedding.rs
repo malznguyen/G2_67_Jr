@@ -157,11 +157,9 @@ impl OllamaEmbedder {
             .map(|(i, chunk)| (i * batch_size, chunk.to_vec()))
             .collect();
 
-        let results = stream::iter(batches.into_iter().map(|(start, batch)| {
-            async move {
-                let embeddings = self.embed_batch_with_retry(&batch).await?;
-                Ok::<_, EmbedError>((start, embeddings))
-            }
+        let results = stream::iter(batches.into_iter().map(|(start, batch)| async move {
+            let embeddings = self.embed_batch_with_retry(&batch).await?;
+            Ok::<_, EmbedError>((start, embeddings))
         }))
         .buffer_unordered(self.concurrency)
         .collect::<Vec<_>>()
@@ -189,10 +187,7 @@ impl OllamaEmbedder {
     /// on any error (HTTP non-2xx, network error, or timeout). Backoff is
     /// `backoff_ms * 2^attempt` capped at `2^BACKOFF_CAP_POWER` to avoid
     /// multi-minute waits on long retry chains.
-    async fn embed_batch_with_retry(
-        &self,
-        texts: &[String],
-    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn embed_batch_with_retry(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let body = OllamaEmbedRequest {
             model: self.model.clone(),
             input: texts,
@@ -201,11 +196,9 @@ impl OllamaEmbedder {
 
         let mut last_error: Option<EmbedError> = None;
         for attempt in 0..=self.retries {
-            let result = tokio::time::timeout(
-                self.timeout,
-                self.client.post(&self.url).json(&body).send(),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(self.timeout, self.client.post(&self.url).json(&body).send())
+                    .await;
 
             let outcome: Result<Vec<Vec<f32>>, EmbedError> = match result {
                 Ok(Ok(resp)) => match resp.error_for_status() {
@@ -343,16 +336,11 @@ impl OpenAiEmbedder {
     /// Embed a single text. Convenience wrapper around the trait's
     /// `embed_batch`.
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        let out = self
-            .embed_batch(&[text.to_string()])
-            .await?;
+        let out = self.embed_batch(&[text.to_string()]).await?;
         out.into_iter().next().ok_or(EmbedError::Empty)
     }
 
-    async fn embed_batch_with_retry(
-        &self,
-        texts: &[String],
-    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+    async fn embed_batch_with_retry(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let body = OpenAiEmbedRequest {
             model: self.model.clone(),
             input: texts,
@@ -431,11 +419,9 @@ impl Embedder for OpenAiEmbedder {
                 .map(|(i, chunk)| (i * batch_size, chunk.to_vec()))
                 .collect();
 
-            let results = stream::iter(batches.into_iter().map(|(start, batch)| {
-                async move {
-                    let embeddings = self.embed_batch_with_retry(&batch).await?;
-                    Ok::<_, EmbedError>((start, embeddings))
-                }
+            let results = stream::iter(batches.into_iter().map(|(start, batch)| async move {
+                let embeddings = self.embed_batch_with_retry(&batch).await?;
+                Ok::<_, EmbedError>((start, embeddings))
             }))
             .buffer_unordered(self.concurrency)
             .collect::<Vec<_>>()
@@ -573,9 +559,12 @@ fn resolve_byok_api_key(
 ) -> Result<Option<String>, EmbedError> {
     match (ciphertext, nonce) {
         (Some(ct), Some(n)) => {
-            let key = enc_key.ok_or_else(|| EmbedError::Decrypt(
-                "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured".into(),
-            ))?;
+            let key = enc_key.ok_or_else(|| {
+                EmbedError::Decrypt(
+                    "encrypted BYOK key present but GMRAG_TENANT_KEY_ENCRYPTION_KEY not configured"
+                        .into(),
+                )
+            })?;
             let decrypted = gmrag_core::crypto::decrypt_with_aad(ct, n, key, tenant_id.as_bytes())
                 .map_err(|e| EmbedError::Decrypt(e.to_string()))?;
             Ok(Some(decrypted))
@@ -583,7 +572,9 @@ fn resolve_byok_api_key(
         (None, None) => Ok(plaintext_key
             .filter(|v| !v.trim().is_empty())
             .map(|s| s.to_string())),
-        _ => Err(EmbedError::Decrypt("encrypted key pair is incomplete (one field NULL)".into())),
+        _ => Err(EmbedError::Decrypt(
+            "encrypted key pair is incomplete (one field NULL)".into(),
+        )),
     }
 }
 
@@ -618,9 +609,9 @@ struct OpenAiEmbedDatum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use serde_json::json;
 
     fn embedder_at(server: &MockServer) -> OllamaEmbedder {
         OllamaEmbedder::new_with_url(&server.uri(), "nomic-embed-text")
@@ -670,23 +661,19 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/embed"))
             .and(body_partial_json(json!({ "input": ["first"] })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "nomic-embed-text",
-                    "embeddings": [vec768(0.1)],
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nomic-embed-text",
+                "embeddings": [vec768(0.1)],
+            })))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/api/embed"))
             .and(body_partial_json(json!({ "input": ["second"] })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "nomic-embed-text",
-                    "embeddings": [vec768(0.2)],
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nomic-embed-text",
+                "embeddings": [vec768(0.2)],
+            })))
             .mount(&server)
             .await;
 
@@ -712,12 +699,10 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/embed"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "nomic-embed-text",
-                    "embeddings": [vec768(0.9)],
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nomic-embed-text",
+                "embeddings": [vec768(0.9)],
+            })))
             .mount(&server)
             .await;
 
@@ -754,10 +739,14 @@ mod tests {
         // Respond after 3s, but timeout is 1s.
         Mock::given(method("POST"))
             .and(path("/api/embed"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)).set_body_json(json!({
-                "model": "nomic-embed-text",
-                "embeddings": [vec768(0.0)],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(3))
+                    .set_body_json(json!({
+                        "model": "nomic-embed-text",
+                        "embeddings": [vec768(0.0)],
+                    })),
+            )
             .mount(&server)
             .await;
 
@@ -779,12 +768,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/embed"))
             .and(body_partial_json(json!({ "input": ["a", "b"] })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "nomic-embed-text",
-                    "embeddings": [vec768(0.1)],
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nomic-embed-text",
+                "embeddings": [vec768(0.1)],
+            })))
             .mount(&server)
             .await;
 
@@ -794,7 +781,13 @@ mod tests {
             .await
             .expect_err("must detect count mismatch");
         assert!(
-            matches!(err, EmbedError::CountMismatch { expected: 2, actual: 1 }),
+            matches!(
+                err,
+                EmbedError::CountMismatch {
+                    expected: 2,
+                    actual: 1
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -804,7 +797,10 @@ mod tests {
         let server = MockServer::start().await;
         // No mock mounted — any call would fail. Empty input must short-circuit.
         let embedder = embedder_at(&server);
-        let out = embedder.embed_batch(&[]).await.expect("empty -> Ok(vec![])");
+        let out = embedder
+            .embed_batch(&[])
+            .await
+            .expect("empty -> Ok(vec![])");
         assert!(out.is_empty(), "empty input must produce empty output");
     }
 
@@ -813,12 +809,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/embed"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "model": "nomic-embed-text",
-                    "embeddings": [vec768(0.5)],
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nomic-embed-text",
+                "embeddings": [vec768(0.5)],
+            })))
             .mount(&server)
             .await;
 
@@ -845,14 +839,12 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .and(body_partial_json(json!({ "dimensions": 768 })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "data": [
-                        { "embedding": vec768(0.1), "index": 0 },
-                        { "embedding": vec768(0.2), "index": 1 },
-                    ]
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "embedding": vec768(0.1), "index": 0 },
+                    { "embedding": vec768(0.2), "index": 1 },
+                ]
+            })))
             .mount(&server)
             .await;
 
@@ -876,15 +868,15 @@ mod tests {
                 "Authorization",
                 "Bearer sk-test-key",
             ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "data": [{ "embedding": vec768(0.7), "index": 0 }]
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": vec768(0.7), "index": 0 }]
+            })))
             .mount(&server)
             .await;
 
-        let embedder = openai_embedder_at(&server).with_batch_size(1).with_retries(0);
+        let embedder = openai_embedder_at(&server)
+            .with_batch_size(1)
+            .with_retries(0);
         let v = embedder.embed_one("hello").await.expect("must succeed");
         assert_eq!(v[0], 0.7);
     }
@@ -900,11 +892,9 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "data": [{ "embedding": vec768(0.3), "index": 0 }]
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": vec768(0.3), "index": 0 }]
+            })))
             .mount(&server)
             .await;
 

@@ -56,8 +56,8 @@ ON CONFLICT (workspace_id, user_id) DO NOTHING;
 
 -- ---------- Documents ----------
 INSERT INTO documents (id, tenant_id, workspace_id, owner_id, title, status, mime_type, byte_size, s3_key) VALUES
-    ('d1000000-0000-0000-0000-000000000001', 'a1000000-0000-0000-0000-000000000001', 'c1000000-0000-0000-0000-000000000001', 'b1000000-0000-0000-0000-000000000001', 'Architecture Guide', 'ready', 'application/pdf', 245678, 'acme/eng/architecture-guide.pdf'),
-    ('d1000000-0000-0000-0000-000000000002', 'a1000000-0000-0000-0000-000000000001', 'c1000000-0000-0000-0000-000000000001', 'b1000000-0000-0000-0000-000000000002', 'API Reference', 'ready', 'text/markdown', 45120, 'acme/eng/api-reference.md'),
+    ('d1000000-0000-0000-0000-000000000001', 'a1000000-0000-0000-0000-000000000001', 'c1000000-0000-0000-0000-000000000001', 'b1000000-0000-0000-0000-000000000001', 'Architecture Guide', 'indexed', 'application/pdf', 245678, 'acme/eng/architecture-guide.pdf'),
+    ('d1000000-0000-0000-0000-000000000002', 'a1000000-0000-0000-0000-000000000001', 'c1000000-0000-0000-0000-000000000001', 'b1000000-0000-0000-0000-000000000002', 'API Reference', 'indexed', 'text/markdown', 45120, 'acme/eng/api-reference.md'),
     ('d1000000-0000-0000-0000-000000000003', 'a1000000-0000-0000-0000-000000000002', 'c1000000-0000-0000-0000-000000000002', 'b1000000-0000-0000-0000-000000000003', 'Research Notes', 'processing', 'text/plain', 8900, 'globex/research/notes.txt')
 ON CONFLICT (id) DO NOTHING;
 

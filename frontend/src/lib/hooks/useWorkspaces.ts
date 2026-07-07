@@ -19,7 +19,10 @@ export function useWorkspaces(tid?: string) {
     async queryFn() {
       if (!resolvedTid) throw new Error("no tenant id");
       const { data, error } = await client.GET("/tenants/{tid}/workspaces", {
-        params: { path: { tid: resolvedTid } },
+        params: {
+          path: { tid: resolvedTid },
+          header: { "X-Tenant-ID": resolvedTid },
+        },
       });
       if (error || !data) {
         throw error ?? new Error("fetch workspaces: no data");

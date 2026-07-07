@@ -179,6 +179,13 @@ pub trait AuthorizationService: Send + Sync {
         object: &str,
     ) -> Result<Vec<RelationshipTuple>, AuthzError>;
 
+    /// Enumerate every direct relationship tuple currently stored in the
+    /// authorization backend (OpenFGA), with no object filter. Used by the
+    /// Phase 3 drift reconciler to detect orphaned tuples whose referenced
+    /// Postgres entity no longer exists. Implementations must paginate if the
+    /// backend caps page size.
+    async fn read_all_direct_relationships(&self) -> Result<Vec<RelationshipTuple>, AuthzError>;
+
     async fn write_relationships(
         &self,
         writes: Vec<RelationshipTuple>,
@@ -335,12 +342,12 @@ impl AuthorizationService for OpenFgaAuthorizationService {
             consistency: Option<&'static str>,
         }
         // Same forward-compatible treatment as the check() response: OpenFGA may
-// add new top-level fields in future versions; ignore anything we don't
-// need rather than failing closed on a malformed-response error.
-#[derive(Deserialize)]
-struct Response {
-    objects: Vec<String>,
-}
+        // add new top-level fields in future versions; ignore anything we don't
+        // need rather than failing closed on a malformed-response error.
+        #[derive(Deserialize)]
+        struct Response {
+            objects: Vec<String>,
+        }
 
         let path = format!("/stores/{}/list-objects", self.store_id);
         let body = Body {
@@ -382,6 +389,43 @@ struct Response {
         };
         let response: Response = self.post_json(&path, &body).await?;
         Ok(response.tuples.into_iter().map(|t| t.key).collect())
+    }
+
+    async fn read_all_direct_relationships(&self) -> Result<Vec<RelationshipTuple>, AuthzError> {
+        // OpenFGA `/read` with no `tuple_key` filter returns every tuple,
+        // paginated by `continuation_token`. Loop until the token is absent
+        // (or empty) so the reconciler sees the complete live tuple set.
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            continuation_token: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            tuples: Vec<TupleEnvelope>,
+            #[serde(default)]
+            continuation_token: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct TupleEnvelope {
+            key: RelationshipTuple,
+        }
+
+        let path = format!("/stores/{}/read", self.store_id);
+        let mut all = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let body = Body {
+                continuation_token: continuation.clone(),
+            };
+            let response: Response = self.post_json(&path, &body).await?;
+            all.extend(response.tuples.into_iter().map(|t| t.key));
+            match response.continuation_token {
+                Some(token) if !token.is_empty() => continuation = Some(token),
+                _ => break,
+            }
+        }
+        Ok(all)
     }
 
     async fn write_relationships(
@@ -1001,6 +1045,13 @@ impl AuthorizationService for PgTestAuthorizationService {
             .collect())
     }
 
+    async fn read_all_direct_relationships(&self) -> Result<Vec<RelationshipTuple>, AuthzError> {
+        // The in-memory `direct` set IS the full tuple set for the test
+        // backend — no pagination needed.
+        let direct = self.direct.lock().await;
+        Ok(direct.iter().cloned().collect())
+    }
+
     async fn write_relationships(
         &self,
         writes: Vec<RelationshipTuple>,
@@ -1034,10 +1085,23 @@ pub async fn check_or_unavailable(
     authz: &AuthzService,
     request: CheckRequest,
 ) -> Result<bool, crate::error::ApiError> {
-    authz.check(request).await.map_err(|e| {
-        warn!(error = %e, "authorization check failed closed");
-        crate::error::ApiError::AuthorizationUnavailable(e.to_string())
-    })
+    match authz.check(request).await {
+        Ok(true) => {
+            crate::metrics::metrics().inc_authz("allowed");
+            Ok(true)
+        }
+        Ok(false) => {
+            crate::metrics::metrics().inc_authz("denied");
+            Ok(false)
+        }
+        Err(e) => {
+            crate::metrics::metrics().inc_authz("error");
+            warn!(error = %e, "authorization check failed closed");
+            Err(crate::error::ApiError::AuthorizationUnavailable(
+                e.to_string(),
+            ))
+        }
+    }
 }
 
 pub async fn write_or_unavailable(

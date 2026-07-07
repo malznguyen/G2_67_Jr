@@ -13,8 +13,14 @@ async fn chat_sessions_table_exists_with_expected_columns(pool: PgPool) {
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
     for required in [
-        "id", "tenant_id", "workspace_id", "user_id", "title", "model",
-        "created_at", "updated_at",
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "user_id",
+        "title",
+        "model",
+        "created_at",
+        "updated_at",
     ] {
         assert!(
             names.contains(&required.to_string()),
@@ -34,7 +40,13 @@ async fn chat_messages_table_exists_with_expected_columns(pool: PgPool) {
     .unwrap();
     let names: Vec<String> = cols.into_iter().map(|c| c.0).collect();
     for required in [
-        "id", "tenant_id", "session_id", "role", "content", "token_count", "created_at",
+        "id",
+        "tenant_id",
+        "session_id",
+        "role",
+        "content",
+        "token_count",
+        "created_at",
     ] {
         assert!(
             names.contains(&required.to_string()),
@@ -76,10 +88,14 @@ async fn chat_messages_table_exists_with_expected_columns(pool: PgPool) {
         .await
         .unwrap();
 
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE session_id = $1")
-        .bind(session.0)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(remaining, 0, "chat_messages must cascade-delete with session");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat_messages WHERE session_id = $1")
+            .bind(session.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "chat_messages must cascade-delete with session"
+    );
 }

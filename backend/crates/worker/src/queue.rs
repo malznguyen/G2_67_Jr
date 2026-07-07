@@ -114,7 +114,10 @@ impl MockQueue {
     /// Snapshot of every payload ever LPUSHed since the queue was constructed
     /// (in insertion order). Used by the outbox relay test.
     pub fn pushed(&self) -> Vec<Vec<u8>> {
-        self.pushed.lock().expect("mock queue mutex poisoned").clone()
+        self.pushed
+            .lock()
+            .expect("mock queue mutex poisoned")
+            .clone()
     }
 }
 
@@ -150,9 +153,7 @@ impl JobQueue for MockQueue {
 ///
 /// This is the testable unit — it accepts any `JobQueue` implementation,
 /// so tests inject `MockQueue` without touching real Redis.
-pub async fn poll_once<Q: JobQueue + Send>(
-    queue: &mut Q,
-) -> anyhow::Result<Option<IngestJob>> {
+pub async fn poll_once<Q: JobQueue + Send>(queue: &mut Q) -> anyhow::Result<Option<IngestJob>> {
     let raw = queue
         .brpop_timeout(INGEST_JOBS_KEY, POLL_TIMEOUT_SECS)
         .await?;
@@ -204,14 +205,13 @@ mod tests {
 
     #[tokio::test]
     async fn poll_once_drains_jobs_in_fifo_order() {
-        let mut q = MockQueue::new(vec![
-            sample_job_json(),
-            {
-                let json = sample_job_json();
-                let s = String::from_utf8(json).unwrap().replace("report.pdf", "second.pdf");
-                s.into_bytes()
-            },
-        ]);
+        let mut q = MockQueue::new(vec![sample_job_json(), {
+            let json = sample_job_json();
+            let s = String::from_utf8(json)
+                .unwrap()
+                .replace("report.pdf", "second.pdf");
+            s.into_bytes()
+        }]);
         let first = poll_once(&mut q).await.unwrap().unwrap();
         assert_eq!(first.filename, "report.pdf");
         let second = poll_once(&mut q).await.unwrap().unwrap();

@@ -13,7 +13,7 @@
 
 use gmrag_core::config::OllamaConfig;
 use gmrag_core::crypto::encrypt_with_aad;
-use gmrag_worker::{Embedder, select_embedder};
+use gmrag_worker::{select_embedder, Embedder};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -254,8 +254,7 @@ async fn select_embedder_encrypted_without_enc_key_returns_error(pool: PgPool) {
     .await
     .unwrap();
 
-    let result = select_embedder(&pool, tenant, &test_ollama_cfg(), None)
-        .await;
+    let result = select_embedder(&pool, tenant, &test_ollama_cfg(), None).await;
     match result {
         Err(e) => assert!(
             e.to_string().contains("decrypt failed"),

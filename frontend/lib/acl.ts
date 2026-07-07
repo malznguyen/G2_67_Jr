@@ -4,7 +4,7 @@
 // subject (`user` | `workspace` group) at a relation (`viewer` | `editor`).
 //
 // Framework-agnostic: every call takes an explicit `AclClientConfig` carrying
-// the API base URL, the active tenant id (sent as `X-Tenant-Id`), and the
+// the API base URL, the active tenant id (sent as `X-Tenant-ID`), and the
 // caller's bearer token, so this module has no hidden global state.
 
 export type PrincipalType = "user" | "workspace";
@@ -27,7 +27,7 @@ export interface Grant {
 export interface AclClientConfig {
   /** API origin/prefix, e.g. "http://localhost:8000" or "/api". */
   baseUrl: string;
-  /** Active tenant id, sent as the `X-Tenant-Id` header. */
+  /** Active tenant id, sent as the `X-Tenant-ID` header. */
   tenantId: string;
   /** OIDC access token, sent as `Authorization: Bearer`. */
   token: string;
@@ -56,7 +56,7 @@ export class AclError extends Error {
 function authHeaders(cfg: AclClientConfig): HeadersInit {
   return {
     Authorization: `Bearer ${cfg.token}`,
-    "X-Tenant-Id": cfg.tenantId,
+    "X-Tenant-ID": cfg.tenantId,
     "Content-Type": "application/json",
   };
 }

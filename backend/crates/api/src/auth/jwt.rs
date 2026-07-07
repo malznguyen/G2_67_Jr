@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -136,9 +136,9 @@ impl JwtValidator {
         let header = decode_header(token)
             .map_err(|e| AuthError::InvalidToken(format!("invalid header: {e}")))?;
 
-        let kid = header.kid.ok_or_else(|| {
-            AuthError::InvalidToken("token missing 'kid' header".to_string())
-        })?;
+        let kid = header
+            .kid
+            .ok_or_else(|| AuthError::InvalidToken("token missing 'kid' header".to_string()))?;
 
         let entry = self.get_key(&kid).await?;
 
@@ -146,9 +146,8 @@ impl JwtValidator {
         validation.set_issuer(&[&self.issuer_verify]);
         validation.set_audience(&self.accepted_audiences);
 
-        let token_data: TokenData<JwtClaims> =
-            decode(token, &entry.key, &validation)
-                .map_err(|e| AuthError::InvalidToken(format!("validation failed: {e}")))?;
+        let token_data: TokenData<JwtClaims> = decode(token, &entry.key, &validation)
+            .map_err(|e| AuthError::InvalidToken(format!("validation failed: {e}")))?;
 
         Ok(token_data.claims)
     }
@@ -211,9 +210,9 @@ impl JwtValidator {
             .await
             .map_err(|e| AuthError::JwksFetchFailed(format!("JWKS parse failed: {e}")))?;
 
-        let keys_array = jwks["keys"]
-            .as_array()
-            .ok_or_else(|| AuthError::JwksFetchFailed("missing 'keys' array in JWKS".to_string()))?;
+        let keys_array = jwks["keys"].as_array().ok_or_else(|| {
+            AuthError::JwksFetchFailed("missing 'keys' array in JWKS".to_string())
+        })?;
 
         let mut keys = HashMap::new();
 
@@ -241,14 +240,16 @@ impl JwtValidator {
                 "RSA" => {
                     let n = key_value["n"].as_str().unwrap_or("");
                     let e = key_value["e"].as_str().unwrap_or("");
-                    DecodingKey::from_rsa_components(n, e)
-                        .map_err(|e| AuthError::JwksFetchFailed(format!("RSA key parse failed: {e}")))?
+                    DecodingKey::from_rsa_components(n, e).map_err(|e| {
+                        AuthError::JwksFetchFailed(format!("RSA key parse failed: {e}"))
+                    })?
                 }
                 "EC" => {
                     let x = key_value["x"].as_str().unwrap_or("");
                     let y = key_value["y"].as_str().unwrap_or("");
-                    DecodingKey::from_ec_components(x, y)
-                        .map_err(|e| AuthError::JwksFetchFailed(format!("EC key parse failed: {e}")))?
+                    DecodingKey::from_ec_components(x, y).map_err(|e| {
+                        AuthError::JwksFetchFailed(format!("EC key parse failed: {e}"))
+                    })?
                 }
                 _ => {
                     debug!(kid = %kid, kty = %kty, "skipping unsupported key type");
@@ -256,14 +257,19 @@ impl JwtValidator {
                 }
             };
 
-            keys.insert(kid, JwksEntry {
-                key: decoding_key,
-                algorithm,
-            });
+            keys.insert(
+                kid,
+                JwksEntry {
+                    key: decoding_key,
+                    algorithm,
+                },
+            );
         }
 
         if keys.is_empty() {
-            return Err(AuthError::JwksFetchFailed("no valid keys found in JWKS".to_string()));
+            return Err(AuthError::JwksFetchFailed(
+                "no valid keys found in JWKS".to_string(),
+            ));
         }
 
         let mut cache = self.cache.write().await;
@@ -278,10 +284,10 @@ impl JwtValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::get;
     use axum::Json;
     use axum::Router;
-    use axum::routing::get;
-    use jsonwebtoken::{EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
 
     const TEST_PEM_PRIV: &[u8] = include_bytes!("test_keys/test_rsa_private.pem");
@@ -291,7 +297,12 @@ mod tests {
     fn make_token(claims: &JwtClaims, kid: &str) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_string());
-        encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap()).unwrap()
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap()
     }
 
     fn test_claims() -> JwtClaims {
@@ -335,8 +346,12 @@ mod tests {
         // Token without kid header.
         let claims = test_claims();
         let header = Header::new(Algorithm::RS256); // no kid
-        let token = encode(&header, &claims, &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap())
-            .unwrap();
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_PEM_PRIV).unwrap(),
+        )
+        .unwrap();
 
         let validator = make_validator_with_key();
         let result = validator.validate(&token).await;
@@ -353,11 +368,13 @@ mod tests {
         let token = make_token(&claims, TEST_KID);
 
         let validator = make_validator_with_key();
-        validator.inject_key(
-            TEST_KID.to_string(),
-            DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
-            Algorithm::RS256,
-        ).await;
+        validator
+            .inject_key(
+                TEST_KID.to_string(),
+                DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
+                Algorithm::RS256,
+            )
+            .await;
 
         let result = validator.validate(&token).await;
         assert!(result.is_err());
@@ -372,11 +389,13 @@ mod tests {
         let token = make_token(&claims, TEST_KID);
 
         let validator = make_validator_with_key();
-        validator.inject_key(
-            TEST_KID.to_string(),
-            DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
-            Algorithm::RS256,
-        ).await;
+        validator
+            .inject_key(
+                TEST_KID.to_string(),
+                DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
+                Algorithm::RS256,
+            )
+            .await;
 
         let result = validator.validate(&token).await;
         assert!(result.is_err());
@@ -391,11 +410,13 @@ mod tests {
         let token = make_token(&claims, TEST_KID);
 
         let validator = make_validator_with_key();
-        validator.inject_key(
-            TEST_KID.to_string(),
-            DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
-            Algorithm::RS256,
-        ).await;
+        validator
+            .inject_key(
+                TEST_KID.to_string(),
+                DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
+                Algorithm::RS256,
+            )
+            .await;
 
         let result = validator.validate(&token).await;
         assert!(result.is_err());
@@ -407,14 +428,20 @@ mod tests {
         let token = make_token(&claims, TEST_KID);
 
         let validator = make_validator_with_key();
-        validator.inject_key(
-            TEST_KID.to_string(),
-            DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
-            Algorithm::RS256,
-        ).await;
+        validator
+            .inject_key(
+                TEST_KID.to_string(),
+                DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
+                Algorithm::RS256,
+            )
+            .await;
 
         let result = validator.validate(&token).await;
-        assert!(result.is_ok(), "valid token must be accepted: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "valid token must be accepted: {:?}",
+            result.err()
+        );
         let decoded = result.unwrap();
         assert_eq!(decoded.sub, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(decoded.preferred_username.as_deref(), Some("testuser"));
@@ -468,7 +495,12 @@ mod tests {
             vec!["gmrag-backend".to_string()],
             "gmrag-backend".to_string(),
         )
-        .with_http_client(reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap());
+        .with_http_client(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        );
 
         // The JWKS fetch will succeed (mock returns valid JSON), but the key
         // "mock-kid" is a dummy RSA key. We test that the fetch path works.
@@ -481,14 +513,19 @@ mod tests {
         assert!(result.is_err()); // Expected: key mismatch.
 
         // Now inject the real key and validate.
-        validator.inject_key(
-            "mock-kid".to_string(),
-            DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
-            Algorithm::RS256,
-        ).await;
+        validator
+            .inject_key(
+                "mock-kid".to_string(),
+                DecodingKey::from_rsa_pem(TEST_PEM_PUB).unwrap(),
+                Algorithm::RS256,
+            )
+            .await;
 
         let result = validator.validate(&token).await;
-        assert!(result.is_ok(), "token must validate after injecting correct key");
+        assert!(
+            result.is_ok(),
+            "token must validate after injecting correct key"
+        );
     }
 
     #[tokio::test]

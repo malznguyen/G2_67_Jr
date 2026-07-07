@@ -17,6 +17,10 @@ use gmrag_api::middleware::rls::SharedConnection;
 use gmrag_api::routes::chat::LlmRuntime;
 use gmrag_api::routes::settings::{get_llm_settings, put_llm_settings, PutLlmSettingsBody};
 
+#[path = "support/authz.rs"]
+mod authz_support;
+use authz_support::test_authz;
+
 fn claims_for(user_id: Uuid) -> JwtClaims {
     JwtClaims {
         sub: user_id.to_string(),
@@ -44,7 +48,7 @@ async fn create_user(pool: &PgPool, email: &str) -> Uuid {
         .bind(email)
         .execute(pool)
         .await
-        .unwrap(); 
+        .unwrap();
     id
 }
 
@@ -130,6 +134,7 @@ async fn non_owner_get_llm_settings_forbidden(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
         Extension(test_llm_runtime(Some(ENC_KEY))),
     )
     .await;
@@ -148,6 +153,7 @@ async fn non_owner_put_llm_settings_forbidden(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(member)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
         Extension(test_llm_runtime(Some(ENC_KEY))),
         Json(PutLlmSettingsBody {
             provider: "openai".into(),
@@ -177,6 +183,7 @@ async fn get_llm_settings_unconfigured_returns_default(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(rls_conn(&pool, tenant).await),
+            Extension(test_authz(&pool)),
             Extension(test_llm_runtime(Some(ENC_KEY))),
         )
         .await,
@@ -202,6 +209,7 @@ async fn put_llm_settings_encrypts_and_get_masks(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn.clone()),
+            Extension(test_authz(&pool)),
             Extension(test_llm_runtime(Some(ENC_KEY))),
             Json(PutLlmSettingsBody {
                 provider: "openai".into(),
@@ -221,10 +229,7 @@ async fn put_llm_settings_encrypts_and_get_masks(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(put_body["configured"], true);
     assert_eq!(put_body["has_api_key"], true);
-    assert!(put_body["api_key_masked"]
-        .as_str()
-        .unwrap()
-        .contains("789"));
+    assert!(put_body["api_key_masked"].as_str().unwrap().contains("789"));
     assert!(!put_body["api_key_masked"]
         .as_str()
         .unwrap()
@@ -232,7 +237,9 @@ async fn put_llm_settings_encrypts_and_get_masks(pool: PgPool) {
 
     {
         let mut guard = conn.lock().await;
-        sqlx::Executor::execute(&mut *guard, "COMMIT").await.unwrap();
+        sqlx::Executor::execute(&mut *guard, "COMMIT")
+            .await
+            .unwrap();
     }
 
     let (ct, nonce, plaintext): (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) =
@@ -254,6 +261,7 @@ async fn put_llm_settings_encrypts_and_get_masks(pool: PgPool) {
             Extension(TenantContext(tenant)),
             Extension(auth_user(owner)),
             Extension(conn),
+            Extension(test_authz(&pool)),
             Extension(test_llm_runtime(Some(ENC_KEY))),
         )
         .await,
@@ -279,6 +287,7 @@ async fn put_without_encryption_key_returns_error(pool: PgPool) {
         Extension(TenantContext(tenant)),
         Extension(auth_user(owner)),
         Extension(rls_conn(&pool, tenant).await),
+        Extension(test_authz(&pool)),
         Extension(test_llm_runtime(None)),
         Json(PutLlmSettingsBody {
             provider: "openai".into(),
@@ -312,6 +321,7 @@ async fn rls_isolates_llm_settings(pool: PgPool) {
             Extension(TenantContext(tenant_a)),
             Extension(auth_user(owner_a)),
             Extension(rls_conn(&pool, tenant_a).await),
+            Extension(test_authz(&pool)),
             Extension(test_llm_runtime(Some(ENC_KEY))),
             Json(PutLlmSettingsBody {
                 provider: "openai".into(),
@@ -328,14 +338,16 @@ async fn rls_isolates_llm_settings(pool: PgPool) {
     )
     .await;
 
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tenant_llm_config WHERE tenant_id = $1",
-    )
-    .bind(tenant_b)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "tenant B must not see tenant A config via superuser without filter");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tenant_llm_config WHERE tenant_id = $1")
+            .bind(tenant_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 0,
+        "tenant B must not see tenant A config via superuser without filter"
+    );
 
     let (status, body) = parts(
         get_llm_settings(
@@ -343,6 +355,7 @@ async fn rls_isolates_llm_settings(pool: PgPool) {
             Extension(TenantContext(tenant_b)),
             Extension(auth_user(owner_b)),
             Extension(rls_conn(&pool, tenant_b).await),
+            Extension(test_authz(&pool)),
             Extension(test_llm_runtime(Some(ENC_KEY))),
         )
         .await,

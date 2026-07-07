@@ -21,12 +21,16 @@ use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
 use crate::auth::tenant::TenantContext;
+use crate::authz::{
+    tenant_role_tuple, write_or_unavailable, AuthzService, REL_ADMIN, REL_MEMBER, REL_OWNER,
+};
 use crate::error::ApiError;
 use crate::middleware::rls::SharedConnection;
+use crate::roles::TenantMemberRole;
 use crate::routes::tenants::{ensure_path_matches_context, require_owner};
 
 const ROLE_OWNER: &str = "owner";
-const DEFAULT_INVITE_ROLE: &str = "member";
+const DEFAULT_INVITE_ROLE: TenantMemberRole = TenantMemberRole::Member;
 
 #[derive(Serialize, sqlx::FromRow)]
 struct MemberRow {
@@ -53,10 +57,11 @@ struct InvitationRow {
 #[utoipa::path(
     get,
     path = "/tenants/{tid}/members",
+    operation_id = "list_tenant_members",
     tag = "TenantMembers",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -95,7 +100,7 @@ pub async fn list_members(
     tag = "TenantMembers",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     request_body = crate::openapi::schemas::InviteMemberRequest,
@@ -104,6 +109,7 @@ pub async fn list_members(
         (status = 400, description = "Bad request", body = crate::openapi::schemas::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -112,23 +118,35 @@ pub async fn invite_member(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
     Json(body): Json<InviteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
 
     let email = body.email.trim();
     if email.is_empty() {
-        return Err(ApiError::BadRequest("invite email must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "invite email must not be empty".into(),
+        ));
     }
-    let role = body
-        .role
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .unwrap_or(DEFAULT_INVITE_ROLE)
-        .to_string();
+    let role = match body.role.as_deref() {
+        None => DEFAULT_INVITE_ROLE,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                DEFAULT_INVITE_ROLE
+            } else {
+                TenantMemberRole::parse(trimmed).ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "invalid tenant role '{trimmed}'; must be one of: owner, admin, member"
+                    ))
+                })?
+            }
+        }
+    };
+    let role_str = role.as_str().to_string();
 
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
     let invitation = sqlx::query_as::<_, InvitationRow>(
@@ -138,7 +156,7 @@ pub async fn invite_member(
     )
     .bind(tid)
     .bind(email)
-    .bind(&role)
+    .bind(&role_str)
     .bind(auth_user.user_id)
     .fetch_one(&mut *guard)
     .await
@@ -150,7 +168,7 @@ pub async fn invite_member(
         Json(serde_json::json!({
             "id": invitation.id,
             "email": email,
-            "role": role,
+            "role": role_str,
             "token": invitation.token,
             "status": invitation.status,
         })),
@@ -161,11 +179,12 @@ pub async fn invite_member(
 #[utoipa::path(
     delete,
     path = "/tenants/{tid}/members/{user_id}",
+    operation_id = "remove_tenant_member",
     tag = "TenantMembers",
     params(
         ("tid" = Uuid, Path, description = "Tenant ID"),
         ("user_id" = Uuid, Path, description = "Member user ID"),
-        ("X-Tenant-Id" = Uuid, Header, description = "Must match path tid"),
+        ("X-Tenant-ID" = Uuid, Header, description = "Must match path tid"),
     ),
     security(("bearer_auth" = [])),
     responses(
@@ -174,6 +193,7 @@ pub async fn invite_member(
         (status = 401, description = "Unauthorized", body = crate::openapi::schemas::ErrorResponse),
         (status = 403, description = "Forbidden — owner only", body = crate::openapi::schemas::ErrorResponse),
         (status = 404, description = "Member not found", body = crate::openapi::schemas::ErrorResponse),
+        (status = 503, description = "Authorization unavailable", body = crate::openapi::schemas::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::openapi::schemas::ErrorResponse),
     )
 )]
@@ -182,9 +202,10 @@ pub async fn remove_member(
     Extension(ctx): Extension<TenantContext>,
     Extension(auth_user): Extension<AuthUser>,
     Extension(conn): Extension<SharedConnection>,
+    Extension(authz): Extension<AuthzService>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_path_matches_context(tid, &ctx)?;
-    require_owner(&conn, auth_user.user_id).await?;
+    require_owner(&authz, tid, auth_user.user_id).await?;
 
     let mut guard = conn.lock().await;
 
@@ -217,6 +238,17 @@ pub async fn remove_member(
             ));
         }
     }
+
+    write_or_unavailable(
+        &authz,
+        Vec::new(),
+        vec![
+            tenant_role_tuple(target_user_id, REL_OWNER, tid),
+            tenant_role_tuple(target_user_id, REL_ADMIN, tid),
+            tenant_role_tuple(target_user_id, REL_MEMBER, tid),
+        ],
+    )
+    .await?;
 
     sqlx::query("DELETE FROM tenant_members WHERE user_id = $1")
         .bind(target_user_id)
